@@ -13,11 +13,12 @@
 //! time.
 
 use av_core::{Platform, Severity, ThreatCategory};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 
 /// A byte range in the source text, used for diagnostics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Span {
     pub start: u32,
     pub end: u32,
@@ -40,7 +41,7 @@ impl Span {
 }
 
 /// A complete rule.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Rule {
     pub name: String,
     /// `private rule` — matches are recorded internally but never reported.
@@ -59,7 +60,7 @@ pub struct Rule {
 ///
 /// `extra` preserves any meta key we do not model so that a round-trip through
 /// the importer does not silently discard an author's annotations.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct RuleMeta {
     pub description: Option<String>,
     pub author: Option<String>,
@@ -87,7 +88,7 @@ pub struct RuleMeta {
 }
 
 /// A meta value, in the types the language allows.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MetaValue {
     Text(String),
     Integer(i64),
@@ -105,7 +106,7 @@ impl fmt::Display for MetaValue {
 }
 
 /// One `$name = ...` string definition.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StringDef {
     /// Identifier including the leading `$`, e.g. `$a`. Anonymous strings are
     /// given a synthesised identifier by the parser.
@@ -116,7 +117,7 @@ pub struct StringDef {
 }
 
 /// The three kinds of string a rule can define.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum StringValue {
     /// A literal text string, stored as raw bytes because the source may use
     /// escape sequences that do not form valid UTF-8.
@@ -139,7 +140,7 @@ pub enum StringValue {
 }
 
 /// A parsed hex pattern.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct HexPattern {
     pub tokens: Vec<HexToken>,
 }
@@ -218,7 +219,7 @@ fn collect_fixed(tokens: &[HexToken], out: &mut Vec<u8>) -> bool {
 /// One element inside a hex pattern.
 ///
 /// Not `Copy`: the alternative and negation variants own their sub-patterns.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HexToken {
     /// A fully specified byte: `4D`.
     Byte(u8),
@@ -294,7 +295,7 @@ impl HexToken {
 }
 
 /// Modifiers applied to a string definition.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Modifiers {
     /// Match the bytes as stored. Defaults to true when neither `ascii` nor
     /// `wide` is given, matching YARA's behaviour.
@@ -313,7 +314,7 @@ pub struct Modifiers {
 }
 
 /// Inclusive range of single-byte XOR keys.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct XorRange {
     pub min: u8,
     pub max: u8,
@@ -335,7 +336,7 @@ impl XorRange {
 }
 
 /// Which base64 alphabet a `base64` modifier should generate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Base64Alphabet {
     /// Include the standard alphabet's first encoding.
     pub standard: bool,
@@ -365,7 +366,7 @@ impl Modifiers {
 }
 
 /// Expressions allowed in a `condition:` block.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Expr {
     Bool(bool),
     Int(i64),
@@ -493,7 +494,7 @@ pub enum Expr {
 }
 
 /// A dotted accessor chain rooted at a module name or a loop variable.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemberPath {
     /// First identifier: `pe`, `math`, `hash`, `file`, `dotnet`, or a variable.
     pub root: String,
@@ -501,7 +502,7 @@ pub struct MemberPath {
 }
 
 /// One step in a [`MemberPath`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PathSegment {
     Field(String),
     Index(Box<Expr>),
@@ -535,7 +536,7 @@ impl MemberPath {
 ///
 /// Not `Copy` or `Eq`: [`Quantifier::Count`] carries an expression, and
 /// expressions contain floats.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Quantifier {
     Any,
     All,
@@ -549,7 +550,7 @@ pub enum Quantifier {
 }
 
 /// The set of strings a quantifier ranges over.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum StringSet {
     /// `them` — every string in the rule.
     All,
@@ -562,7 +563,7 @@ pub enum StringSet {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ArithOp {
     Add,
     Sub,
@@ -571,7 +572,7 @@ pub enum ArithOp {
     Mod,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BitOp {
     And,
     Or,
@@ -580,7 +581,7 @@ pub enum BitOp {
     Shr,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CmpOp {
     Eq,
     Ne,
@@ -590,7 +591,7 @@ pub enum CmpOp {
     Ge,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StringOp {
     Contains,
     IContains,

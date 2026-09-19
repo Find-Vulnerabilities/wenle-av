@@ -54,6 +54,7 @@
 pub mod ast;
 pub mod atoms;
 pub mod compiler;
+pub mod database;
 pub mod hex;
 pub mod lexer;
 pub mod matcher;
@@ -62,6 +63,7 @@ pub mod parser;
 pub mod prefilter;
 pub mod program;
 pub mod ruleset;
+pub mod scanner;
 pub mod vm;
 
 pub use ast::{

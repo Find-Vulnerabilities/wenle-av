@@ -57,6 +57,20 @@ impl MatchSet {
         self.slots.len()
     }
 
+    /// Clear every slot and resize to `string_count`.
+    ///
+    /// For reuse across the rules of one scan, which is why it clears in place
+    /// rather than starting over: every rule has a different string count, and
+    /// allocating a fresh table per rule would put an allocation on the path
+    /// that runs once per candidate rule per file. Slots that survive the
+    /// resize keep their capacity.
+    pub fn reset(&mut self, string_count: usize) {
+        for slot in &mut self.slots {
+            slot.clear();
+        }
+        self.slots.resize_with(string_count, Vec::new);
+    }
+
     /// Record a match.
     ///
     /// A slot past the end is dropped rather than panicking. The slot comes

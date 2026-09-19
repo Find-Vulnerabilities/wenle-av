@@ -30,6 +30,7 @@
 //! Collapsing that into `0` would make `pe.entry_point == 0` fire on every
 //! non-executable file — a false positive manufactured out of a missing field.
 
+use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::rc::Rc;
 
@@ -122,12 +123,37 @@ impl std::fmt::Display for Value {
 /// `Op::Push` carries an index into this rather than the value, which keeps
 /// every instruction the same small size whether it pushes `1` or a 4 KiB
 /// string literal.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Const {
     Bool(bool),
     Int(i64),
     Float(f64),
+    /// Serialised through [`rc_str`] rather than by turning on serde's `rc`
+    /// feature: that feature would apply to every `Rc` and `Arc` in the
+    /// workspace, which is a large change to make for one field, and it makes
+    /// shared ownership silently serialisable in places where sharing is
+    /// meaningless.
+    #[serde(with = "rc_str")]
     Str(Rc<str>),
+}
+
+/// Serde adapter for a reference-counted string.
+///
+/// It is written and read as a plain string. The refcount is deliberately not
+/// preserved: what comes back is a fresh `Rc` holding the same text, which is
+/// what the interpreter wants and what makes the round-trip test meaningful.
+mod rc_str {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::rc::Rc;
+
+    pub fn serialize<S: Serializer>(value: &Rc<str>, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(value)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Rc<str>, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Ok(Rc::from(text.as_str()))
+    }
 }
 
 impl Const {
@@ -146,7 +172,7 @@ impl Const {
 /// Each gets its own opcode rather than a shared opcode with a modifier byte:
 /// the interpreter dispatches on a single integer either way, and separate
 /// opcodes keep the disassembly readable when a rule misbehaves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum Cmp {
     Contains,
@@ -177,7 +203,7 @@ impl Cmp {
 /// Kept to a single machine word so a program is a compact array. The payload of
 /// every variant is an index or a small count — never a value — which is what
 /// makes that possible with a data-carrying enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum Op {
     /// Push `constants[0]`.
@@ -332,7 +358,7 @@ impl Op {
 /// A compiled condition.
 ///
 /// Produced by `compiler::compile_condition` and executed by `vm::run`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Program {
     pub code: Vec<Op>,
     pub constants: Vec<Const>,
@@ -355,6 +381,20 @@ pub struct Program {
     /// checks this against its own capacity, which is what stops a corrupt rule
     /// database from pushing the interpreter past its guard.
     pub max_stack: u32,
+    /// String slots the condition cannot be true without.
+    ///
+    /// From [`crate::compiler::required_slots`], and read by the prefilter
+    /// rather than the interpreter. A conjunction of strings — `$a and $b` —
+    /// means the rule is only worth evaluating when both are still possible,
+    /// which is a far stronger filter than the "any string might be present"
+    /// the atom tables alone can support. Empty means nothing could be proven,
+    /// which the prefilter reads as that weaker disjunction.
+    ///
+    /// Sorted and deduplicated, and every slot is within `string_count`. The
+    /// prefilter relies on the sort: the list is serialised into the rule
+    /// database, so two compilations of one rule set have to produce the same
+    /// bytes.
+    pub required_strings: Vec<u32>,
     /// Source span of the condition, for diagnostics.
     pub span: Span,
 }
@@ -367,6 +407,7 @@ impl Program {
             string_count: 0,
             max_steps: 0,
             max_stack: 0,
+            required_strings: Vec::new(),
             span,
         }
     }

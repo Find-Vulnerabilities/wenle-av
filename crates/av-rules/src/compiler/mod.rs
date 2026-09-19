@@ -37,9 +37,11 @@
 //! way.
 
 mod error;
+mod required;
 mod strings;
 
 pub use error::CompileError;
+pub use required::required_slots;
 pub use strings::StringTable;
 
 use crate::ast::{ArithOp, BitOp, CmpOp, Expr, Quantifier, Rule, Span, StringOp};
@@ -90,6 +92,12 @@ pub fn compile_condition(
     compiler.program.compute_limits();
     compiler.program.string_count = u32::try_from(strings.len())
         .map_err(|_| CompileError::too_many_strings(strings.len(), span))?;
+    // What the condition cannot be true without, for the prefilter. Computed
+    // here rather than by whoever builds a rule database because this is the
+    // last point at which the condition is still an AST — after this it is
+    // bytecode, and recovering the conjunction from jumps is a different and
+    // much harder problem.
+    compiler.program.required_strings = required_slots(condition, strings);
     Ok(compiler.program)
 }
 

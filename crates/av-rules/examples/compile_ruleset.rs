@@ -37,7 +37,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use av_rules::compiler::{compile_rule, CompileError};
-use av_rules::prefilter::{Prefilter, RuleStrings};
+use av_rules::prefilter::{Prefilter, RuleFilter, RuleStrings};
 use av_rules::ruleset;
 
 fn main() -> ExitCode {
@@ -88,8 +88,10 @@ fn run() -> ExitCode {
     let mut instructions = 0usize;
     let mut constants = 0usize;
     // Every compiled rule's strings, in rule order, so the prefilter can be
-    // built from the real rule set rather than from a guess about it.
-    let mut atoms: Vec<RuleStrings> = Vec::new();
+    // built from the real rule set rather than from a guess about it — along
+    // with what each condition requires, which is what decides whether the
+    // rule-level filter is a conjunction or a disjunction.
+    let mut filters: Vec<RuleFilter> = Vec::new();
     let mut rules_without_atoms = 0usize;
     let mut string_refusals: BTreeMap<&'static str, (usize, String)> = BTreeMap::new();
 
@@ -145,7 +147,10 @@ fn run() -> ExitCode {
                     if rule_atoms.iter().all(|atoms| atoms.is_empty()) {
                         rules_without_atoms += 1;
                     }
-                    atoms.push(rule_atoms);
+                    filters.push(RuleFilter {
+                        strings: rule_atoms,
+                        required: program.required_strings.clone(),
+                    });
 
                     if shown < show {
                         shown += 1;
@@ -226,7 +231,7 @@ fn run() -> ExitCode {
         }
     }
 
-    report_prefilter(&atoms, rules_without_atoms);
+    report_prefilter(&filters, rules_without_atoms);
 
     ExitCode::SUCCESS
 }
@@ -237,9 +242,9 @@ fn run() -> ExitCode {
 /// that selects most of the rule set on every file has bought nothing, and the
 /// only way to know which way it went is to build one out of the rules that
 /// actually ship and measure it against a buffer.
-fn report_prefilter(atoms: &[RuleStrings], rules_without_atoms: usize) {
+fn report_prefilter(filters: &[RuleFilter], rules_without_atoms: usize) {
     let started = Instant::now();
-    let prefilter = Prefilter::build(atoms);
+    let prefilter = Prefilter::build(filters);
     let stats = prefilter.stats();
     println!("\n=== prefilter ===");
     println!(
