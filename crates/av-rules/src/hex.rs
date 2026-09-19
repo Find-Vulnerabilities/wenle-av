@@ -88,8 +88,22 @@ impl<'a> Parser<'a> {
     }
 
     fn skip_space(&mut self) {
-        while matches!(self.peek(), Some(b' ' | b'\t' | b'\r' | b'\n')) {
-            self.pos += 1;
+        loop {
+            while matches!(self.peek(), Some(b' ' | b'\t' | b'\r' | b'\n')) {
+                self.pos += 1;
+            }
+            // Hex patterns in real rule sets annotate nearly every token:
+            // `88 4C 34 10  //mov byte ptr [esp + esi + 0x10], cl`. Treating
+            // `//` as anything but a comment makes those patterns unparseable,
+            // and a hex pattern that fails to parse is a rule that silently
+            // never fires.
+            if self.peek() == Some(b'/') && self.src.get(self.pos + 1) == Some(&b'/') {
+                while !matches!(self.peek(), None | Some(b'\n')) {
+                    self.pos += 1;
+                }
+                continue;
+            }
+            break;
         }
     }
 
@@ -99,6 +113,24 @@ impl<'a> Parser<'a> {
             true
         } else {
             false
+        }
+    }
+
+    /// Consume `byte`, which the caller has already peeked.
+    ///
+    /// The consumption must never live inside a `debug_assert!`. An assertion
+    /// is stripped from the release build — the build that ships — so
+    /// `debug_assert!(self.eat(b'('))` left the `(` unconsumed in release while
+    /// behaving correctly under `cargo test`. The result was that
+    /// `( AA | BB )` recursed between `parse_pattern` and `parse_alternative`
+    /// until the stack was gone, in the shipping build only, with a green test
+    /// suite. A guard that disappears in release is not a guard.
+    fn expect_byte(&mut self, byte: u8) -> Result<(), HexError> {
+        debug_assert_eq!(self.peek(), Some(byte), "caller peeked a different byte");
+        if self.eat(byte) {
+            Ok(())
+        } else {
+            Err(self.error(format!("expected `{}`", byte as char)))
         }
     }
 
@@ -174,11 +206,26 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `[n]`, `[n-m]`, `[n-]`.
+    /// `[n]`, `[n-m]`, `[n-]`, `[-]`.
     fn parse_jump(&mut self) -> Result<HexToken, HexError> {
         let start = self.pos;
-        debug_assert!(self.eat(b'['));
+        self.expect_byte(b'[')?;
         self.skip_space();
+        // `[-]` is an unbounded jump — any number of bytes, including none.
+        // It appears in the middle of long patterns where the author was
+        // splicing in a gap to keep the surrounding code aligned, so refusing
+        // it would reject the whole rule over a detail that carries no
+        // matching constraint.
+        if self.eat(b'-') {
+            self.skip_space();
+            if !self.eat(b']') {
+                return Err(HexError {
+                    message: "`[-]` takes no bounds; expected `]`".into(),
+                    offset: start,
+                });
+            }
+            return Ok(HexToken::Jump { min: 0, max: None });
+        }
         let min = self.parse_number()?;
         self.skip_space();
         let max = if self.eat(b'-') {
@@ -224,7 +271,7 @@ impl<'a> Parser<'a> {
     /// `( AA | BB CC )`.
     fn parse_alternative(&mut self) -> Result<HexToken, HexError> {
         let start = self.pos;
-        debug_assert!(self.eat(b'('));
+        self.expect_byte(b'(')?;
         let mut branches = Vec::new();
         loop {
             let branch = self.parse_pattern()?;
@@ -262,7 +309,7 @@ impl<'a> Parser<'a> {
     /// `~AA`, `~( AA | BB )`.
     fn parse_negation(&mut self) -> Result<HexToken, HexError> {
         let start = self.pos;
-        debug_assert!(self.eat(b'~'));
+        self.expect_byte(b'~')?;
         self.skip_space();
         let inner = match self.peek() {
             // A single-branch, single-token alternative collapses to that
@@ -309,6 +356,14 @@ impl<'a> Parser<'a> {
 
 #[cfg(test)]
 mod tests {
+    //! Run these under `cargo test --release` as well as the default profile.
+    //!
+    //! The parser once consumed delimiters inside `debug_assert!`, which made
+    //! `( AA | BB )` recurse until the stack ran out — in release only, while
+    //! every debug-build test passed. A green default `cargo test` therefore
+    //! says nothing about the build that ships, and the alternatives and
+    //! negation tests below are the ones that catch this class of mistake.
+
     use super::*;
 
     fn p(body: &str) -> HexPattern {
@@ -483,6 +538,56 @@ mod tests {
     #[test]
     fn lowercase_hex_digits_are_accepted() {
         assert_eq!(p("4d 5a").tokens, vec![HexToken::Byte(0x4D), HexToken::Byte(0x5A)]);
+    }
+
+    #[test]
+    fn comments_inside_a_pattern_are_ignored() {
+        // Rule authors annotate nearly every token of a long pattern with the
+        // disassembly it came from. Refusing the comment would reject the whole
+        // rule over text that carries no matching constraint.
+        let pattern = p(
+            "8A 94 1C 10 01 ?? ??  //mov dl, byte ptr [esp + ebx + 0x110]\n\
+             8D 8C 24 10 01 ?? ??  //lea ecx, [esp + 0x110]\n\
+             46                    //inc esi",
+        );
+        // Seven tokens per annotated line, plus the trailing `46`.
+        assert_eq!(pattern.tokens.len(), 15);
+        assert_eq!(pattern.tokens[0], HexToken::Byte(0x8A));
+        assert_eq!(
+            pattern.tokens[7],
+            HexToken::Byte(0x8D),
+            "the second line must start at its own first byte"
+        );
+        assert_eq!(pattern.tokens[14], HexToken::Byte(0x46));
+    }
+
+    #[test]
+    fn a_comment_at_the_end_of_a_pattern_is_ignored() {
+        // Trailing comments are the common case, and `parse` rejects trailing
+        // input after the last token — so a comment left unskipped here would
+        // be read as trailing garbage.
+        assert_eq!(p("4D 5A  // MZ").tokens.len(), 2);
+    }
+
+    #[test]
+    fn a_lone_slash_is_not_a_comment() {
+        let e = err("4D 5A / 90");
+        assert!(e.message.contains('/'), "{e}");
+    }
+
+    #[test]
+    fn an_unbounded_jump_is_accepted() {
+        // `[-]` matches any number of bytes, including none.
+        let pattern = p("8D 05 [-] 4? 8D 4D ??");
+        assert_eq!(pattern.tokens[2], HexToken::Jump { min: 0, max: None });
+    }
+
+    #[test]
+    fn an_unbounded_jump_takes_no_bounds() {
+        // `[-]` and `[n-m]` are different forms; a bound after the `-` means
+        // the author wrote one of each and the pattern is not what they meant.
+        let e = err("8D 05 [-3] 90");
+        assert!(e.message.contains("`[-]`"), "{e}");
     }
 
     #[test]

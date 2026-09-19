@@ -435,17 +435,43 @@ pub enum Expr {
         quantifier: Quantifier,
         set: StringSet,
     },
+    /// `any of ($t*) in (0..504)` — the set must match inside the range.
+    ///
+    /// Distinct from [`Expr::Of`] because the range constrains where each
+    /// string matches, so the operand cannot be evaluated as a plain set.
+    OfIn {
+        quantifier: Quantifier,
+        set: StringSet,
+        from: Box<Expr>,
+        to: Box<Expr>,
+    },
     /// `for any of ($a*) : ( $ )` — the body sees `$` bound to each match.
     ForOf {
         quantifier: Quantifier,
         set: StringSet,
         body: Box<Expr>,
     },
-    /// `for any i in (0..pe.number_of_sections) : ( ... )`.
+    /// `for any i in (0..pe.number_of_sections) : ( ... )` — an integer range.
+    ///
+    /// Carries the quantifier because it is not decorative: `for all i in
+    /// (0..n)` and `for any i in (0..n)` differ exactly the way `all` and `any`
+    /// differ elsewhere, and dropping it silently turns one into the other.
     ForIn {
+        quantifier: Quantifier,
         var: String,
         from: Box<Expr>,
         to: Box<Expr>,
+        body: Box<Expr>,
+    },
+    /// `for any s in pe.sections : ( ... )` — iterating a module array.
+    ///
+    /// Separate from [`Expr::ForIn`] because the operands are different kinds
+    /// of thing: one counts between two integers, the other walks a sequence
+    /// whose length is only known once the module has been evaluated.
+    ForEach {
+        quantifier: Quantifier,
+        var: String,
+        iterable: Box<Expr>,
         body: Box<Expr>,
     },
     /// The `$` placeholder inside a `for ... of` body.

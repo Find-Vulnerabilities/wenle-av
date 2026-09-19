@@ -387,6 +387,19 @@ impl Parser {
                 "`=` after the meta key",
             )?;
 
+            // `quality = -107`. Machine-scored rule sets use a signed meta
+            // value as a score adjustment, so a leading `-` is a value and not
+            // an error. It is only consumed when a number actually follows, so
+            // a stray `-` still produces the error the author needs to see.
+            let negative = self.check(|k| matches!(k, TokenKind::Minus))
+                && matches!(
+                    self.peek_at(1).kind,
+                    TokenKind::Integer(_) | TokenKind::Float(_)
+                );
+            if negative {
+                self.advance();
+            }
+
             let val_tok = self.peek().clone();
             let value = match &val_tok.kind {
                 TokenKind::Literal(bytes) => {
@@ -395,13 +408,14 @@ impl Parser {
                     MetaValue::Text(text)
                 }
                 TokenKind::Integer(i) => {
-                    let i = *i;
+                    let i = if negative { i.saturating_neg() } else { *i };
                     self.advance();
                     MetaValue::Integer(i)
                 }
                 TokenKind::Float(x) => {
                     // `RuleMeta` has no float slot, and a float meta value is
                     // almost always a mistaken version string anyway.
+                    let x = if negative { -x } else { *x };
                     let text = x.to_string();
                     self.advance();
                     MetaValue::Text(text)
@@ -905,6 +919,25 @@ impl Parser {
 
     fn parse_of_body(&mut self, quantifier: Quantifier) -> Result<Expr, ParseError> {
         let set = self.parse_string_set()?;
+        // `any of ($t*) in (8..504)`. The range restricts where each string may
+        // match, so this is a different question from `any of ($t*)` and cannot
+        // be expressed by wrapping the set in a `StringIn`.
+        if self.eat_word("in").is_some() {
+            self.expect_token(|k| matches!(k, TokenKind::LParen), "`(` after `in`")?;
+            let from = self.parse_expr()?;
+            self.expect_token(|k| matches!(k, TokenKind::DotDot), "`..` in the range")?;
+            let to = self.parse_expr()?;
+            self.expect_token(
+                |k| matches!(k, TokenKind::RParen),
+                "`)` closing the `of ... in` range",
+            )?;
+            return Ok(Expr::OfIn {
+                quantifier,
+                set,
+                from: Box::new(from),
+                to: Box::new(to),
+            });
+        }
         Ok(Expr::Of { quantifier, set })
     }
 
@@ -951,9 +984,10 @@ impl Parser {
         Ok(StringSet::List { names, prefixes })
     }
 
-    /// `for any of ($a*) : ( $ )` and `for all i in (0..n) : ( ... )`.
+    /// `for any of ($a*) : ( $ )`, `for all i in (0..n) : ( ... )`, and
+    /// `for any s in pe.sections : ( ... )`.
     fn parse_for(&mut self) -> Result<Expr, ParseError> {
-        let Some(quantifier) = self.peek_quantifier_keyword() else {
+        let Some(quantifier) = self.peek_for_quantifier() else {
             return Err(self.error_here("expected `any`, `all`, `none` or a count after `for`"));
         };
         self.advance();
@@ -971,17 +1005,51 @@ impl Parser {
 
         let var = self.expect_identifier("a loop variable")?;
         self.expect_word("in")?;
-        self.expect_token(|k| matches!(k, TokenKind::LParen), "`(` after `in`")?;
-        let from = self.parse_expr()?;
-        self.expect_token(|k| matches!(k, TokenKind::DotDot), "`..` in the loop range")?;
-        let to = self.parse_expr()?;
-        self.expect_token(|k| matches!(k, TokenKind::RParen), "`)` closing the loop range")?;
+
+        // Two operands are possible here. `(a..b)` is an integer range;
+        // anything else — `pe.sections`, a call, a parenthesised expression —
+        // is a sequence to walk. The range form is recognised by the `..`
+        // after the first expression, so the leading `(` cannot decide it.
+        if self.check(|k| matches!(k, TokenKind::LParen)) {
+            self.advance();
+            let first = self.parse_expr()?;
+            if self.eat_kind(|k| matches!(k, TokenKind::DotDot)) {
+                let to = self.parse_expr()?;
+                self.expect_token(|k| matches!(k, TokenKind::RParen), "`)` closing the loop range")?;
+                self.expect_token(|k| matches!(k, TokenKind::Colon), "`:` before the loop body")?;
+                let body = self.parse_loop_body()?;
+                return Ok(Expr::ForIn {
+                    quantifier,
+                    var,
+                    from: Box::new(first),
+                    to: Box::new(to),
+                    body: Box::new(body),
+                });
+            }
+            self.expect_token(
+                |k| matches!(k, TokenKind::RParen),
+                "`)` closing the loop iterable",
+            )?;
+            // `( expr )` is `expr`, so the parentheses need no node of their own.
+            return self.finish_foreach(quantifier, var, first);
+        }
+
+        let iterable = self.parse_expr()?;
+        self.finish_foreach(quantifier, var, iterable)
+    }
+
+    fn finish_foreach(
+        &mut self,
+        quantifier: Quantifier,
+        var: String,
+        iterable: Expr,
+    ) -> Result<Expr, ParseError> {
         self.expect_token(|k| matches!(k, TokenKind::Colon), "`:` before the loop body")?;
         let body = self.parse_loop_body()?;
-        Ok(Expr::ForIn {
+        Ok(Expr::ForEach {
+            quantifier,
             var,
-            from: Box::new(from),
-            to: Box::new(to),
+            iterable: Box::new(iterable),
             body: Box::new(body),
         })
     }
@@ -993,7 +1061,15 @@ impl Parser {
         Ok(body)
     }
 
-    fn peek_quantifier_keyword(&self) -> Option<Quantifier> {
+    /// The quantifier after `for`: a keyword, or a count.
+    ///
+    /// `for 12 resource in pe.resources : ( ... )` requires at least twelve of
+    /// the resources to satisfy the body. Only the keyword forms used to be
+    /// accepted, so a counted loop was a syntax error.
+    fn peek_for_quantifier(&self) -> Option<Quantifier> {
+        if let TokenKind::Integer(v) = self.peek().kind {
+            return Some(Quantifier::Count(Box::new(Expr::Int(v))));
+        }
         quantifier_keyword(self.peek())
     }
 }
@@ -1093,16 +1169,22 @@ fn apply_meta(meta: &mut RuleMeta, key: &str, value: MetaValue) {
         }
         "family" => set_once(&mut meta.family, text(&value)),
         "variant" => set_once(&mut meta.variant, text(&value)),
-        "weight" => {
-            if let Some(w) = parse_u16(&value) {
-                set_once(&mut meta.weight, w);
+        // Both of these are `u16`/`u8` in the typed metadata, so a value that
+        // does not fit is kept verbatim in `extra` instead of being dropped.
+        // Silently discarding `quality = -107` would leave a rule looking
+        // unscored when its author had in fact supplied a score.
+        "weight" => match parse_u16(&value) {
+            Some(w) => set_once(&mut meta.weight, w),
+            None => {
+                meta.extra.insert(key.to_string(), value);
             }
-        }
-        "quality" => {
-            if let Some(q) = parse_u16(&value).and_then(|q| u8::try_from(q).ok()) {
-                set_once(&mut meta.quality, q);
+        },
+        "quality" => match parse_u16(&value).and_then(|q| u8::try_from(q).ok()) {
+            Some(q) => set_once(&mut meta.quality, q),
+            None => {
+                meta.extra.insert(key.to_string(), value);
             }
-        }
+        },
         "decisive" => {
             meta.decisive = match &value {
                 MetaValue::Boolean(b) => *b,
@@ -1841,5 +1923,135 @@ mod tests {
             }
             other => panic!("expected a hex pattern, got {other:?}"),
         }
+    }
+
+    // -- constructs found in third-party rule sets --------------------------
+
+    #[test]
+    fn a_negative_meta_value_keeps_its_sign() {
+        // `quality = -107` appears in machine-scored rule sets, where the value
+        // is a signed adjustment rather than a count or a version.
+        let file = parse_file(r#"rule r { meta: quality = -107 condition: true }"#).unwrap();
+        assert_eq!(
+            file.rules[0].meta.extra.get("quality"),
+            Some(&MetaValue::Integer(-107))
+        );
+    }
+
+    #[test]
+    fn a_negative_sign_without_a_number_is_still_an_error() {
+        let e = err(r#"rule r { meta: author = -"x" condition: true }"#);
+        assert!(e.message.contains("meta value"), "{e}");
+    }
+
+    #[test]
+    fn an_of_set_can_be_constrained_to_a_range() {
+        // `any of ($t*) in (8..504)` asks whether the set matches *within* the
+        // range, which is a different question from `any of ($t*)`.
+        let e = cond("any of ($t*) in (8 .. 504)");
+        match e {
+            Expr::OfIn {
+                quantifier,
+                set,
+                from,
+                to,
+            } => {
+                assert_eq!(quantifier, Quantifier::Any);
+                assert_eq!(
+                    set,
+                    StringSet::List {
+                        names: vec![],
+                        prefixes: vec!["t".into()]
+                    }
+                );
+                assert_eq!(*from, Expr::Int(8));
+                assert_eq!(*to, Expr::Int(504));
+            }
+            other => panic!("expected an `of ... in`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_of_set_without_a_range_is_still_a_plain_of() {
+        assert!(matches!(cond("any of them"), Expr::Of { .. }));
+    }
+
+    #[test]
+    fn a_for_loop_quantifier_may_be_a_count() {
+        // `for 12 resource in pe.resources : ( ... )` means at least twelve of
+        // the resources must satisfy the body.
+        let e = cond("for 12 resource in pe.resources : ( resource.type == 10 )");
+        match e {
+            Expr::ForEach {
+                quantifier, var, ..
+            } => {
+                assert_eq!(quantifier, Quantifier::Count(Box::new(Expr::Int(12))));
+                assert_eq!(var, "resource");
+            }
+            other => panic!("expected a counted `for .. in`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_for_loop_can_iterate_a_module_array() {
+        let e = cond(r#"for any s in pe.sections : ( s.name == ".text" )"#);
+        match e {
+            Expr::ForEach {
+                quantifier,
+                var,
+                iterable,
+                ..
+            } => {
+                assert_eq!(quantifier, Quantifier::Any);
+                assert_eq!(var, "s");
+                match *iterable {
+                    Expr::Field { path } => assert_eq!(path.render(), "pe.sections"),
+                    other => panic!("expected the array field, got {other:?}"),
+                }
+            }
+            other => panic!("expected a `for .. in` over an array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_parenthesised_iterable_is_the_same_as_a_bare_one() {
+        // `( expr )` carries no meaning of its own, so it must not become a
+        // separate node that the compiler then has to understand.
+        let bare = cond("for any s in pe.sections : ( s.id == 1 )");
+        let wrapped = cond("for any s in (pe.sections) : ( s.id == 1 )");
+        assert_eq!(bare, wrapped);
+    }
+
+    #[test]
+    fn a_for_range_keeps_its_quantifier() {
+        // The quantifier is not decorative: `for all i in (0..n)` and
+        // `for any i in (0..n)` ask opposite questions. It used to be dropped
+        // while parsing, which silently turned one into the other.
+        let e = cond("for all i in (0 .. pe.number_of_sections) : ( i > 0 )");
+        match e {
+            Expr::ForIn { quantifier, var, .. } => {
+                assert_eq!(quantifier, Quantifier::All);
+                assert_eq!(var, "i");
+            }
+            other => panic!("expected a `for .. in` range, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_for_range_and_a_for_array_are_distinguished_by_the_dotdot() {
+        assert!(matches!(
+            cond("for any i in (0 .. 10) : ( i > 0 )"),
+            Expr::ForIn { .. }
+        ));
+        assert!(matches!(
+            cond("for any i in pe.sections : ( i > 0 )"),
+            Expr::ForEach { .. }
+        ));
+    }
+
+    #[test]
+    fn a_for_loop_needs_a_quantifier() {
+        let e = err("rule r { condition: for in (0..1) : ( true ) }");
+        assert!(e.message.contains("after `for`"), "{e}");
     }
 }
