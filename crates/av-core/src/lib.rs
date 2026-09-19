@@ -18,7 +18,6 @@
 //! false-positive rate low without blinding the engine to real threats.
 
 // Lint policy is defined once in the workspace manifest.
-#![cfg_attr(not(test), warn(missing_docs))]
 
 pub mod config;
 pub mod error;

@@ -1,0 +1,30 @@
+[package]
+name = "av-rules"
+description = "Native rule language: parser, compiler, bytecode virtual machine and pattern matchers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+av-core.workspace = true
+
+serde.workspace = true
+thiserror.workspace = true
+log.workspace = true
+bitflags.workspace = true
+smallvec.workspace = true
+aho-corasick.workspace = true
+regex.workspace = true
+once_cell.workspace = true
+byteorder.workspace = true
+bincode.workspace = true
+hex.workspace = true
+memmap2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

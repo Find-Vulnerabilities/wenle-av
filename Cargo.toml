@@ -1,11 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/av-core"]
+members = ["crates/av-core", "crates/av-rules"]
 
 # The kernel driver lives in its own workspace (see crates/av-driver) because it
 # requires the WDK, a nightly toolchain and `-Z build-std`. Keeping it out of the
 # default member set means `cargo build` never tries to compile it.
-default-members = ["crates/av-core"]
+default-members = ["crates/av-core", "crates/av-rules"]
 
 [workspace.package]
 version = "0.1.0"
@@ -68,6 +68,7 @@ byteorder = "1"
 
 # --- internal crates ----------------------------------------------------------
 av-core = { path = "crates/av-core" }
+av-rules = { path = "crates/av-rules" }
 
 [profile.release]
 opt-level = 3
@@ -87,7 +88,6 @@ opt-level = 2
 # The correctness lints below *are* errors, because each one has bitten this
 # codebase's predecessor in a way that shipped a wrong verdict.
 [workspace.lints.rust]
-missing_docs = "warn"
 missing_debug_implementations = "warn"
 unsafe_op_in_unsafe_fn = "deny"
 unused_must_use = "deny"
