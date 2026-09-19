@@ -57,16 +57,23 @@ const MAX_DEPTH: u32 = 128;
 
 /// Compile a rule's condition.
 pub fn compile_rule(rule: &Rule) -> Result<Program, CompileError> {
-    let table = StringTable::from_defs(&rule.strings);
-    let mut program = compile_condition(&rule.condition, &table, rule.span)?;
-    program.string_count = u32::try_from(table.len())
-        .map_err(|_| CompileError::too_many_strings(table.len(), rule.span))?;
-    Ok(program)
+    compile_condition(
+        &rule.condition,
+        &StringTable::from_defs(&rule.strings),
+        rule.span,
+    )
 }
 
 /// Compile a condition against a set of string definitions.
 ///
 /// `span` is reported in errors; the AST does not carry one per node.
+///
+/// The resulting program carries `string_count` from the table, and that field
+/// is what the scanner sizes its match table from. Leaving it to the caller
+/// would be a trap rather than an inconvenience: a program compiled here with a
+/// zero count silently drops every match it is handed, so a rule with strings
+/// would evaluate as though none of them were present and never fire — with no
+/// error anywhere to say why.
 pub fn compile_condition(
     condition: &Expr,
     strings: &StringTable,
@@ -81,6 +88,8 @@ pub fn compile_condition(
     compiler.compile(condition)?;
     compiler.program.emit(Op::Ret);
     compiler.program.compute_limits();
+    compiler.program.string_count = u32::try_from(strings.len())
+        .map_err(|_| CompileError::too_many_strings(strings.len(), span))?;
     Ok(compiler.program)
 }
 
