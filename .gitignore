@@ -1,0 +1,16 @@
+/target
+**/target
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.obj
+
+# Compiled rule databases are build artefacts, not sources.
+*.avdb
+
+# Local runtime state
+/data/quarantine
+/data/logs
+/data/cache
+/data/config.toml
