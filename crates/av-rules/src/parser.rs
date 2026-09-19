@@ -741,6 +741,11 @@ impl Parser {
                 "endswith" => by_token(BinOp::Str(StringOp::EndsWith), PREC_CMP),
                 "iendswith" => by_token(BinOp::Str(StringOp::IEndsWith), PREC_CMP),
                 "iequals" => by_token(BinOp::Str(StringOp::IEquals), PREC_CMP),
+                // `a equals b` is case-sensitive equality, the counterpart to
+                // `iequals`. Its absence is silent rather than loud: without
+                // this arm the word is just an identifier, so a rule using it
+                // stops parsing at `equals` and the whole rule is dropped.
+                "equals" => by_token(BinOp::Str(StringOp::Equals), PREC_CMP),
                 "matches" => by_token(BinOp::Str(StringOp::Matches), PREC_CMP),
                 _ => None,
             },
@@ -1890,6 +1895,9 @@ mod tests {
             ("\"a\" startswith \"b\"", StringOp::StartsWith),
             ("\"a\" endswith \"b\"", StringOp::EndsWith),
             ("\"a\" iequals \"b\"", StringOp::IEquals),
+            ("\"a\" equals \"b\"", StringOp::Equals),
+            ("\"a\" istartswith \"b\"", StringOp::IStartsWith),
+            ("\"a\" iendswith \"b\"", StringOp::IEndsWith),
             ("\"a\" matches /b/", StringOp::Matches),
         ] {
             match cond(src) {

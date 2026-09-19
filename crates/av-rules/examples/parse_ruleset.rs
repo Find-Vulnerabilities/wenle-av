@@ -18,14 +18,8 @@
 //! without unwinding, so the last name printed is the only clue about where it
 //! happened.
 //!
-//! # Why the split is line-based
-//!
-//! Tracking brace depth would need to know about regex literals, because
-//! `/ab{2}/` contains a brace that is not a block delimiter. Every rule set in
-//! practice writes one rule per block with the closing brace alone on a line,
-//! so splitting on `rule`-header lines and `^}` lines is both simpler and more
-//! reliable. The splitter verifies its own work: chunks that do not begin with
-//! `rule` and end with `}` are counted and reported rather than parsed.
+//! The split itself lives in `av_rules::ruleset`, shared with the compiler's
+//! coverage tool, so that both agree on what one rule is.
 
 // An example is a program whose job is to fail loudly when given bad input, so
 // the panic-family lints that guard the library do not apply here.
@@ -68,18 +62,36 @@ fn run() -> ExitCode {
     };
 
     let started = Instant::now();
-    let (chunks, malformed) = if env::var_os("PARSE_WHOLE").is_some() {
-        (vec![(1usize, source.as_str())], 0usize)
+    let whole = env::var_os("PARSE_WHOLE").is_some();
+    let split = if whole {
+        av_rules::ruleset::Split {
+            chunks: vec![av_rules::ruleset::Chunk {
+                line: 1,
+                text: &source,
+            }],
+            headers: 1,
+            malformed: 0,
+        }
     } else {
-        split_rules(&source)
+        av_rules::ruleset::split_rule_chunks(&source)
     };
     let split_elapsed = started.elapsed();
 
     println!(
-        "{} bytes, {} rule chunks, {malformed} chunks the splitter could not delimit",
+        "{} bytes, {} rule chunks, {} chunks the splitter could not delimit",
         source.len(),
-        chunks.len()
+        split.chunks.len(),
+        split.malformed
     );
+    if split.unaccounted() > 0 {
+        // Loud, because it means rules the parser never saw. Every count below
+        // would be an undercount and nothing else in the pipeline would say so.
+        println!(
+            "WARNING: {} `rule` headers produced no chunk — the splitter dropped rules",
+            split.unaccounted()
+        );
+    }
+    let chunks = split.chunks;
 
     let mut parsed_chunks = 0usize;
     let mut rule_count = 0usize;
@@ -89,7 +101,8 @@ fn run() -> ExitCode {
     let mut parse_elapsed = std::time::Duration::ZERO;
 
     let trace = env::var_os("PARSE_TRACE").is_some();
-    for (line, text) in &chunks {
+    for chunk in &chunks {
+        let (line, text) = (chunk.line, chunk.text);
         if trace {
             // A stack overflow aborts the process without unwinding, so the
             // only way to find the offending rule is to name it beforehand.
@@ -183,99 +196,6 @@ fn bucket(message: &str) -> String {
         }
     }
     out
-}
-
-/// Split into `(starting line number, rule text)` pairs.
-///
-/// A hex string closes with a brace alone on a line — `        }` — which is
-/// character-for-character what a rule's closing brace looks like. Taking that
-/// for the end of the rule truncates it: the remaining strings and the whole
-/// `condition:` block vanish, and the fragment that survives parses as a rule
-/// that is simply missing its condition. So the splitter tracks whether it is
-/// inside a hex block and only a brace outside one ends the rule.
-fn split_rules(source: &str) -> (Vec<(usize, &str)>, usize) {
-    let mut chunks = Vec::new();
-    let mut malformed = 0usize;
-    let mut start: Option<(usize, usize)> = None; // (line, byte offset)
-    let mut in_hex = false;
-
-    // `str::lines` yields subslices of `source`, so a line's distance from the
-    // start of the source is just its pointer difference. That is how each
-    // chunk gets a byte range without re-scanning for offsets.
-    let base = source.as_ptr() as usize;
-
-    for (index, line) in source.lines().enumerate() {
-        let line_no = index.saturating_add(1);
-        let line_offset = line.as_ptr() as usize - base;
-        let trimmed = line.trim();
-
-        if start.is_none() {
-            if is_rule_header(line.trim_start()) {
-                start = Some((line_no, line_offset));
-            }
-            continue;
-        }
-
-        if in_hex {
-            if trimmed == "}" {
-                in_hex = false;
-            }
-            continue;
-        }
-
-        // `$a = {` opens a hex block, and so does `$a = { 4D 5A` with the body
-        // already begun. Hex bodies hold only hex digits, wildcards, brackets
-        // and parentheses — never braces — so an unbalanced brace on a line
-        // that names a string can only be the start of one.
-        if trimmed.contains('$') && line.matches('{').count() > line.matches('}').count() {
-            in_hex = true;
-            continue;
-        }
-
-        if trimmed != "}" {
-            continue;
-        }
-
-        let (from_line, offset) = start.take().expect("checked by `start.is_some()`");
-        let text = &source[offset..line_offset + line.len()];
-        // A rule without a `condition:` section is not a rule. Checking for one
-        // turns any truncation this splitter still gets wrong into a counted
-        // failure rather than a silently mis-parsed rule.
-        if text.trim_start().contains("rule ") && text.trim_end().ends_with('}') && has_condition(text)
-        {
-            chunks.push((from_line, text));
-        } else {
-            malformed += 1;
-        }
-    }
-    (chunks, malformed)
-}
-
-/// True when some line of the rule opens a `condition:` section.
-fn has_condition(text: &str) -> bool {
-    text.lines().any(|l| {
-        let t = l.trim_start();
-        t.strip_prefix("condition").is_some_and(|rest| rest.trim_start().starts_with(':'))
-    })
-}
-
-/// True for `rule name : tags` and its `private`/`global` prefixes.
-fn is_rule_header(trimmed: &str) -> bool {
-    let mut rest = trimmed;
-    loop {
-        if let Some(r) = rest.strip_prefix("private") {
-            rest = r.trim_start();
-        } else if let Some(r) = rest.strip_prefix("global") {
-            rest = r.trim_start();
-        } else {
-            break;
-        }
-    }
-    let Some(rest) = rest.strip_prefix("rule") else {
-        return false;
-    };
-    // The name must follow, so `rulex` is not a header.
-    matches!(rest.chars().next(), Some(c) if c.is_whitespace())
 }
 
 /// Record which condition constructs a rule uses, once per rule.

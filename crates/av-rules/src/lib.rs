@@ -52,9 +52,12 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod ast;
+pub mod compiler;
 pub mod hex;
 pub mod lexer;
 pub mod parser;
+pub mod program;
+pub mod ruleset;
 
 pub use ast::{
     ArithOp, BitOp, CmpOp, Expr, HexPattern, HexToken, MemberPath, MetaValue, Modifiers,
