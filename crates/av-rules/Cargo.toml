@@ -20,6 +20,7 @@ bitflags.workspace = true
 smallvec.workspace = true
 aho-corasick.workspace = true
 regex.workspace = true
+memchr.workspace = true
 once_cell.workspace = true
 byteorder.workspace = true
 bincode.workspace = true

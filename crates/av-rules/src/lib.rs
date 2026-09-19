@@ -55,6 +55,7 @@ pub mod ast;
 pub mod compiler;
 pub mod hex;
 pub mod lexer;
+pub mod matcher;
 pub mod matches;
 pub mod parser;
 pub mod program;

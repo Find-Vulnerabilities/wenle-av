@@ -362,40 +362,6 @@ impl Modifiers {
     pub fn matches_bytes(&self) -> bool {
         true
     }
-
-    /// How many distinct encodings this string expands into. Used to bound the
-    /// prefilter size — a `nocase wide xor(0x01-0xff) base64` string on a long
-    /// literal would otherwise explode into thousands of atoms.
-    pub fn variant_count(&self, literal_len: usize) -> usize {
-        let mut n = 1usize;
-        if self.ascii || !self.wide {
-            // ascii form counts once
-        }
-        if self.wide {
-            n += 1;
-        }
-        if self.nocase && literal_len > 0 {
-            // Case-insensitivity is handled by the matcher, not by generating
-            // 2^len literals; it costs nothing in variant count.
-        }
-        if let Some(x) = self.xor {
-            n = n.saturating_mul(x.len());
-        }
-        if let Some(b) = self.base64 {
-            let mut b64 = 0;
-            if b.standard {
-                b64 += 1;
-            }
-            if b.url_safe {
-                b64 += 1;
-            }
-            if b.wide {
-                b64 += 1;
-            }
-            n = n.saturating_mul(b64.max(1));
-        }
-        n
-    }
 }
 
 /// Expressions allowed in a `condition:` block.
@@ -760,14 +726,6 @@ mod tests {
         assert!(m.matches_bytes());
     }
 
-    #[test]
-    fn xor_variant_count_multiplies() {
-        let m = Modifiers {
-            xor: Some(XorRange { min: 1, max: 255 }),
-            ..Default::default()
-        };
-        assert_eq!(m.variant_count(8), 255);
-    }
 
     #[test]
     fn member_path_renders_dimensions() {

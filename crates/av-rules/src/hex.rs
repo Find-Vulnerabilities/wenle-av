@@ -40,9 +40,14 @@ impl fmt::Display for HexError {
 
 impl std::error::Error for HexError {}
 
-/// Largest jump we will accept. A `[0-]` jump against a 4 GiB buffer would
-/// otherwise generate an unbounded search per start offset.
-const MAX_JUMP: u32 = 1 << 20;
+/// Largest jump bound the language will accept.
+///
+/// A `[2000000]` jump is not a signature, it is a way to make the engine walk a
+/// buffer two million times per start offset. The bound is generous — a
+/// megabyte covers every real pattern by orders of magnitude — and it is public
+/// because the matcher enforces the same limit on patterns that did not come
+/// through this parser; one constant, so the two cannot drift apart.
+pub const MAX_JUMP: u32 = 1 << 20;
 
 /// Parse the body of a hex pattern (the text between the braces).
 pub fn parse(body: &str) -> Result<HexPattern, HexError> {

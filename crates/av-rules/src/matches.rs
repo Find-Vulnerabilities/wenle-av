@@ -81,7 +81,15 @@ impl MatchSet {
         }
     }
 
-    /// Drop overlapping duplicates, keeping the earliest and longest.
+    /// Drop overlapping duplicates in every slot, keeping the earliest and
+    /// longest.
+    pub fn dedup(&mut self) {
+        for slot in 0..self.slots.len() as u32 {
+            self.dedup_slot(slot);
+        }
+    }
+
+    /// The same, for one slot, after its matches have just been found.
     ///
     /// The same bytes can be found by more than one variant of a string —
     /// `"abc" ascii wide xor` produces several matchers that can land on the
@@ -89,8 +97,13 @@ impl MatchSet {
     /// `#a == 1` false and `all of them` unsatisfiable. Two matches that start
     /// at the same offset are one occurrence; the longer reading is kept
     /// because it is the one that consumed more of the buffer.
-    pub fn dedup(&mut self) {
-        for list in &mut self.slots {
+    ///
+    /// Doing this per string rather than once at the end is also what puts a
+    /// slot's offsets in order as soon as they are known, which `@a[i]`
+    /// depends on and which is much cheaper to maintain incrementally than to
+    /// re-establish later.
+    pub fn dedup_slot(&mut self, slot: u32) {
+        if let Some(list) = self.slots.get_mut(slot as usize) {
             list.sort_unstable();
             list.dedup_by(|later, earlier| {
                 if later.offset == earlier.offset {

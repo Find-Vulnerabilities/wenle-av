@@ -53,6 +53,7 @@ dependencies = [
  "byteorder",
  "hex",
  "log",
+ "memchr",
  "memmap2",
  "once_cell",
  "regex",
