@@ -48,9 +48,9 @@ use crate::ruleset;
 /// anything else, and readable in a hex dump.
 pub const MAGIC: [u8; 8] = *b"WENLEAV\0";
 
-/// Format version. Bump on any change to the layout of [`DatabaseImage`].
+/// Format version. Bump on any change to the layout of the serialised image.
 ///
-/// [`DatabaseImage`] is private, so the only way this can go unnoticed is a
+/// That image is private, so the only way this can go unnoticed is a
 /// serialised type changing underneath it — which is exactly what it is for.
 pub const FORMAT_VERSION: u32 = 1;
 

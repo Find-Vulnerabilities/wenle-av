@@ -25,9 +25,9 @@
 //! group must be satisfied, and a group is satisfied by any one of its atoms.
 //! A string with no groups — every form of it too short to have an atom —
 //! constrains nothing, and a rule with such a string has to be let through
-//! untested. Those rules are collected at build time into
-//! [`Prefilter::unfiltered`], and how many there are is the honest measure of
-//! how much the rule set can be filtered at all.
+//! untested. Those rules are collected at build time and reported as
+//! [`PrefilterStats::unfiltered_rules`], and how many there are is the honest
+//! measure of how much the rule set can be filtered at all.
 //!
 //! # What "must contain" means for a whole rule
 //!
@@ -40,7 +40,8 @@
 //! them is a common byte sequence, and on a Windows DLL most of them are. That
 //! is what `examples/scan_bench.rs` measured — 51% of the rule set selected on
 //! `notepad.exe`, 72% on `shell32.dll`, and 0.4 MB/s. The atoms were right; the
-//! rule-level reading was too weak.
+//! rule-level reading was too weak. With the conjunction read out of the
+//! condition, the same binaries select 5.8% and 12.7%.
 //!
 //! So [`RuleFilter::required`] carries the slots the condition cannot be true
 //! without, from [`crate::compiler::required_slots`]. `$a and $b and $c` gives
@@ -68,20 +69,26 @@
 //! matched.
 //!
 //! Measured against the 10,764-rule set this engine is built for — 8,715 rules
-//! that compile, 67,218 distinct atoms:
+//! that compile, 92,182 distinct atoms, 156 rules nothing can be said about:
 //!
 //! ```text
-//! 1 MiB of zeros    215 rules selected (2.47%)     47 MB/s
-//! 1 MiB of text     230 rules selected (2.64%)    125 MB/s
-//! 1 MiB random      234 rules selected (2.69%)     33 MB/s
+//! 1 MiB of zeros     156 rules selected (1.79%)     9 MB/s
+//! 1 MiB of text      156 rules selected (1.79%)    21 MB/s
+//! 1 MiB random       165 rules selected (1.89%)    14 MB/s
+//!
+//! notepad.exe        504 rules selected (5.78%)     6 MB/s
+//! kernel32.dll       702 rules selected (8.06%)     4 MB/s
+//! shell32.dll      1,108 rules selected (12.71%)    3 MB/s
 //! ```
 //!
-//! Throughput is the weak half of that. It is not proportional to the number of
-//! *matches*, which is near zero on the last two, but to the size of the
-//! automaton: the transition tables spill out of cache and every byte of the
-//! buffer pays for a miss. `examples/ac_bench.rs` measures the same effect in
-//! isolation — 154 MB/s at a thousand patterns, 84 at ten thousand, 22 at
-//! sixty-seven thousand.
+//! Selection is the number this module owns, and it is now low enough that the
+//! prefilter is no longer where the time goes: it is 17-32% of a real scan, and
+//! the rest is the strings that survived it. Throughput was the weak half and
+//! still is — it is not proportional to the number of *matches*, which is near
+//! zero on the synthetic buffers, but to the size of the automaton: the
+//! transition tables spill out of cache and every byte of the buffer pays for a
+//! miss. `examples/ac_bench.rs` measures the same effect in isolation — 154 MB/s
+//! at a thousand patterns, 84 at ten thousand, 22 at sixty-seven thousand.
 //!
 //! That is the range a signature engine of this kind lives in, so it is not
 //! broken; it is the known next thing to fix if scanning turns out to be the
@@ -96,6 +103,17 @@
 //! bytes, which is what [`crate::atoms::score`] does today, would cut the
 //! automaton, and there is a second pass over the rule set that could do it.
 //! Neither is worth building until something measures the end-to-end scan.
+//!
+//! # Checking that none of this costs a detection
+//!
+//! Everything above is a filter, and every filter here is an optimization that
+//! can lose a rule if its premise is wrong. `examples/verify_filters.rs` scans
+//! the same buffer twice — once through this module and once with
+//! [`crate::scanner::Scanner::unfiltered`], which decides nothing — and compares
+//! the reported matches, rule by rule and offset by offset. Run it after any
+//! change in this file or in [`crate::atoms`]: on the rule set's own text it
+//! compares about ninety real detections, and it prints the slot and the offset
+//! when the two scans disagree.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -178,6 +196,12 @@ pub struct Prefilter {
     /// Automaton pattern index -> unified atom id, one table per automaton.
     sensitive_atom: Vec<u32>,
     insensitive_atom: Vec<u32>,
+    /// Unified atom id -> the atom, for its trailer and its case rule.
+    ///
+    /// The bytes are in the automaton, but the bytes *after* them are not: a
+    /// four-byte atom is what the automaton can afford, and the trailer is
+    /// checked here at each hit. See [`crate::atoms::TRAILER_LEN`].
+    atoms: Vec<Atom>,
     /// Unified atom id -> the groups it satisfies. More than one when the same
     /// bytes appear in more than one rule, which is common — `kernel32.dll`
     /// alone is in hundreds.
@@ -436,6 +460,7 @@ impl Prefilter {
             case_insensitive: build_automaton(&insensitive_patterns, true),
             sensitive_atom,
             insensitive_atom,
+            atoms,
             atom_groups,
             group_string,
             string_group_count,
@@ -680,17 +705,32 @@ impl Prefilter {
         // below caught it. It requires `MatchKind::Standard`, which is what the
         // automatons are built with.
         for found in ac.find_overlapping_iter(data) {
-            let atom = atom_of_pattern[found.pattern().as_usize()];
-            let offset = u32::try_from(found.start()).unwrap_or(u32::MAX);
-            if !scratch.visit_atom(atom, offset) {
+            let atom = atom_of_pattern[found.pattern().as_usize()] as usize;
+
+            // The automaton found the atom's own bytes; the bytes that must
+            // follow them are checked here, because four is all the automaton
+            // can carry. A hit that fails this is not an occurrence of the atom
+            // at all, so it is skipped exactly as if the automaton had never
+            // reported it — which is what turns a four-byte match into a
+            // twelve-byte one and keeps the scanner from searching for strings
+            // that are not in the file.
+            let Some(the) = self.atoms.get(atom) else {
+                continue;
+            };
+            if !the.is_present_at(data, found.start()) {
                 continue;
             }
-            for group in &self.atom_groups[atom as usize] {
+
+            let offset = u32::try_from(found.start()).unwrap_or(u32::MAX);
+            if !scratch.visit_atom(atom as u32, offset) {
+                continue;
+            }
+            for group in &self.atom_groups[atom] {
                 if !scratch.satisfy_group(*group, &self.group_string, &self.string_group_count) {
                     continue;
                 }
                 let string = self.group_string[*group as usize] as usize;
-                scratch.set_witness(string as u32, atom);
+                scratch.set_witness(string as u32, atom as u32);
                 let rule = self.string_rule[string];
                 if self.string_required[string] {
                     // The condition needs this string, so the rule is selected
@@ -1049,10 +1089,9 @@ mod tests {
         //
         // The needles are four bytes each and differ in every position, so no
         // one of them contains another and the assertion can be exact. A family
-        // of strings sharing a prefix — `marker00`, `marker01` — would all be
-        // given the *same* atom, because the chooser in `atoms` scores a window
-        // by its own bytes and has no idea that `mark` is the common part. That
-        // is a real limitation, and the test below writes it down.
+        // of strings sharing a prefix — `marker00`, `marker01` — is covered by
+        // the test below instead: those share a window, and the atom's trailer
+        // is what tells them apart.
         let needles: Vec<Vec<u8>> = (0..64u8)
             .map(|i| vec![0x40 + i, 0xC0 + i, 0x20 + i, 0x80 + i])
             .collect();
@@ -1073,21 +1112,69 @@ mod tests {
     }
 
     #[test]
-    fn strings_sharing_a_prefix_are_given_the_same_atom_and_all_selected() {
-        // The limitation above, written down as a test so that it is a known
-        // behaviour rather than a surprise. Sixty-four rules whose only
-        // difference is at the end are all selected for any file containing the
-        // prefix, so the prefilter saves nothing for them. The fix is to score
-        // atoms by how *rare* they are across the rule set rather than by their
-        // own bytes alone, which needs a second pass over the atoms and a
-        // corpus to tune it against.
+    fn strings_that_differ_only_at_the_end_are_told_apart() {
+        // Eight rules whose only difference is at the end. Before the atom
+        // carried the bytes that follow it, all eight shared one four-byte atom
+        // and any file containing the prefix selected all of them, so the
+        // prefilter saved nothing for a family of rules like this — which is
+        // exactly the shape of a rule set with a variant per family member.
+        //
+        // The bytes after the window are as mandatory as the window itself, so
+        // they belong to the atom: the eight literals now have eight atoms and
+        // a file selects the one rule that is actually about it.
         let needles: Vec<Vec<u8>> = (0..8u8)
             .map(|i| format!("marker{i:02}").into_bytes())
             .collect();
         let rules: Vec<RuleStrings> = needles.iter().map(|n| vec![one(n)]).collect();
         let p = Prefilter::build(&filters(&rules));
-        assert_eq!(p.stats().atoms, 1, "one atom, eight strings");
-        assert_eq!(scan(&p, b"marker03"), (0..8).collect::<Vec<u32>>());
+        assert_eq!(p.stats().atoms, 8, "eight strings, eight atoms");
+        assert_eq!(scan(&p, b"marker03"), vec![3], "and only one of them selected");
+        for (index, needle) in needles.iter().enumerate() {
+            let mut file = b"padding ".to_vec();
+            file.extend_from_slice(needle);
+            file.extend_from_slice(b" more padding");
+            assert_eq!(scan(&p, &file), vec![index as u32], "rule {index}");
+        }
+    }
+
+    /// Four bytes of a string are not the string's atom.
+    ///
+    /// This is the property the trailer exists for, and it is worth a test of
+    /// its own because it is what a file full of library code meets: a large
+    /// binary contains short windows of hundreds of strings by accident, and
+    /// each one used to cost a pass over the whole buffer to disprove.
+    #[test]
+    fn a_bare_window_is_not_the_atom() {
+        let atoms = StringAtoms {
+            groups: vec![vec![Atom::with_trailer(b"ABCD", false, b"EFGH").unwrap()]],
+        };
+        let p = Prefilter::build(&filters(&[vec![atoms]]));
+        assert!(scan(&p, b"ABCD").is_empty(), "the four bytes alone are not the atom");
+        assert!(
+            scan(&p, b"ABCD EFGH").is_empty(),
+            "nor are they when the rest is somewhere else in the file"
+        );
+        assert_eq!(scan(&p, b"ABCDEFGH"), vec![0], "the atom, and the rule");
+    }
+
+    /// The trailer is verified, not merely required to be somewhere.
+    ///
+    /// Two atoms that differ only in the bytes after them are different atoms.
+    /// If they were the same the prefilter would have to be satisfied by either
+    /// one's trailer, which would put the false selects back.
+    #[test]
+    fn atoms_that_differ_only_in_their_trailer_are_different_atoms() {
+        let first = StringAtoms {
+            groups: vec![vec![Atom::with_trailer(b"ABCD", false, b"EFGH").unwrap()]],
+        };
+        let second = StringAtoms {
+            groups: vec![vec![Atom::with_trailer(b"ABCD", false, b"IJKL").unwrap()]],
+        };
+        let p = Prefilter::build(&filters(&[vec![first], vec![second]]));
+        assert_eq!(p.stats().atoms, 2);
+        assert_eq!(scan(&p, b"ABCDEFGH"), vec![0]);
+        assert_eq!(scan(&p, b"ABCDIJKL"), vec![1]);
+        assert!(scan(&p, b"ABCD").is_empty(), "neither trailer is there");
     }
 
     #[test]

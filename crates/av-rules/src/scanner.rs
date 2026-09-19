@@ -165,6 +165,8 @@ pub struct Scanner<'a> {
     /// global rule and asking "which rules are global" per scan would be a
     /// linear pass over the rule set per file.
     globals: Vec<u32>,
+    /// Skip every filter and search for everything. See [`Scanner::unfiltered`].
+    unfiltered: bool,
 }
 
 impl<'a> Scanner<'a> {
@@ -181,8 +183,33 @@ impl<'a> Scanner<'a> {
                 .filter(|(_, rule)| rule.global)
                 .map(|(index, _)| index as u32)
                 .collect(),
+            unfiltered: false,
             vm: Vm::new(),
             database,
+        }
+    }
+
+    /// A scanner that believes every rule is a candidate and every string may
+    /// be in the file, so the prefilter decides nothing.
+    ///
+    /// This is the honest baseline the filtered scanner is measured against,
+    /// and the only practical way to test that the filtering is
+    /// *sound* rather than merely fast. Every filter here is an optimization
+    /// that can lose a detection if it is wrong, and a lost detection is the
+    /// one failure an antivirus cannot have: it says a file is clean when it is
+    /// not, and nothing downstream will ever notice.
+    ///
+    /// The argument for each filter is a proof, but a proof is only as good as
+    /// its premises — the atom really is a window of the string, the trailer
+    /// really is implied by any match, the automaton really did see every
+    /// occurrence. Running both scanners over the same file and comparing the
+    /// reported matches checks the conclusion against the data instead, and it
+    /// covers every filter at once rather than one at a time. It is slow by
+    /// construction, which is what makes it a test rather than a mode.
+    pub fn unfiltered(database: &'a RuleDatabase) -> Self {
+        Self {
+            unfiltered: true,
+            ..Self::new(database)
         }
     }
 
@@ -219,6 +246,20 @@ impl<'a> Scanner<'a> {
                 outcome.global_gate_failed = true;
                 return outcome;
             }
+        }
+
+        if self.unfiltered {
+            // Every rule, in order, with nothing ruled out. The candidate
+            // count still reports the rule set, because that is what the
+            // prefilter would have been handed.
+            outcome.candidates += self.database.rules().len();
+            for rule in 0..self.database.rules().len() as u32 {
+                if self.database.rule(rule).is_some_and(|r| r.global) {
+                    continue;
+                }
+                let _matched = self.evaluate(rule, data, input, &mut outcome);
+            }
+            return outcome;
         }
 
         self.database
@@ -339,6 +380,19 @@ impl<'a> Scanner<'a> {
     ///
     /// The counters do distinguish them, so that a scan can be read back and
     /// the work attributed.
+    ///
+    /// The prefilter's verdict on one string, which is `Unknown` when the
+    /// filter is switched off: nothing was proved, so the string has to be
+    /// searched for.
+    fn string_state(&self, rule_index: u32, slot: u32) -> StringState {
+        if self.unfiltered {
+            return StringState::Unknown;
+        }
+        self.database
+            .prefilter()
+            .string_state(&self.scratch, rule_index, slot)
+    }
+
     #[must_use]
     fn search_string(
         &mut self,
@@ -348,11 +402,7 @@ impl<'a> Scanner<'a> {
         data: &[u8],
         outcome: &mut ScanOutcome,
     ) -> bool {
-        match self
-            .database
-            .prefilter()
-            .string_state(&self.scratch, rule_index, slot)
-        {
+        match self.string_state(rule_index, slot) {
             // The atoms were all found, so the string may be there; and the
             // string has no atoms, so nothing could be said either way. Both
             // have to be searched for.
@@ -379,7 +429,8 @@ impl<'a> Scanner<'a> {
         // where the string can be, and the search collapses to a few byte
         // comparisons each. This is the difference between a scan that costs
         // the buffer size per string and one that costs the string.
-        let located = matcher.can_use_witness()
+        let located = !self.unfiltered
+            && matcher.can_use_witness()
             && self.database.prefilter().witnesses(
                 &self.scratch,
                 rule_index,
@@ -553,26 +604,43 @@ rule located {
     /// candidate offset, compare the bytes there, and report nothing, rather
     /// than reporting the window as a match.
     ///
-    /// Every four-byte window of the string is in the buffer, separately, so
-    /// the test does not depend on which one the chooser picked: whichever it
-    /// is, it occurs exactly once, the string itself never occurs, and the
-    /// buffer is never the literal.
+    /// The buffer is built from the atom the chooser actually picked rather than
+    /// from a guess about which window that is, so the test holds whatever the
+    /// scoring does. The atom is placed on its own, with the same number of
+    /// bytes in front of where a match would have to start — bytes that are not
+    /// the string's first byte — so the atom is there and the string is not.
+    ///
+    /// The literal is sixteen bytes so that the atom, which is at most twelve,
+    /// can never cover it. With a string short enough for the atom to span it,
+    /// "the atom is present" would mean "the string is present", and the case
+    /// this test exists to tell apart would not arise.
     #[test]
     fn a_witness_that_points_at_a_coincidence_reports_no_match() {
+        const LITERAL: &[u8] = b"zzqqxxjjvveemmww";
         let source = r#"
 rule located {
     strings:
-        $a = "zzqqxxjjvv"
+        $a = "zzqqxxjjvveemmww"
     condition:
         $a
 }
 "#;
-        let data = b"zzqq zqqx qqxx qxxj xxjj xjjv jjvv";
+        let atom = crate::atoms::best_atom(LITERAL, false).expect("the literal is long enough");
         assert!(
-            !data.windows(10).any(|w| w == b"zzqqxxjjvv"),
+            atom.len() < LITERAL.len(),
+            "the atom must be shorter than the string, or there is nothing to test"
+        );
+        let mut run = atom.bytes.to_vec();
+        run.extend_from_slice(&atom.trailer);
+
+        let mut data = b"................".to_vec();
+        data.extend_from_slice(&run);
+        data.extend_from_slice(b"\0\0\0\0");
+        assert!(
+            !data.windows(LITERAL.len()).any(|w| w == LITERAL),
             "the string must not be in the buffer, or this tests nothing"
         );
-        let (outcome, _) = scan(source, data);
+        let (outcome, _) = scan(source, &data);
         assert_eq!(outcome.strings_searched, 1, "the atom is there, so it is searched");
         assert_eq!(
             outcome.strings_localized, 1,
@@ -580,7 +648,7 @@ rule located {
         );
         assert!(
             outcome.matches.is_empty(),
-            "a window in the buffer is not the string"
+            "an atom in the buffer is not the string"
         );
     }
 

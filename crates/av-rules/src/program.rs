@@ -128,7 +128,7 @@ pub enum Const {
     Bool(bool),
     Int(i64),
     Float(f64),
-    /// Serialised through [`rc_str`] rather than by turning on serde's `rc`
+    /// Serialised through the `rc_str` module rather than by turning on serde's `rc`
     /// feature: that feature would apply to every `Rc` and `Arc` in the
     /// workspace, which is a large change to make for one field, and it makes
     /// shared ownership silently serialisable in places where sharing is

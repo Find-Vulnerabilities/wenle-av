@@ -67,30 +67,103 @@ pub const MIN_ATOM_LEN: usize = 3;
 /// trade-off YARA makes at the same number.
 pub const MAX_ATOM_LEN: usize = 4;
 
-/// A short byte sequence a match must contain.
+/// How many bytes after the atom are carried along to check at each hit.
+///
+/// This is what makes a four-byte atom behave like a twelve-byte one. Four
+/// bytes is the longest the automaton can afford, but it is short enough to
+/// occur by accident all over a large binary — which is what the scanner
+/// measured: on `shell32.dll`, 18,489 strings had an atom present and only a
+/// few hundred of them were actually in the file, and every one of the rest
+/// cost a full pass over eight megabytes to disprove.
+///
+/// The bytes following the atom inside the same run are just as mandatory as
+/// the atom itself, so they can be checked directly at each hit. A hit that
+/// fails is not an occurrence of the atom at all, and the string it belonged to
+/// is refuted before any search rather than after one. Nearly every false hit
+/// fails on its first extra byte, so the check costs a comparison and saves a
+/// scan.
+///
+/// The limit is not correctness — every byte carried is one more that must
+/// match, and they were all mandatory already. It is that a longer trailer
+/// makes the check itself the work: for a string that *is* present, all of it
+/// is compared, and the trailer is compared once per occurrence.
+///
+/// Measured, with `examples/scan_bench.rs`, against the 10,764-rule set: the
+/// strings that reached a search on `shell32.dll` fell from 18,489 to 2,227,
+/// and the six test binaries went from 22.9 s to 4.9 s. `examples/verify_filters.rs`
+/// checks that none of that was bought with a lost detection.
+pub const TRAILER_LEN: usize = 8;
+
+/// A short byte sequence a match must contain, and what must follow it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Atom {
     pub bytes: SmallVec<[u8; MAX_ATOM_LEN]>,
     /// The bytes must be matched case-insensitively. Carried on the atom
     /// because it decides which automaton the atom is compiled into.
     pub nocase: bool,
+    /// Bytes that must immediately follow `bytes` in a file that matches.
+    ///
+    /// Empty when the run the atom came from ended with it. Part of the atom's
+    /// identity, so two atoms with the same four bytes and different trailers
+    /// are different atoms — which is right, because they are found in
+    /// different places and refute different strings.
+    pub trailer: SmallVec<[u8; TRAILER_LEN]>,
 }
 
 impl Atom {
-    /// Build an atom from bytes that are already the right length.
+    /// Build an atom from bytes that are already the right length, with no
+    /// trailer.
     ///
     /// A caller that has not been through [`best_atom`] has to respect the
     /// length bounds itself; anything longer is truncated rather than rejected,
     /// because a truncated atom is still a necessary condition and rejecting
     /// would silently drop the whole string out of the filter.
     pub fn new(bytes: &[u8], nocase: bool) -> Option<Self> {
+        Self::with_trailer(bytes, nocase, &[])
+    }
+
+    /// The same, with the bytes that follow the atom in the run it came from.
+    ///
+    /// The trailer is clipped to [`TRAILER_LEN`]; the rest of the run is
+    /// mandatory too, but checking all of it would turn the atom test into a
+    /// string comparison and give up the automaton's speed for nothing.
+    pub fn with_trailer(bytes: &[u8], nocase: bool, rest: &[u8]) -> Option<Self> {
         if bytes.len() < MIN_ATOM_LEN {
             return None;
         }
         Some(Self {
             bytes: SmallVec::from_slice(&bytes[..bytes.len().min(MAX_ATOM_LEN)]),
             nocase,
+            trailer: SmallVec::from_slice(&rest[..rest.len().min(TRAILER_LEN)]),
         })
+    }
+
+    /// How many bytes a match must contain here, atom and trailer together.
+    pub fn len(&self) -> usize {
+        self.bytes.len() + self.trailer.len()
+    }
+
+    /// Whether this atom constrains nothing beyond its own bytes.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Whether `data` contains this atom at `at`, trailer included.
+    ///
+    /// The bytes after the atom are checked here rather than in the automaton
+    /// because the automaton is what could not afford them.
+    pub fn is_present_at(&self, data: &[u8], at: usize) -> bool {
+        let start = at + self.bytes.len();
+        let Some(window) = data.get(start..start + self.trailer.len()) else {
+            // Running off the end of the buffer is a failure to contain the
+            // bytes, not a reason to panic.
+            return false;
+        };
+        if self.nocase {
+            window.eq_ignore_ascii_case(&self.trailer)
+        } else {
+            window == self.trailer.as_slice()
+        }
     }
 }
 
@@ -163,6 +236,10 @@ pub fn score(bytes: &[u8], nocase: bool) -> u32 {
 /// than an atom the choice is purely about which window is least likely to
 /// occur by accident. Returns `None` when the run is too short to yield one,
 /// which is the caller's signal that this run cannot contribute.
+///
+/// The bytes after the chosen window come back with it, up to [`TRAILER_LEN`],
+/// because they are mandatory too and are what the automaton could not afford
+/// to search for.
 pub fn best_atom(run: &[u8], nocase: bool) -> Option<Atom> {
     if run.len() < MIN_ATOM_LEN {
         return None;
@@ -170,12 +247,23 @@ pub fn best_atom(run: &[u8], nocase: bool) -> Option<Atom> {
     if run.len() <= MAX_ATOM_LEN {
         return Atom::new(run, nocase);
     }
-    (0..=run.len() - MAX_ATOM_LEN)
-        .map(|start| &run[start..start + MAX_ATOM_LEN])
-        // The earliest of equally good windows, so that the choice is
-        // reproducible rather than dependent on iteration order.
-        .min_by_key(|window| std::cmp::Reverse(score(window, nocase)))
-        .and_then(|window| Atom::new(window, nocase))
+    // The earliest of equally good windows, so that the choice is reproducible
+    // rather than dependent on the order they happen to be visited in.
+    let last = run.len() - MAX_ATOM_LEN;
+    let mut start = 0;
+    let mut best = score(&run[..MAX_ATOM_LEN], nocase);
+    for candidate in 1..=last {
+        let candidate_score = score(&run[candidate..candidate + MAX_ATOM_LEN], nocase);
+        if candidate_score > best {
+            best = candidate_score;
+            start = candidate;
+        }
+    }
+    Atom::with_trailer(
+        &run[start..start + MAX_ATOM_LEN],
+        nocase,
+        &run[start + MAX_ATOM_LEN..],
+    )
 }
 
 /// Turn fixed, mandatory runs into the groups they imply.
