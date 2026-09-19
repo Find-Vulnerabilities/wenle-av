@@ -31,6 +31,7 @@
 // the panic-family lints that guard the library do not apply here.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
@@ -40,13 +41,14 @@ use std::time::Instant;
 use av_rules::ast::Expr;
 
 fn main() -> ExitCode {
-    // Rule sets in the wild contain expressions nested deeply enough to
-    // exhaust the default main-thread stack. Running the work on a thread with
-    // a large stack gets past that so the histogram is visible; the parser
-    // itself needs a depth limit so the shipping engine cannot be crashed the
-    // same way, which is tracked separately.
+    // A bounded, deliberately ordinary stack. The parser limits nesting depth
+    // and condition size, so a real rule set must fit in a stack of the size
+    // the engine would actually run on — if it does not, the bounds are wrong
+    // and this is where that shows up rather than in production. The earlier
+    // half-gigabyte here was a workaround for unbounded recursion, and keeping
+    // it would hide exactly the failure this tool exists to find.
     let handle = std::thread::Builder::new()
-        .stack_size(512 * 1024 * 1024)
+        .stack_size(16 * 1024 * 1024)
         .spawn(run)
         .expect("spawning the worker thread");
     handle.join().unwrap_or(ExitCode::FAILURE)
@@ -127,7 +129,7 @@ fn run() -> ExitCode {
     if !failures.is_empty() {
         println!("\n=== failure histogram ===");
         let mut rows: Vec<_> = failures.into_iter().collect();
-        rows.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+        rows.sort_by_key(|(_, (count, _))| Reverse(*count));
         for (message, (count, example)) in rows.iter().take(25) {
             println!("\n{count:>6}  {message}\n        {example}");
         }
@@ -137,7 +139,7 @@ fn run() -> ExitCode {
     if !modules.is_empty() {
         println!("\n=== module references ===");
         let mut rows: Vec<_> = modules.into_iter().collect();
-        rows.sort_by(|a, b| b.1.cmp(&a.1));
+        rows.sort_by_key(|(_, count)| Reverse(*count));
         for (name, count) in rows {
             println!("{count:>7}  {name}");
         }
@@ -146,7 +148,7 @@ fn run() -> ExitCode {
     if !constructs.is_empty() {
         println!("\n=== condition constructs (rules using each) ===");
         let mut rows: Vec<_> = constructs.into_iter().collect();
-        rows.sort_by(|a, b| b.1.cmp(&a.1));
+        rows.sort_by_key(|(_, count)| Reverse(*count));
         for (name, count) in rows {
             println!("{count:>7}  {name}");
         }

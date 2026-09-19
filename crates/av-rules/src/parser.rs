@@ -97,14 +97,14 @@ pub struct ParsedFile {
 /// Parse a rule file into its rules, imports and includes.
 pub fn parse_file(src: &str) -> Result<ParsedFile, ParseError> {
     let tokens = Lexer::new(src).tokenize()?;
-    Parser { tokens, pos: 0 }.parse_file()
+    Parser::new(tokens).parse_file()
 }
 
 /// Parse a single condition expression, for tests and for the CLI's
 /// `--explain` mode.
 pub fn parse_condition(src: &str) -> Result<Expr, ParseError> {
     let tokens = Lexer::new(src).tokenize()?;
-    let mut p = Parser { tokens, pos: 0 };
+    let mut p = Parser::new(tokens);
     let expr = p.parse_expr()?;
     p.expect_eof()?;
     Ok(expr)
@@ -143,12 +143,78 @@ enum BinOp {
     Bit(BitOp),
 }
 
+/// Deepest expression nesting the parser will build.
+///
+/// Both the parser and everything downstream — the compiler, the VM, and even
+/// `Drop` on the tree — walk the AST recursively, so the depth of that tree is
+/// what decides whether the engine survives its input. Left alone, a file
+/// consisting of a hundred thousand `(` characters is not a syntax error, it is
+/// a stack overflow in the shipping binary. Rule files are read from disk and
+/// the rule set is a plugin surface, so this is a denial of service, not a
+/// hypothetical.
+///
+/// The bound has to be low enough to be safe on a stack the engine does not
+/// control. Descending one nesting level costs several frames — `parse_binary`,
+/// `parse_operand`, `parse_unary`, `parse_postfix`, `parse_primary` and back
+/// into `parse_binary` — and an unoptimised build makes each of those frames
+/// large, so a bound that merely feels generous is not a bound at all. At 128 a
+/// pathological input needs well under a megabyte, which fits the smallest
+/// stack this is likely to run on.
+///
+/// Real rules are nowhere near it: the deepest construct in a 10,764-rule
+/// third-party set nests a handful of levels, and 128 still leaves room for
+/// tens of levels of nesting. Note that a long `or` chain produces a deep
+/// *tree* while parsing iteratively, so [`MAX_NODES`] covers that shape.
+const MAX_DEPTH: u32 = 128;
+
+/// Largest expression a single condition may build.
+///
+/// [`MAX_DEPTH`] bounds how deep the parser recurses, but not how deep the tree
+/// it returns is: `a or b or c or ...` is parsed by a loop, so a million-term
+/// chain costs the parser constant stack and produces a million-deep tree.
+///
+/// The saving grace is that a tree's depth can never exceed its node count, so
+/// bounding the nodes bounds the depth as well — and depth is what has to be
+/// bounded, because dropping the tree recurses just as hard as building it did.
+/// Refusing a condition at 4,096 nodes keeps every later traversal, `Drop`
+/// included, inside about a megabyte even in an unoptimised build.
+///
+/// The largest conditions in a 10,764-rule third-party set are a few hundred
+/// nodes — long `or` chains of resource names — so this leaves an order of
+/// magnitude of headroom.
+const MAX_NODES: usize = 4_096;
+
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// Current expression nesting depth, checked against [`MAX_DEPTH`].
+    depth: u32,
+    /// Expression nodes built so far in the condition being parsed, checked
+    /// against [`MAX_NODES`].
+    nodes: usize,
 }
 
 impl Parser {
+    fn new(tokens: Vec<Token>) -> Self {
+        Self {
+            tokens,
+            pos: 0,
+            depth: 0,
+            nodes: 0,
+        }
+    }
+
+    /// Account for one more node, refusing the condition once it is implausibly
+    /// large. Called from the two places that create nodes, so the count tracks
+    /// the tree rather than the token stream.
+    fn note_node(&mut self) -> Result<(), ParseError> {
+        self.nodes = self.nodes.saturating_add(1);
+        if self.nodes > MAX_NODES {
+            return Err(self.error_here("condition is too large"));
+        }
+        Ok(())
+    }
+
     // -- token access -------------------------------------------------------
 
     fn peek(&self) -> &Token {
@@ -615,12 +681,28 @@ impl Parser {
         self.parse_binary(PREC_OR)
     }
 
+    /// Checked entry point for expression parsing.
+    ///
+    /// Every recursive descent into an expression passes through here or
+    /// through [`Parser::parse_unary`], so the depth counter measures the tree
+    /// the parser is building rather than the call stack it happens to have.
     fn parse_binary(&mut self, min_prec: u8) -> Result<Expr, ParseError> {
+        if self.depth >= MAX_DEPTH {
+            return Err(self.error_here("expression nests too deeply"));
+        }
+        self.depth = self.depth.saturating_add(1);
+        let result = self.parse_binary_inner(min_prec);
+        self.depth = self.depth.saturating_sub(1);
+        result
+    }
+
+    fn parse_binary_inner(&mut self, min_prec: u8) -> Result<Expr, ParseError> {
         let mut lhs = self.parse_operand(min_prec)?;
         while let Some((prec, op)) = self.peek_binary_op() {
             if prec < min_prec {
                 break;
             }
+            self.note_node()?;
             self.advance();
             // Left-associative: the right operand must bind strictly tighter.
             let rhs = self.parse_binary(prec.saturating_add(1))?;
@@ -685,6 +767,18 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Result<Expr, ParseError> {
+        // A run of prefix operators — `----x`, `~~~~x` — recurses without
+        // passing through `parse_binary`, so it needs the same bound.
+        if self.depth >= MAX_DEPTH {
+            return Err(self.error_here("expression nests too deeply"));
+        }
+        self.depth = self.depth.saturating_add(1);
+        let result = self.parse_unary_inner();
+        self.depth = self.depth.saturating_sub(1);
+        result
+    }
+
+    fn parse_unary_inner(&mut self) -> Result<Expr, ParseError> {
         if self.eat_kind(|k| matches!(k, TokenKind::Minus)) {
             let inner = self.parse_unary()?;
             // Fold `-1` here: negative literals are everywhere in rules, and a
@@ -731,6 +825,7 @@ impl Parser {
     }
 
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
+        self.note_node()?;
         let tok = self.peek().clone();
 
         if tok.is_word("for") {
@@ -2053,5 +2148,63 @@ mod tests {
     fn a_for_loop_needs_a_quantifier() {
         let e = err("rule r { condition: for in (0..1) : ( true ) }");
         assert!(e.message.contains("after `for`"), "{e}");
+    }
+
+    // -- hostile input ------------------------------------------------------
+
+    #[test]
+    fn deeply_nested_parentheses_are_refused_rather_than_overflowing() {
+        // Without a bound this is not a syntax error, it is a stack overflow —
+        // and the file it overflows on is whatever is on disk.
+        let src = format!(
+            "rule r {{ condition: {}{}{} }}",
+            "(".repeat(2000),
+            "true",
+            ")".repeat(2000)
+        );
+        let e = err(&src);
+        assert!(e.message.contains("nests too deeply"), "{e}");
+    }
+
+    #[test]
+    fn a_long_run_of_prefix_operators_is_refused_rather_than_overflowing() {
+        // `-----...-1` recurses through `parse_unary`, which the depth check in
+        // `parse_binary` never sees.
+        let src = format!("rule r {{ condition: {}1 }}", "-".repeat(2000));
+        let e = err(&src);
+        assert!(e.message.contains("nests too deeply"), "{e}");
+    }
+
+    #[test]
+    fn an_enormous_conditional_chain_is_refused() {
+        // Parsed by a loop, so it costs no parser stack — but it builds a tree
+        // one node deep per term, and the partial tree is dropped on the error
+        // path, which recurses. The bound that matters is on the tree, not the
+        // parse, which is why it is a node count and not a loop counter.
+        let terms = vec!["uint16(0) == 1"; 40_000].join(" or ");
+        let src = format!("rule r {{ condition: {terms} }}");
+        let e = err(&src);
+        assert!(e.message.contains("too large"), "{e}");
+    }
+
+    #[test]
+    fn a_long_but_plausible_chain_still_parses() {
+        // The bound has to clear what real rules actually do: a few hundred
+        // `or` terms selecting resource names is the largest condition shape in
+        // the 10,764-rule set this parser is validated against.
+        let terms = vec!["resource.name_string == \"1\"".to_string(); 500].join(" or ");
+        let src = format!("rule r {{ condition: {terms} }}");
+        let file = parse_file(&src).unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(file.rules[0].condition, Expr::Or(_, _)));
+    }
+
+    #[test]
+    fn a_deeply_nested_hex_alternative_is_refused() {
+        let e = err(&format!(
+            "rule r {{ strings: $a = {{ {}4D{} }} condition: $a }}",
+            "(".repeat(200),
+            ")".repeat(200)
+        ));
+        assert!(e.message.contains("nests too deeply"), "{e}");
     }
 }

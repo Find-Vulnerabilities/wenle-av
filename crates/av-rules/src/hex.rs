@@ -49,6 +49,7 @@ pub fn parse(body: &str) -> Result<HexPattern, HexError> {
     let mut p = Parser {
         src: body.as_bytes(),
         pos: 0,
+        depth: 0,
     };
     let tokens = p.parse_pattern()?;
     p.skip_space();
@@ -64,9 +65,18 @@ pub fn parse(body: &str) -> Result<HexPattern, HexError> {
     Ok(HexPattern { tokens })
 }
 
+/// Deepest alternation nesting accepted.
+///
+/// `parse_pattern` and `parse_alternative` are mutually recursive, so a body
+/// that is nothing but `((((...` recurses once per character. Real patterns
+/// nest two or three levels. See [`crate::parser::MAX_DEPTH`] for why a bound
+/// like this has to exist at all.
+const MAX_DEPTH: u32 = 64;
+
 struct Parser<'a> {
     src: &'a [u8],
     pos: usize,
+    depth: u32,
 }
 
 impl<'a> Parser<'a> {
@@ -270,6 +280,16 @@ impl<'a> Parser<'a> {
 
     /// `( AA | BB CC )`.
     fn parse_alternative(&mut self) -> Result<HexToken, HexError> {
+        if self.depth >= MAX_DEPTH {
+            return Err(self.error("hex pattern nests too deeply"));
+        }
+        self.depth = self.depth.saturating_add(1);
+        let result = self.parse_alternative_inner();
+        self.depth = self.depth.saturating_sub(1);
+        result
+    }
+
+    fn parse_alternative_inner(&mut self) -> Result<HexToken, HexError> {
         let start = self.pos;
         self.expect_byte(b'(')?;
         let mut branches = Vec::new();
