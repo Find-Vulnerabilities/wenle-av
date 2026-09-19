@@ -70,15 +70,26 @@ impl Severity {
         }
     }
 
-    pub fn from_str_lossy(s: &str) -> Self {
-        match s.to_ascii_lowercase().as_str() {
+    pub fn try_from_str(s: &str) -> Option<Self> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
             "info" | "informational" => Severity::Info,
             "low" => Severity::Low,
             "medium" | "moderate" => Severity::Medium,
             "high" => Severity::High,
             "critical" | "severe" => Severity::Critical,
-            _ => Severity::Medium,
-        }
+            _ => return None,
+        })
+    }
+
+    /// Parse a severity, defaulting to [`Severity::Medium`] for anything
+    /// unrecognised.
+    ///
+    /// Prefer [`Severity::try_from_str`] anywhere the caller can report the
+    /// problem. A misspelled `severity = hgih` silently becoming `Medium` gives
+    /// a rule a plausible-looking score of 60 when the author meant 100, which
+    /// is exactly the kind of quiet wrongness that produces false positives.
+    pub fn from_str_lossy(s: &str) -> Self {
+        Self::try_from_str(s).unwrap_or(Severity::Medium)
     }
 }
 

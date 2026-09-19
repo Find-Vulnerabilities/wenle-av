@@ -169,9 +169,13 @@ pub struct Lexer<'a> {
     pos: usize,
     line: u32,
     line_start: usize,
-    /// True when the previous significant token was `=`, which is what makes a
-    /// following `/` a regex rather than a division.
-    after_assign: bool,
+    /// True when the previous significant token promises a value next, which
+    /// is what makes a following `/` a regex rather than a division.
+    ///
+    /// Two tokens do that: `=`, as in `$a = /re/`, and `matches`, as in
+    /// `$a matches /re/`. Both are exact — `=` never appears in a condition
+    /// (comparison is `==`), and `matches` is only ever a binary operator.
+    value_expected: bool,
 }
 
 impl<'a> Lexer<'a> {
@@ -181,7 +185,7 @@ impl<'a> Lexer<'a> {
             pos: 0,
             line: 1,
             line_start: 0,
-            after_assign: false,
+            value_expected: false,
         }
     }
 
@@ -306,12 +310,11 @@ impl<'a> Lexer<'a> {
             b'!' if matches!(self.peek_at(1), Some(c) if c.is_ascii_alphanumeric() || c == b'_') => {
                 self.lex_string_ref(start, b)
             }
-            // `{` opens the rule body, but a `{` directly after `=` opens a
-            // hex pattern. The same one-token lookback that disambiguates `/`
-            // settles this too, and it is exact: `=` never appears in a
-            // condition (comparison is `==`), so the two uses cannot collide.
-            b'{' if self.after_assign => self.lex_hex_block(start),
-            b'/' if self.after_assign => self.lex_regex(start),
+            // `{` opens the rule body, but a `{` where a value is expected
+            // opens a hex pattern. The same one-token lookback that
+            // disambiguates `/` settles this too.
+            b'{' if self.value_expected => self.lex_hex_block(start),
+            b'/' if self.value_expected => self.lex_regex(start),
             _ => self.lex_operator(start, b),
         }
     }
@@ -330,7 +333,9 @@ impl<'a> Lexer<'a> {
             "false" => TokenKind::Boolean(false),
             _ => TokenKind::Identifier(text),
         };
-        self.after_assign = false;
+        // `matches` is the one identifier that promises a value: its right-hand
+        // side is a regex literal, `$a matches /re/`.
+        self.value_expected = matches!(&kind, TokenKind::Identifier(w) if w == "matches");
         self.make(kind, start)
     }
 
@@ -354,7 +359,7 @@ impl<'a> Lexer<'a> {
                 .map_err(|_| self.error("invalid hex literal", start))?;
             let value = i64::from_str_radix(text, 16)
                 .map_err(|_| self.error(format!("hex literal `0x{text}` does not fit in 64 bits"), start))?;
-            self.after_assign = false;
+            self.value_expected = false;
             return Ok(self.make(TokenKind::Integer(value), start));
         }
 
@@ -399,7 +404,7 @@ impl<'a> Lexer<'a> {
             .collect();
         let text = text.replace('_', "");
 
-        self.after_assign = false;
+        self.value_expected = false;
         let kind = if is_float {
             let value: f64 = text
                 .parse()
@@ -462,7 +467,7 @@ impl<'a> Lexer<'a> {
                 other => out.push(other),
             }
         }
-        self.after_assign = false;
+        self.value_expected = false;
         Ok(self.make(TokenKind::Literal(out), start))
     }
 
@@ -484,7 +489,7 @@ impl<'a> Lexer<'a> {
             }
         }
         let name = String::from_utf8_lossy(&self.src[name_start..self.pos]).into_owned();
-        self.after_assign = false;
+        self.value_expected = false;
         let kind = match sigil {
             b'$' => TokenKind::StringRef(name),
             b'#' => {
@@ -545,7 +550,7 @@ impl<'a> Lexer<'a> {
                 break;
             }
         }
-        self.after_assign = false;
+        self.value_expected = false;
         Ok(self.make(TokenKind::Regex { body, flags }, start))
     }
 
@@ -570,7 +575,7 @@ impl<'a> Lexer<'a> {
                         let body_end = self.pos - 1;
                         let body = String::from_utf8_lossy(&self.src[body_start..body_end])
                             .into_owned();
-                        self.after_assign = false;
+                        self.value_expected = false;
                         return Ok(self.make(TokenKind::HexBlock(body), start));
                     }
                 }
@@ -611,10 +616,10 @@ impl<'a> Lexer<'a> {
             b'=' => {
                 if self.peek() == Some(b'=') {
                     self.bump();
-                    self.after_assign = false;
+                    self.value_expected = false;
                     TokenKind::Eq
                 } else {
-                    self.after_assign = true;
+                    self.value_expected = true;
                     TokenKind::Assign
                 }
             }
@@ -661,7 +666,7 @@ impl<'a> Lexer<'a> {
             }
         };
         if !matches!(kind, TokenKind::Assign) {
-            self.after_assign = false;
+            self.value_expected = false;
         }
         Ok(self.make(kind, start))
     }
@@ -778,6 +783,41 @@ mod tests {
             k,
             vec![
                 TokenKind::Identifier("filesize".into()),
+                TokenKind::Slash,
+                TokenKind::Integer(2),
+                TokenKind::Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn slash_after_matches_opens_a_regex() {
+        // `matches` promises a value just as `=` does, so `/` there is a regex
+        // and not a division. Without this, `$a matches /re/` lexed as a
+        // division and could never be written.
+        let k = kinds("$a matches /ab+c/i");
+        assert_eq!(
+            k,
+            vec![
+                TokenKind::StringRef("a".into()),
+                TokenKind::Identifier("matches".into()),
+                TokenKind::Regex {
+                    body: "ab+c".into(),
+                    flags: "i".into()
+                },
+                TokenKind::Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn an_identifier_is_only_a_value_promise_when_it_is_matches() {
+        // A variable called `matcher` must not turn the next `/` into a regex.
+        let k = kinds("matcher / 2");
+        assert_eq!(
+            k,
+            vec![
+                TokenKind::Identifier("matcher".into()),
                 TokenKind::Slash,
                 TokenKind::Integer(2),
                 TokenKind::Eof

@@ -54,6 +54,7 @@
 pub mod ast;
 pub mod hex;
 pub mod lexer;
+pub mod parser;
 
 pub use ast::{
     ArithOp, BitOp, CmpOp, Expr, HexPattern, HexToken, MemberPath, MetaValue, Modifiers,

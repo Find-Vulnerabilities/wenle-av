@@ -123,8 +123,19 @@ pub enum StringValue {
     Text(Vec<u8>),
     /// A pattern in the `{ 4D 5A ?? [4-6] (41|42) }` hex syntax.
     Hex(HexPattern),
-    /// A regular expression, in the body between the slashes.
-    Regex(String),
+    /// A regular expression: the text between the slashes, plus the flag
+    /// letters that followed them.
+    ///
+    /// The flags live here rather than being folded into [`Modifiers`] because
+    /// `/re/i` and `"re" nocase` are different syntaxes for the same idea, and
+    /// collapsing them would lose the distinction between "the author wrote a
+    /// flag" and "the author wrote a modifier" if either ever grows a meaning
+    /// the other lacks.
+    Regex {
+        body: String,
+        /// Flag letters as written, e.g. `i` in `/re/i`.
+        flags: String,
+    },
 }
 
 /// A parsed hex pattern.
@@ -395,6 +406,12 @@ pub enum Expr {
     Float(f64),
     /// A quoted string literal, as used with `contains` and friends.
     Str(String),
+    /// A `/regex/` literal. Only meaningful as the right-hand side of
+    /// `matches`; the compiler rejects it anywhere else.
+    Regex {
+        body: String,
+        flags: String,
+    },
     /// The `filesize` keyword.
     Filesize,
     /// The `entrypoint` keyword.
@@ -523,15 +540,19 @@ impl MemberPath {
 }
 
 /// How many strings in a set must match.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Not `Copy` or `Eq`: [`Quantifier::Count`] carries an expression, and
+/// expressions contain floats.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Quantifier {
     Any,
     All,
     None,
-    /// `N of them`. `Expr` rather than an integer because YARA allows
-    /// `pe.number_of_sections of them`.
-    Count(usize),
-    /// A count that is only known at evaluation time.
+    /// `N of them`. An expression rather than an integer because the count is
+    /// often a module field — `pe.number_of_sections of them` is a real and
+    /// common construct.
+    Count(Box<Expr>),
+    /// `50% of them`. Bounded to `0..=100` by the parser.
     Percentage(u8),
 }
 
