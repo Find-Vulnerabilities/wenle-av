@@ -39,7 +39,7 @@
 //! a rule set writes a helper, and dropping it would change what the rules that
 //! depend on it mean.
 
-use crate::database::RuleDatabase;
+use crate::database::{CompiledRule, RuleDatabase};
 use crate::matches::MatchSet;
 use crate::prefilter::StringState;
 use crate::vm::{Input, Vm};
@@ -106,6 +106,24 @@ pub struct ScanOutcome {
     pub strings_refuted: usize,
     /// Strings that were searched for.
     pub strings_searched: usize,
+    /// Of those, the ones that did not have to scan the buffer.
+    ///
+    /// A string whose atom the automaton found exactly once is verified at the
+    /// one offset that occurrence allows, instead of being searched for. When
+    /// this is a large fraction of `string_searched`, the scan is bounded by
+    /// the automaton pass rather than by the per-string searches, which is the
+    /// difference between a scan measured in milliseconds and one measured in
+    /// seconds.
+    pub strings_localized: usize,
+    /// Strings whose matcher gave up before finishing its search.
+    ///
+    /// A hex pattern with enough jumps that the number of ways it can align
+    /// against a buffer exceeds the search budget. The matches found are real,
+    /// but they are not all of them, so `#a` is an undercount and a rule
+    /// depending on it may fail to fire. Counted rather than swallowed for the
+    /// same reason as `vm_failures`: a rule that cannot run is a detection that
+    /// cannot fire, and silence about it is how one goes unnoticed.
+    pub matcher_failures: usize,
     /// Rules whose condition could not be evaluated because the bytecode is
     /// malformed. A corrupt database, never a property of the file — see
     /// [`crate::vm::VmError`]. Counted rather than swallowed, because a rule that cannot
@@ -140,6 +158,9 @@ pub struct Scanner<'a> {
     candidates: Vec<u32>,
     /// The match table for the rule being evaluated, reused across rules.
     working: MatchSet,
+    /// Where the prefilter says the current string's matches could be. Reused
+    /// across strings, and empty whenever the search is done the ordinary way.
+    witnesses: Vec<u32>,
     /// Resolved once, because the prefilter must not be allowed to filter a
     /// global rule and asking "which rules are global" per scan would be a
     /// linear pass over the rule set per file.
@@ -152,6 +173,7 @@ impl<'a> Scanner<'a> {
             scratch: database.prefilter().scratch(),
             candidates: Vec::new(),
             working: MatchSet::default(),
+            witnesses: Vec::new(),
             globals: database
                 .rules()
                 .iter()
@@ -223,6 +245,25 @@ impl<'a> Scanner<'a> {
     /// Match a rule's strings and run its condition. Returns whether it held.
     ///
     /// Records the match in `outcome` when it did.
+    ///
+    /// # Why the required strings are searched first
+    ///
+    /// A rule is a candidate because the prefilter could not rule it out, which
+    /// on a large binary is still thousands of rules. Each one that survives
+    /// costs a search for every string whose atoms were present, and then a
+    /// run of the machine — and almost all of them are candidates that will not
+    /// match. The great majority of conditions in a real rule set say
+    /// `$a and $b and $c and pe.something`, so the first string that turns out
+    /// to be absent settles the rule: the condition is false whatever the rest
+    /// of the file contains, and neither the remaining searches nor the machine
+    /// can change that.
+    ///
+    /// The slots that can settle it are exactly the ones
+    /// [`crate::compiler::required_slots`] proved the condition cannot be true
+    /// without, which the prefilter is already carrying. Reading them here
+    /// turns an average of four searches and a machine run per candidate into
+    /// one search for the ones that fail, which on `shell32.dll` is nearly all
+    /// of them.
     fn evaluate(
         &mut self,
         rule_index: u32,
@@ -235,33 +276,26 @@ impl<'a> Scanner<'a> {
         };
 
         self.working.reset(rule.program.string_count as usize);
-        for slot in 0..rule.program.string_count {
-            match self
-                .database
-                .prefilter()
-                .string_state(&self.scratch, rule_index, slot)
-            {
-                // The atoms were all found, so the string may be there; and the
-                // string has no atoms, so nothing could be said either way. Both
-                // have to be searched for.
-                StringState::Possible | StringState::Unknown => {}
-                StringState::Absent => {
-                    // A group had no atom present, so the string cannot be here.
-                    // This is the whole reason the per-string state exists: the
-                    // search is the expensive half and it would find nothing.
-                    outcome.strings_refuted += 1;
-                    continue;
-                }
+        let required = &rule.program.required_strings;
+
+        // Sound because `required_slots` only ever lists a slot the condition
+        // cannot be true without, so a rule that matches has all of them
+        // matching: bailing out here can only drop rules that were going to
+        // fail.
+        for slot in required {
+            if !self.search_string(rule, rule_index, *slot, data, outcome) {
+                return false;
             }
-            let Some(matcher) = rule.matcher(slot) else {
-                // The matcher refused this string when it was compiled — a
-                // construct the engine cannot search for. The slot stays empty,
-                // so the condition sees the string as never matching, which is
-                // the honest reading.
+        }
+        for slot in 0..rule.program.string_count {
+            if required.contains(&slot) {
+                // Already searched above, and its matches are in the table.
                 continue;
-            };
-            outcome.strings_searched += 1;
-            matcher.find_all(data, &mut self.working);
+            }
+            // Optional: the condition can hold without it, so whether it was
+            // found changes nothing about reaching the machine. The matches, if
+            // any, are in the table for the machine to read.
+            let _ = self.search_string(rule, rule_index, slot, data, outcome);
         }
 
         outcome.evaluated += 1;
@@ -292,6 +326,86 @@ impl<'a> Scanner<'a> {
                 false
             }
         }
+    }
+
+    /// Search for one of a rule's strings, and say whether it is there.
+    ///
+    /// Three things can make a string absent without a search: the atoms can
+    /// refute it, or the matcher can refuse it, and both mean the condition
+    /// will see it as never matching. Only the third — a search that runs and
+    /// finds nothing — costs anything, and the return value does not
+    /// distinguish between them, because the caller is asking one question:
+    /// can the condition see this string at all.
+    ///
+    /// The counters do distinguish them, so that a scan can be read back and
+    /// the work attributed.
+    #[must_use]
+    fn search_string(
+        &mut self,
+        rule: &CompiledRule,
+        rule_index: u32,
+        slot: u32,
+        data: &[u8],
+        outcome: &mut ScanOutcome,
+    ) -> bool {
+        match self
+            .database
+            .prefilter()
+            .string_state(&self.scratch, rule_index, slot)
+        {
+            // The atoms were all found, so the string may be there; and the
+            // string has no atoms, so nothing could be said either way. Both
+            // have to be searched for.
+            StringState::Possible | StringState::Unknown => {}
+            StringState::Absent => {
+                // A group had no atom present, so the string cannot be here.
+                // This is the whole reason the per-string state exists: the
+                // search is the expensive half and it would find nothing.
+                outcome.strings_refuted += 1;
+                return false;
+            }
+        }
+
+        let Some(matcher) = rule.matcher(slot) else {
+            // The matcher refused this string when it was compiled — a
+            // construct the engine cannot search for. The slot stays empty, so
+            // the condition sees the string as never matching, which is the
+            // honest reading.
+            return false;
+        };
+
+        outcome.strings_searched += 1;
+        // If the automaton saw every occurrence of this string's atom, they say
+        // where the string can be, and the search collapses to a few byte
+        // comparisons each. This is the difference between a scan that costs
+        // the buffer size per string and one that costs the string.
+        let located = matcher.can_use_witness()
+            && self.database.prefilter().witnesses(
+                &self.scratch,
+                rule_index,
+                slot,
+                &mut self.witnesses,
+            );
+        match located {
+            // A witnessed search is a handful of byte comparisons per
+            // candidate, so it cannot run out of budget.
+            true => {
+                outcome.strings_localized += 1;
+                for offset in &self.witnesses {
+                    matcher.find_all_from_witness(data, *offset, &mut self.working);
+                }
+            }
+            // Nothing to derive the position from, so the honest answer is a
+            // search. Not a fallback in the sense of a degraded mode: it is
+            // what every string did before, and most still do.
+            false => {
+                if !matcher.find_all(data, &mut self.working) {
+                    outcome.matcher_failures += 1;
+                }
+            }
+        }
+
+        self.working.count(slot) > 0
     }
 }
 
@@ -362,6 +476,112 @@ rule two {
         assert_eq!(outcome.strings_searched, 1, "$a searched, $b and $c skipped");
         assert_eq!(outcome.strings_refuted, 2);
         assert!(outcome.matches.is_empty(), "neither $b nor $c is present");
+    }
+
+    /// A string whose atom occurrences the prefilter knows is not searched for
+    /// across the whole file.
+    ///
+    /// The prefilter's automaton already visited every byte, so it knows where
+    /// the atom matched. Every one of those places is somewhere a match of the
+    /// string must reach, so the match starts are derivable and the matcher
+    /// only has to verify a few candidate offsets instead of passing over the
+    /// buffer again. On a large binary that second pass is the scan's whole
+    /// cost, because it is memory bandwidth.
+    ///
+    /// The string is ten bytes and every one of its four-byte windows is
+    /// distinct from the padding, so the test does not depend on which window
+    /// the atom chooser picks: whichever it is, it occurs exactly once in the
+    /// first buffer and twice in the second.
+    #[test]
+    fn a_string_whose_atom_occurrences_are_known_is_located_rather_than_searched() {
+        let source = r#"
+rule located {
+    strings:
+        $a = "zzqqxxjjvv"
+    condition:
+        $a
+}
+"#;
+        let once = b"padding zzqqxxjjvv padding";
+        let (outcome, _) = scan(source, once);
+        assert_eq!(outcome.strings_localized, 1, "the witness must be used");
+        assert_eq!(outcome.strings_searched, 1);
+        assert_eq!(outcome.matches.len(), 1);
+        let found = outcome.matches[0].strings.first(0).unwrap();
+        assert_eq!((found.offset, found.length), (8, 10));
+
+        // The same bytes twice. Both occurrences are candidates, both are
+        // checked, and the answer is the one a full search gives — two matches,
+        // at the right offsets. This half is what makes the test about
+        // equivalence rather than just about the fast path being taken.
+        let twice = b"padding zzqqxxjjvv padding padding zzqqxxjjvv padding";
+        let (outcome, _) = scan(source, twice);
+        assert_eq!(outcome.strings_localized, 1, "two occurrences, both known");
+        assert_eq!(outcome.strings_searched, 1);
+        assert_eq!(outcome.matches.len(), 1);
+        let found = outcome.matches[0].strings.first(0).unwrap();
+        assert_eq!((found.offset, found.length), (8, 10), "the first of the two");
+        assert_eq!(outcome.matches[0].strings.count(0), 2, "both were found");
+
+        // More occurrences than the prefilter keeps offsets for. The list it
+        // could give would be incomplete, which is worse than not having one at
+        // all, so the search stands down — and must still find every match,
+        // including the ones whose offsets were never kept.
+        let occurrences = u32::try_from(crate::prefilter::WITNESS_CAP + 1).unwrap();
+        let mut too_many = b"padding ".to_vec();
+        for _ in 0..occurrences {
+            too_many.extend_from_slice(b"zzqqxxjjvv padding ");
+        }
+        let (outcome, _) = scan(source, &too_many);
+        assert_eq!(
+            outcome.strings_localized, 0,
+            "an incomplete list of offsets is not usable"
+        );
+        assert_eq!(outcome.strings_searched, 1, "searched the long way instead");
+        assert_eq!(
+            outcome.matches[0].strings.count(0),
+            occurrences,
+            "every match, including the ones past the cap"
+        );
+    }
+
+    /// The shortcut must not change the verdict when the atom is a coincidence.
+    ///
+    /// An atom is a window of the string, and a window is far more common than
+    /// the thing it was cut from. The case the localization has to get right is
+    /// the atom being present and the string not — it must derive the one
+    /// candidate offset, compare the bytes there, and report nothing, rather
+    /// than reporting the window as a match.
+    ///
+    /// Every four-byte window of the string is in the buffer, separately, so
+    /// the test does not depend on which one the chooser picked: whichever it
+    /// is, it occurs exactly once, the string itself never occurs, and the
+    /// buffer is never the literal.
+    #[test]
+    fn a_witness_that_points_at_a_coincidence_reports_no_match() {
+        let source = r#"
+rule located {
+    strings:
+        $a = "zzqqxxjjvv"
+    condition:
+        $a
+}
+"#;
+        let data = b"zzqq zqqx qqxx qxxj xxjj xjjv jjvv";
+        assert!(
+            !data.windows(10).any(|w| w == b"zzqqxxjjvv"),
+            "the string must not be in the buffer, or this tests nothing"
+        );
+        let (outcome, _) = scan(source, data);
+        assert_eq!(outcome.strings_searched, 1, "the atom is there, so it is searched");
+        assert_eq!(
+            outcome.strings_localized, 1,
+            "and located, because its atom occurs once"
+        );
+        assert!(
+            outcome.matches.is_empty(),
+            "a window in the buffer is not the string"
+        );
     }
 
     /// A rule whose required string is absent is not a candidate at all.

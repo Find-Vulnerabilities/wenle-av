@@ -21,6 +21,7 @@
 use smallvec::SmallVec;
 
 use crate::ast::{Base64Alphabet, Modifiers};
+use crate::atoms::best_atom;
 
 /// The largest number of literal variants one string may expand to.
 ///
@@ -124,6 +125,72 @@ impl Literal {
             // occurrence where a file has two is a rule that quietly stops
             // firing.
             from = at + 1;
+        }
+    }
+
+    /// Find every occurrence, given that this literal's atom occurs exactly
+    /// once in `data`, at `witness`.
+    ///
+    /// # Why this is exact
+    ///
+    /// The atom is a contiguous window of the literal — [`best_atom`] takes a
+    /// run of the literal's own bytes — so suppose it sits at index `k` of the
+    /// literal. A match of the literal at `S` contains `literal[k..k+A]`, which
+    /// is the atom, which occurs exactly once, at `witness`. So `S + k ==
+    /// witness`, and `S == witness - k`. There is no third possibility and
+    /// nothing to search for: a match can start at exactly the offsets this
+    /// function derives from where the atom's bytes sit inside the literal, and
+    /// each of those is confirmed by comparing the literal there.
+    ///
+    /// That is the point. A full search of an eight megabyte buffer per string
+    /// is what a scan of `shell32.dll` spends its eighteen seconds on; this is
+    /// a handful of byte comparisons, because the prefilter's automaton pass
+    /// already found the needle.
+    ///
+    /// # What the caller owes
+    ///
+    /// That the atom really does occur exactly once. If it occurs twice, this
+    /// finds the matches whose atom is the one at `witness` and misses the
+    /// others, which is a file with one fewer match than it has — enough to
+    /// make `#a == 2` false. The prefilter counts the occurrences and only
+    /// offers a witness when the count is one.
+    pub fn find_all_from_witness(&self, data: &[u8], witness: u32, out: &mut Vec<(u32, u32)>) {
+        if self.bytes.is_empty() || self.bytes.len() > data.len() {
+            return;
+        }
+        let Some(atom) = best_atom(&self.bytes, self.nocase) else {
+            return;
+        };
+        let witness = witness as usize;
+        let len = self.bytes.len();
+        let mut from = 0usize;
+        while from + atom.bytes.len() <= len {
+            // Where the atom's bytes sit inside the literal. Every one of them
+            // is a position a match could carry the found occurrence at.
+            let Some(relative) = memchr::memmem::find(&self.bytes[from..], &atom.bytes) else {
+                return;
+            };
+            let index = from + relative;
+            if let Some(at) = witness.checked_sub(index) {
+                if at + len <= data.len() && self.matches_at(data, at) {
+                    self.push_if_whole(data, at, out);
+                }
+            }
+            from = index + 1;
+        }
+    }
+
+    /// Whether this literal occurs at `at`, with the case rule it was defined
+    /// with.
+    fn matches_at(&self, data: &[u8], at: usize) -> bool {
+        let window = &data[at..at + self.bytes.len()];
+        if self.nocase {
+            window
+                .iter()
+                .zip(&self.bytes)
+                .all(|(x, y)| x.eq_ignore_ascii_case(y))
+        } else {
+            window == self.bytes.as_slice()
         }
     }
 
@@ -375,6 +442,81 @@ mod tests {
     fn find(literal: &Literal, data: &[u8]) -> Vec<(u32, u32)> {
         let mut out = Vec::new();
         literal.find_all(data, &mut out);
+        out
+    }
+
+    /// The literal's atom, which is what a witness is an offset of.
+    ///
+    /// Not derived by hand in each test: a witness is the offset of the *atom*,
+    /// and the atom is a window of the literal chosen by [`best_atom`]. Hand-
+    /// written offsets would test the helper against a guess rather than
+    /// against what the prefilter would actually pass.
+    fn atom_of(literal: &Literal) -> Vec<u8> {
+        best_atom(&literal.bytes, literal.nocase)
+            .expect("a test literal this long has an atom")
+            .bytes
+            .to_vec()
+    }
+
+    /// Every offset a case-insensitive needle occurs at.
+    fn occurrences_ignoring_case(needle: &[u8], data: &[u8]) -> Vec<u32> {
+        (0..=data.len().saturating_sub(needle.len()))
+            .filter(|at| {
+                data[*at..at + needle.len()]
+                    .iter()
+                    .zip(needle)
+                    .all(|(x, y)| x.eq_ignore_ascii_case(y))
+            })
+            .map(|at| at as u32)
+            .collect()
+    }
+
+    /// Searching from every occurrence of the atom must find exactly what a
+    /// full search finds.
+    ///
+    /// The production caller only passes a witness whose atom occurs *once*, so
+    /// this is the stronger claim: it holds for the cases the caller refuses as
+    /// well. If it ever failed, the witness path would be an optimization that
+    /// changes the answer, which is a missed match, which is a missed
+    /// detection.
+    ///
+    /// Case-sensitive only. A case-insensitive literal's atom occurs
+    /// case-insensitively, and the search for those occurrences is its own
+    /// piece of logic that would need testing in turn; the tests that care
+    /// assert against `find` directly instead.
+    fn witness_agrees_with_the_full_search(literal: &Literal, data: &[u8]) {
+        assert!(!literal.nocase, "use the direct assertions for a nocase literal");
+        let atom = atom_of(literal);
+        let mut union: Vec<(u32, u32)> = Vec::new();
+        for witness in occurrences_ignoring_case_exact(&atom, data) {
+            let mut hits = Vec::new();
+            literal.find_all_from_witness(data, witness, &mut hits);
+            union.extend(hits);
+        }
+        union.sort_unstable();
+        union.dedup();
+        assert_eq!(
+            union,
+            find(literal, data),
+            "witnessed search disagreed with the full search for {:?} in {:?} (atom {:?})",
+            String::from_utf8_lossy(&literal.bytes),
+            String::from_utf8_lossy(data),
+            String::from_utf8_lossy(&atom)
+        );
+    }
+
+    /// Every offset an exact needle occurs at.
+    fn occurrences_ignoring_case_exact(needle: &[u8], data: &[u8]) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut from = 0usize;
+        while from + needle.len() <= data.len() {
+            let Some(relative) = memchr::memmem::find(&data[from..], needle) else {
+                break;
+            };
+            let at = from + relative;
+            out.push(at as u32);
+            from = at + 1;
+        }
         out
     }
 
@@ -704,4 +846,149 @@ mod tests {
         );
     }
 
+    // -- searching from a witness -----------------------------------------
+
+    #[test]
+    fn a_witness_finds_the_match_it_points_at() {
+        let literal = Literal::new(b"this is a needle".to_vec(), false, false);
+        // The atom is a window of the literal, not the whole of it, so the
+        // match does not begin where the atom does and the offset has to be
+        // corrected by the atom's index — which is the arithmetic under test.
+        assert!(atom_of(&literal).len() < literal.bytes.len());
+        let data = b"xxxx this is a needle yyyy".to_vec();
+        witness_agrees_with_the_full_search(&literal, &data);
+        assert_eq!(find(&literal, &data), vec![(5, 16)]);
+    }
+
+    #[test]
+    fn a_witness_finds_nothing_when_the_atom_is_a_coincidence() {
+        // The atom is present but the literal is not, which is the case the
+        // prefilter finds constantly: an atom is a window, and a window is far
+        // more common than the thing it was cut from. The witness must produce
+        // no match and must not invent one by searching elsewhere in the
+        // buffer.
+        let literal = Literal::new(b"this is a needle".to_vec(), false, false);
+        let data = [b"padding ".as_slice(), &atom_of(&literal), b" padding"].concat();
+        assert_eq!(find(&literal, &data), Vec::new(), "the literal is not there");
+        assert_eq!(
+            occurrences_ignoring_case_exact(&atom_of(&literal), &data).len(),
+            1,
+            "the atom is there, once, which is what makes this the interesting case"
+        );
+        witness_agrees_with_the_full_search(&literal, &data);
+    }
+
+    #[test]
+    fn a_witness_finds_a_match_at_the_start_and_at_the_end() {
+        let literal = Literal::new(b"needle in a haystack".to_vec(), false, false);
+        for data in [
+            b"needle in a haystack".to_vec(),
+            b"needle in a haystack tail".to_vec(),
+            b"head needle in a haystack".to_vec(),
+        ] {
+            witness_agrees_with_the_full_search(&literal, &data);
+        }
+    }
+
+    #[test]
+    fn a_witness_does_not_reach_past_the_end_of_the_buffer() {
+        // A witness far past the end, as a corrupt or stale one would be. The
+        // one place an offset arithmetic mistake turns into a panic rather than
+        // a wrong answer.
+        let literal = Literal::new(b"needle in a haystack".to_vec(), false, false);
+        let data = b"a haystack".to_vec();
+        for witness in [4096u32, u32::MAX] {
+            let mut localized = Vec::new();
+            literal.find_all_from_witness(&data, witness, &mut localized);
+            assert!(localized.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_witness_respects_the_case_rule() {
+        let data = b"load KERNEL32.DLL now".to_vec();
+        let loose = Literal::new(b"Kernel32.dll".to_vec(), true, false);
+        let atom = atom_of(&loose);
+        let witnesses = occurrences_ignoring_case(&atom, &data);
+        assert_eq!(witnesses.len(), 1, "the atom is in the data once");
+        let mut localized = Vec::new();
+        loose.find_all_from_witness(&data, witnesses[0], &mut localized);
+        assert_eq!(localized, find(&loose, &data), "a nocase literal must match");
+        assert_eq!(localized, vec![(5, 12)]);
+
+        // The same bytes, read case-sensitively, must find nothing — and must
+        // not find it somewhere else either.
+        let strict = Literal::new(b"Kernel32.dll".to_vec(), false, false);
+        let mut localized = Vec::new();
+        strict.find_all_from_witness(&data, witnesses[0], &mut localized);
+        assert!(
+            localized.is_empty(),
+            "a case-sensitive literal must not match different case: {localized:?}"
+        );
+        witness_agrees_with_the_full_search(&strict, &data);
+    }
+
+    #[test]
+    fn a_witness_finds_overlapping_matches() {
+        // `#a` counts overlapping occurrences, so a string the witness points
+        // at three times must report three matches.
+        let literal = Literal::new(b"aaaa".to_vec(), false, false);
+        let data = b"aaaaaa".to_vec();
+        assert_eq!(find(&literal, &data).len(), 3);
+        witness_agrees_with_the_full_search(&literal, &data);
+    }
+
+    #[test]
+    fn a_witness_finds_a_match_whose_atom_occurs_more_than_once_in_the_literal() {
+        // The atom's bytes sit at two indices of this literal, so one atom
+        // occurrence implies two possible match starts. Deriving only the first
+        // would miss a match — which is why `find_all_from_witness` walks every
+        // occurrence of the atom inside the pattern rather than assuming it
+        // sits at one index. The trailing space is load-bearing: without it the
+        // second `dle` runs off the end of the literal and cannot be an atom.
+        let literal = Literal::new(b"needle and needle ".to_vec(), false, false);
+        let atom = atom_of(&literal);
+        let indices = occurrences_ignoring_case_exact(&atom, &literal.bytes);
+        assert_eq!(
+            indices,
+            vec![3, 14],
+            "this test is about an atom that sits at more than one index"
+        );
+        // Built from the literal rather than typed out, so that "two matches"
+        // is true by construction and the test cannot drift into asserting that
+        // a buffer contains something it does not.
+        let mut data = b"a ".to_vec();
+        data.extend_from_slice(&literal.bytes);
+        data.extend_from_slice(b" between ");
+        data.extend_from_slice(&literal.bytes);
+        data.push(b'.');
+        assert_eq!(find(&literal, &data).len(), 2);
+        witness_agrees_with_the_full_search(&literal, &data);
+    }
+
+    #[test]
+    fn a_witness_respects_fullword() {
+        // `fullword` is applied at the offset the witness implies, so a match
+        // the atom points at but that sits inside a longer word is still
+        // rejected.
+        let literal = Literal::new(b"need".to_vec(), false, true);
+        let data = b"aneedle".to_vec();
+        let mut localized = Vec::new();
+        literal.find_all_from_witness(&data, 1, &mut localized);
+        assert!(localized.is_empty(), "not a whole word: {localized:?}");
+        witness_agrees_with_the_full_search(&literal, &data);
+    }
+
+    #[test]
+    fn a_witness_for_a_literal_with_no_atom_produces_nothing_rather_than_panicking() {
+        // A literal too short to have an atom of its own. The caller must not
+        // be asking — `CompiledString::can_use_witness` and the prefilter's
+        // own atom table both have to be satisfied first — but a guard that
+        // returns nothing is cheaper than an invariant that has to hold.
+        let literal = Literal::new(b"ab".to_vec(), false, false);
+        assert!(best_atom(&literal.bytes, false).is_none());
+        let mut localized = Vec::new();
+        literal.find_all_from_witness(b"abab", 0, &mut localized);
+        assert!(localized.is_empty());
+    }
 }

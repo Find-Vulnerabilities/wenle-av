@@ -543,6 +543,99 @@ impl Prefilter {
         }
     }
 
+    /// The offsets a string's matches can be derived from, when the atom pass
+    /// saw its atoms often enough to be useful but rarely enough to be exact.
+    ///
+    /// # What this is for
+    ///
+    /// The scanner searches for a string by scanning the buffer. When the
+    /// answer to "where could this string be" is already known from the atom
+    /// pass, that scan is the whole cost of the rule set: a scan of
+    /// `shell32.dll` does 19,977 full-buffer searches over eight megabytes,
+    /// which is 160 GB of memory traffic and eighteen seconds.
+    ///
+    /// The atom the automaton matched is a byte sequence the string must
+    /// contain. Every occurrence of it is somewhere a match of the string must
+    /// reach, so every occurrence is a candidate: if the atom's bytes sit at
+    /// index `k` of the pattern, a match containing the occurrence at `w` must
+    /// start at `w - k`. Turning occurrences into match offsets is the
+    /// matcher's job, because only the matcher knows the pattern — what comes
+    /// back here is the occurrences.
+    ///
+    /// The first version of this asked only for the single-occurrence case,
+    /// which measured at 5% of searches on a real binary: a four-byte atom in
+    /// an eight-megabyte DLL usually occurs more than once. But nothing in the
+    /// argument needs *one* occurrence, only that all of them are known, so the
+    /// list is the general form and the single occurrence is its smallest case.
+    ///
+    /// # When this may be called
+    ///
+    /// Between a [`candidates`](Self::candidates) call and the next one, like
+    /// [`string_state`](Self::string_state), and for the same reason.
+    ///
+    /// # Soundness
+    ///
+    /// Returns `false`, and leaves `out` empty, whenever anything is not known
+    /// for certain: no witness was recorded, no occurrence was seen, or there
+    /// were more occurrences than [`WITNESS_CAP`] and the later ones were not
+    /// kept. The caller then searches properly. There is no case where a
+    /// non-empty list comes back that does not contain *every* occurrence the
+    /// matcher has to check — the count is the proof, and it counts overlapping
+    /// occurrences individually.
+    pub fn witnesses(
+        &self,
+        scratch: &PrefilterScratch,
+        rule: u32,
+        slot: u32,
+        out: &mut Vec<u32>,
+    ) -> bool {
+        debug_assert_eq!(
+            scratch.owner,
+            self.address(),
+            "this scratch has not been used for a scan with this prefilter, so its stamps \
+             mean nothing here"
+        );
+        out.clear();
+
+        // A corrupt database can name a rule or slot that does not exist. There
+        // is no wrong answer that is worse than a full search, so every
+        // unresolvable name returns the same thing.
+        let Some(range) = self.rule_range(rule) else {
+            return false;
+        };
+        if slot as usize >= (range.end - range.start) as usize {
+            return false;
+        }
+        let string = (range.start + slot) as usize;
+
+        if scratch.string_witness_epoch[string] != scratch.epoch {
+            // No group of this string was satisfied, so the string cannot
+            // match. `string_state` says the same thing more directly; this is
+            // the answer that stays correct if it is asked on its own.
+            return false;
+        }
+
+        let atom = scratch.string_witness[string] as usize;
+        let Some(count) = scratch.atom_count.get(atom).copied() else {
+            return false;
+        };
+        // The whole proof, in one comparison. Every occurrence of the atom is
+        // an offset a match could start from, so `count` is exactly how many
+        // candidate offsets there are — usable as long as they were all kept.
+        // More than the cap means the extras are lost, and a lost offset is a
+        // lost match, so the answer falls back to searching.
+        if count == 0 || count as usize > WITNESS_CAP {
+            return false;
+        }
+        let start = atom * WITNESS_CAP;
+        let stored = scratch.atom_offsets.get(start..start + count as usize);
+        let Some(stored) = stored else {
+            return false;
+        };
+        out.extend_from_slice(stored);
+        true
+    }
+
     /// The string slots of one rule, or `None` if there is no such rule.
     fn rule_range(&self, rule: u32) -> Option<std::ops::Range<u32>> {
         let start = *self.rule_first_string.get(rule as usize)?;
@@ -550,7 +643,16 @@ impl Prefilter {
         Some(start..end)
     }
 
-    /// How many string slots a rule has.
+    /// How many occurrences of one atom are remembered for the witness search.
+///
+/// This is the point where locating a string stops being worth it and searching
+/// for it starts. `n` remembered offsets means the matcher verifies `n`
+/// candidate positions, each a comparison of the pattern's length — so the
+/// work is `n × len` instead of the length of the buffer. At sixteen, a
+/// hundred-byte pattern costs 1,600 byte comparisons against eight million for
+/// a pass over `shell32.dll`.
+///
+/// How many string slots a rule has.
     pub fn string_count(&self, rule: u32) -> u32 {
         self.rule_range(rule).map_or(0, |r| r.end - r.start)
     }
@@ -579,7 +681,8 @@ impl Prefilter {
         // automatons are built with.
         for found in ac.find_overlapping_iter(data) {
             let atom = atom_of_pattern[found.pattern().as_usize()];
-            if !scratch.visit_atom(atom) {
+            let offset = u32::try_from(found.start()).unwrap_or(u32::MAX);
+            if !scratch.visit_atom(atom, offset) {
                 continue;
             }
             for group in &self.atom_groups[atom as usize] {
@@ -587,6 +690,7 @@ impl Prefilter {
                     continue;
                 }
                 let string = self.group_string[*group as usize] as usize;
+                scratch.set_witness(string as u32, atom);
                 let rule = self.string_rule[string];
                 if self.string_required[string] {
                     // The condition needs this string, so the rule is selected
@@ -624,6 +728,31 @@ fn build_automaton(patterns: &[Vec<u8>], ascii_case_insensitive: bool) -> Option
         .ok()
 }
 
+/// How many occurrences of one atom are remembered for the witness search.
+///
+/// This is the point where locating a string stops being worth it and searching
+/// for it starts. `n` remembered offsets means the matcher verifies `n`
+/// candidate positions, each a comparison of the pattern's length — so the
+/// work is `n × len` instead of the length of the buffer. At sixteen, a
+/// hundred-byte pattern costs 1,600 byte comparisons against eight million for
+/// a pass over `shell32.dll`.
+///
+/// The cost of raising it is the scratch: `4 × CAP` bytes for every atom in the
+/// database, and 67,218 atoms at sixteen is 4.3 MB per scanning thread.
+///
+/// That cost is not incidental — it is the binding constraint, and it binds in
+/// the direction opposite to the obvious one. Raising this to 64 was measured
+/// on `shell32.dll` and made the scan *slower*: 22.6 s to 25.7 s across the six
+/// test binaries, even though located searches rose from 24% to 36%. The extra
+/// coverage did not pay for a 17 MB table, because every atom match now writes
+/// to a different cache line and the automaton pass is what pays. Sixteen keeps
+/// the table inside the last-level cache on the machines this was measured on.
+///
+/// So this is a cache-size constant as much as it is a search-strategy one, and
+/// the number to trust is the one `examples/scan_bench.rs` reports, not the
+/// reasoning here.
+pub const WITNESS_CAP: usize = 16;
+
 /// Per-file state, so that a scan allocates nothing.
 ///
 /// Every table here is stamped with an epoch instead of being cleared. A scan
@@ -641,6 +770,29 @@ pub struct PrefilterScratch {
     /// allocation order. Recorded so a debug build can refuse instead.
     owner: usize,
     atom_seen: Vec<u32>,
+    /// Atom -> how many times it matched this scan, and where the first
+    /// [`WITNESS_CAP`] occurrences were.
+    ///
+    /// Counted rather than merely noted because the count is what makes the
+    /// offsets usable: the scanner can derive a string's matches from them only
+    /// when every occurrence is on record, so a count that exceeds what was
+    /// kept disqualifies the offsets. All three tables are gated by
+    /// `atom_seen`, so none of them needs clearing.
+    ///
+    /// `atom_offsets` is flat with a stride of `WITNESS_CAP` rather than a
+    /// vector per atom — 67,218 atoms at one `Vec` each is millions of
+    /// allocations, once per scanning thread, for a table that is empty on
+    /// almost every file.
+    atom_count: Vec<u32>,
+    atom_offsets: Vec<u32>,
+    /// String -> the atom that satisfied one of its groups, and the epoch that
+    /// answer belongs to.
+    ///
+    /// A witness, not an answer: which atom got there first says nothing about
+    /// whether the string matches, and is only useful once the atom's
+    /// occurrence count is known to be one.
+    string_witness: Vec<u32>,
+    string_witness_epoch: Vec<u32>,
     group_done: Vec<u32>,
     string_seen: Vec<u32>,
     string_left: Vec<u32>,
@@ -665,6 +817,10 @@ impl PrefilterScratch {
             epoch: 0,
             owner: prefilter.address(),
             atom_seen: vec![0; prefilter.atom_groups.len()],
+            atom_count: vec![0; prefilter.atom_groups.len()],
+            atom_offsets: vec![0; prefilter.atom_groups.len() * WITNESS_CAP],
+            string_witness: vec![0; prefilter.string_group_count.len()],
+            string_witness_epoch: vec![0; prefilter.string_group_count.len()],
             group_done: vec![0; prefilter.group_string.len()],
             string_seen: vec![0; prefilter.string_group_count.len()],
             string_left: vec![0; prefilter.string_group_count.len()],
@@ -711,14 +867,62 @@ impl PrefilterScratch {
         }
     }
 
-    /// Note an atom as matched, returning whether this is the first time.
-    fn visit_atom(&mut self, atom: u32) -> bool {
+    /// Note an occurrence of an atom, returning whether this is the first.
+    ///
+    /// Counts every occurrence, not just the first, because the total is what
+    /// says whether the offsets on record are all of them. The first
+    /// [`WITNESS_CAP`] are kept and the rest only counted: an atom that occurs
+    /// more often than that is one the scanner searches for the ordinary way,
+    /// and paying to remember offsets nobody will read is the wrong trade.
+    fn visit_atom(&mut self, atom: u32, offset: u32) -> bool {
         let slot = &mut self.atom_seen[atom as usize];
-        if *slot == self.epoch {
-            return false;
+        let first = *slot != self.epoch;
+        let count = if first {
+            *slot = self.epoch;
+            self.atom_count[atom as usize] = 0;
+            0
+        } else {
+            self.atom_count[atom as usize] as usize
+        };
+
+        if count < WITNESS_CAP {
+            self.atom_offsets[atom as usize * WITNESS_CAP + count] = offset;
         }
-        *slot = self.epoch;
-        true
+
+        // Saturating, not wrapping. A buffer can be four gigabytes of one byte,
+        // and a count that wrapped back round would eventually reach a value
+        // the witness search accepts while the offsets on record are long stale
+        // — every match after the cap would be missed. Saturating leaves the
+        // count above the cap for good, so the offsets stay refused and the
+        // string is searched for properly.
+        self.atom_count[atom as usize] = self.atom_count[atom as usize].saturating_add(1);
+        first
+    }
+
+    /// Note the atom that satisfied one of a string's groups.
+    ///
+    /// An atom that satisfied a group is a byte sequence the string requires,
+    /// so any of them can serve as the witness — but their occurrence counts
+    /// differ, and only the rarest is likely to be within the cap. So the one
+    /// on record is replaced whenever a rarer candidate turns up, which costs a
+    /// comparison per satisfying atom and is what makes a string with a common
+    /// alternative and a rare one localizable at all.
+    ///
+    /// Counts only grow during a scan, so an atom that was the rarest when it
+    /// was recorded can stop being so later. That costs the localization, not
+    /// the answer: [`Prefilter::witnesses`] re-checks the count of whichever
+    /// atom is on record, and falls back to a full search when it has grown
+    /// past the cap.
+    fn set_witness(&mut self, string: u32, atom: u32) {
+        let string = string as usize;
+        if self.string_witness_epoch[string] == self.epoch {
+            let current = self.string_witness[string] as usize;
+            if self.atom_count[current] <= self.atom_count[atom as usize] {
+                return;
+            }
+        }
+        self.string_witness[string] = atom;
+        self.string_witness_epoch[string] = self.epoch;
     }
 
     /// Mark a group satisfied, returning whether this completed its string.
@@ -1407,5 +1611,239 @@ mod tests {
         let mut out = Vec::new();
         b.candidates(b"alpha", &mut scratch, &mut out);
         assert_eq!(b.string_state(&scratch, 0, 0), StringState::Possible);
+    }
+
+    // -- the witness --------------------------------------------------------
+
+    /// Every occurrence of `needle` in `data`, in order.
+    ///
+    /// The strings these tests use are four bytes, which is `MAX_ATOM_LEN`, so
+    /// the atom *is* the string and the atom's offsets are also the match's.
+    /// That is what lets these assert on exact offsets. The correction for a
+    /// longer literal, where the atom is a window somewhere inside it, belongs
+    /// to `matcher::text` and is tested there.
+    fn every_offset(needle: &[u8], data: &[u8]) -> Vec<u32> {
+        assert_eq!(
+            best_atom(needle, false)
+                .expect("a four-byte needle has an atom")
+                .bytes
+                .as_slice(),
+            needle,
+            "these tests assume a four-byte string's atom is the whole string"
+        );
+        memchr::memmem::find_iter(data, needle)
+            .map(|at| u32::try_from(at).expect("the test buffer is small"))
+            .collect()
+    }
+
+    /// What the prefilter says the offsets of slot 0 of rule 0 are.
+    fn witnesses_of(p: &Prefilter, scratch: &PrefilterScratch) -> Option<Vec<u32>> {
+        let mut out = Vec::new();
+        p.witnesses(scratch, 0, 0, &mut out).then_some(out)
+    }
+
+    /// Run a scan and hand back the scratch, so a test can query it afterwards.
+    fn scan_keeping_scratch(
+        prefilter: &Prefilter,
+        data: &[u8],
+        scratch: &mut PrefilterScratch,
+    ) -> Vec<u32> {
+        let mut out = Vec::new();
+        prefilter.candidates(data, scratch, &mut out);
+        out
+    }
+
+    #[test]
+    fn a_witness_is_reported_for_a_string_whose_atom_occurs_once() {
+        // The case the scanner's shortcut is for: the automaton saw the atom
+        // exactly once, so every match of the string must contain that one
+        // occurrence and the search is a few byte comparisons instead of a pass
+        // over the buffer.
+        let p = Prefilter::build(&filters(&[vec![one(b"atom")]]));
+        let data = b"xxatomxx";
+        let mut scratch = p.scratch();
+        assert_eq!(scan_keeping_scratch(&p, data, &mut scratch), vec![0]);
+        assert_eq!(witnesses_of(&p, &scratch), Some(every_offset(b"atom", data)));
+    }
+
+    #[test]
+    fn an_atom_that_occurs_several_times_yields_all_of_them() {
+        // The general case, and the one that matters on a real file: a
+        // four-byte atom in a large binary usually occurs more than once. Every
+        // occurrence is somewhere a match must reach, so every occurrence is a
+        // candidate — reporting only the first would lose the match at the
+        // second, which is the failure mode the single-occurrence version had
+        // to avoid by refusing to answer at all.
+        let p = Prefilter::build(&filters(&[vec![one(b"atom")]]));
+        let data = b"atom and atom and atom";
+        let mut scratch = p.scratch();
+        assert_eq!(scan_keeping_scratch(&p, data, &mut scratch), vec![0]);
+        assert_eq!(
+            witnesses_of(&p, &scratch),
+            Some(every_offset(b"atom", data)),
+            "all three, in the order the automaton met them"
+        );
+    }
+
+    #[test]
+    fn an_atom_that_occurs_nowhere_yields_no_witness() {
+        let p = Prefilter::build(&filters(&[vec![one(b"atom")]]));
+        let mut scratch = p.scratch();
+        assert!(scan_keeping_scratch(&p, b"nothing relevant", &mut scratch).is_empty());
+        assert_eq!(witnesses_of(&p, &scratch), None);
+    }
+
+    #[test]
+    fn an_atom_that_occurs_too_often_yields_no_witness() {
+        // Past the cap the later offsets are not kept, and a list that is
+        // missing an occurrence is a list that would send the matcher past a
+        // match. So the answer has to be "search for it" rather than a partial
+        // list — the count is what makes that decision possible.
+        let p = Prefilter::build(&filters(&[vec![one(b"atom")]]));
+        let mut data = Vec::new();
+        for _ in 0..WITNESS_CAP + 1 {
+            data.extend_from_slice(b"atom ");
+        }
+        let mut scratch = p.scratch();
+        assert_eq!(scan_keeping_scratch(&p, &data, &mut scratch), vec![0]);
+        assert_eq!(
+            witnesses_of(&p, &scratch),
+            None,
+            "{} occurrences is one more than the cap",
+            WITNESS_CAP + 1
+        );
+    }
+
+    #[test]
+    fn an_atom_at_exactly_the_cap_yields_all_of_them() {
+        // The boundary, from the side that must still work: the cap'th
+        // occurrence is kept, so the list is complete and usable. An off-by-one
+        // in the comparison would throw away every localization at the cap.
+        let p = Prefilter::build(&filters(&[vec![one(b"atom")]]));
+        let mut data = Vec::new();
+        for _ in 0..WITNESS_CAP {
+            data.extend_from_slice(b"atom ");
+        }
+        let mut scratch = p.scratch();
+        assert_eq!(scan_keeping_scratch(&p, &data, &mut scratch), vec![0]);
+        assert_eq!(
+            witnesses_of(&p, &scratch),
+            Some(every_offset(b"atom", &data)),
+            "a full list is usable; it is only an incomplete one that is not"
+        );
+    }
+
+    #[test]
+    fn a_string_whose_groups_were_not_all_satisfied_has_no_witness() {
+        // The atom matched, but the string as a whole cannot match, so there is
+        // no match for the witness to point at. The two answers are separate:
+        // `string_state` says `Absent`, and the witness must agree by saying
+        // nothing.
+        let atoms = StringAtoms {
+            groups: vec![
+                vec![best_atom(b"atom", false).unwrap()],
+                vec![best_atom(b"beta", false).unwrap()],
+            ],
+        };
+        let p = Prefilter::build(&filters(&[vec![atoms]]));
+        let data = b"atom but not the other one";
+        let mut scratch = p.scratch();
+        scan_keeping_scratch(&p, data, &mut scratch);
+        assert_eq!(p.string_state(&scratch, 0, 0), StringState::Absent);
+        assert_eq!(witnesses_of(&p, &scratch), None);
+    }
+
+    #[test]
+    fn a_string_with_no_atoms_has_no_witness() {
+        // Nothing was ever searched for, so nothing was seen and there is no
+        // offset to report. `Unknown` is the state, and it must not be read as
+        // "seen once at zero".
+        let p = Prefilter::build(&filters(&[vec![opaque()]]));
+        let data = b"any data at all";
+        let mut scratch = p.scratch();
+        scan_keeping_scratch(&p, data, &mut scratch);
+        assert_eq!(p.string_state(&scratch, 0, 0), StringState::Unknown);
+        assert_eq!(witnesses_of(&p, &scratch), None);
+    }
+
+    #[test]
+    fn a_witness_belongs_to_the_scan_that_produced_it() {
+        // Two files in a row, the second without the atom. The first scan's
+        // witness is stamped with the first scan's epoch, so the second must
+        // not read it — a stale offset would send the matcher to the wrong
+        // place in a buffer it has never seen, which is a missed detection.
+        let p = Prefilter::build(&filters(&[vec![one(b"atom")]]));
+        let mut scratch = p.scratch();
+        assert_eq!(
+            scan_keeping_scratch(&p, b"xxatomxx", &mut scratch),
+            vec![0],
+            "the first file selects"
+        );
+        assert!(witnesses_of(&p, &scratch).is_some());
+        assert!(
+            scan_keeping_scratch(&p, b"this buffer has nothing in it", &mut scratch).is_empty(),
+            "the second file does not"
+        );
+        assert_eq!(witnesses_of(&p, &scratch), None);
+    }
+
+    #[test]
+    fn a_witness_for_a_slot_or_rule_that_does_not_exist_is_none() {
+        // A program and a prefilter that disagree about the shape of the rule
+        // set is a corrupt database. The answer that costs a full search is
+        // right; the answer that indexes out of bounds is not.
+        let p = Prefilter::build(&filters(&[vec![one(b"atom")]]));
+        let data = b"xxatomxx";
+        let mut scratch = p.scratch();
+        scan_keeping_scratch(&p, data, &mut scratch);
+        let mut out = Vec::new();
+        assert!(!p.witnesses(&scratch, 0, 1, &mut out), "slot past the end");
+        assert!(!p.witnesses(&scratch, 1, 0, &mut out), "rule past the end");
+        assert!(!p.witnesses(&scratch, u32::MAX, 0, &mut out));
+    }
+
+    #[test]
+    fn a_query_leaves_nothing_of_the_previous_answer_in_the_buffer() {
+        // The buffer is reused across strings, so a query that appended instead
+        // of replacing would hand the matcher the previous string's offsets.
+        // Those are offsets into the same buffer, so they would not be
+        // out-of-range failures — they would be silent wrong answers.
+        let p = Prefilter::build(&filters(&[vec![one(b"atom")]]));
+        let mut scratch = p.scratch();
+        scan_keeping_scratch(&p, b"xxatomxx", &mut scratch);
+        let mut out = Vec::new();
+        assert!(p.witnesses(&scratch, 0, 0, &mut out));
+        assert_eq!(out.len(), 1);
+        assert!(!p.witnesses(&scratch, 0, 1, &mut out), "no such slot");
+        assert!(out.is_empty(), "the failed query must have cleared it");
+    }
+
+    #[test]
+    fn a_witness_is_the_offset_where_the_atom_was_found() {
+        // Checked at the start of a buffer, at the end, and deep inside one —
+        // an offset stored as anything narrower than the buffer length would
+        // fail at the last of these.
+        let p = Prefilter::build(&filters(&[vec![one(b"atom")]]));
+        let at_the_start = b"atom then padding".to_vec();
+        let deep_inside = {
+            let mut data = vec![b'a'; 4096];
+            data.extend_from_slice(b"atom");
+            data
+        };
+        let at_the_end = {
+            let mut data = vec![b'z'; 7];
+            data.extend_from_slice(b"atom");
+            data
+        };
+        for data in [at_the_start, deep_inside, at_the_end] {
+            let mut scratch = p.scratch();
+            assert_eq!(scan_keeping_scratch(&p, &data, &mut scratch), vec![0]);
+            assert_eq!(
+                witnesses_of(&p, &scratch),
+                Some(every_offset(b"atom", &data)),
+                "in a buffer of {} bytes",
+                data.len()
+            );
+        }
     }
 }

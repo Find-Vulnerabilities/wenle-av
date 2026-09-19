@@ -17,11 +17,29 @@
 //!
 //! # What to look at
 //!
-//! `rules selected` is the prefilter's selectivity: the fraction of the rule set
-//! that survives to be evaluated. `strings refuted` against `strings searched`
-//! is the second filter, and on a clean file the first should dwarf the second.
-//! If `rules selected` is not a small percentage, nothing downstream matters,
-//! because every rule reaches the interpreter on every file.
+//! Three filters, in the order a file meets them, each reported so the next one
+//! has something to be measured against:
+//!
+//! - **candidates** — the prefilter's selectivity, as a fraction of the rule
+//!   set. This is the filter that matters most, because a rule that survives
+//!   here reaches the interpreter.
+//! - **strings refuted** against **strings searched** — the per-string
+//!   handover. On a clean file the refuted count should dwarf the searched one.
+//! - **strings located** against **strings searched** — of the strings that do
+//!   have to be searched for, how many the prefilter's atom offsets placed
+//!   without a pass over the buffer. This is the memory-bandwidth saving, and
+//!   it applies only when every occurrence of the string's atom was kept, so a
+//!   low number here is the honest answer about how much the shortcut buys on
+//!   this file.
+//!
+//! Each scan also reports its split between the prefilter and everything after
+//! it. The two have different fixes and the aggregate timing cannot tell them
+//! apart, so optimizing without the split is guessing.
+//!
+//! `matcher failures` is not a performance number. It counts strings the
+//! matcher gave up on before finishing its search, which is a correctness
+//! signal: a non-zero count means detections may have been missed, and it must
+//! be read before any timing.
 
 // A development tool whose job is to fail loudly on bad input.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -110,6 +128,17 @@ fn run() -> ExitCode {
         prefilter.unfiltered_rules,
         percent(prefilter.unfiltered_rules, prefilter.rules)
     );
+    // How much of the rule set the condition analysis could say anything about.
+    // This is the ceiling on both the conjunctive selection and the scanner's
+    // early bail-out, and it is the number that decides whether either is worth
+    // more work: a rule whose condition is `any of them` can never be made
+    // selective by reasoning about its strings.
+    println!(
+        "{:>7} rules conjunctive ({:.2}%), demanding {} strings between them",
+        prefilter.conjunctive_rules,
+        percent(prefilter.conjunctive_rules, prefilter.rules),
+        prefilter.required_strings
+    );
 
     // -- the database file ---------------------------------------------------
 
@@ -154,8 +183,8 @@ fn run() -> ExitCode {
         ("text", &text),
         ("random", &random),
     ] {
-        let (best, outcome) = time_scan(&mut scanner, buffer);
-        report_scan(name, buffer.len(), best, &outcome, database.len());
+        let (best, prefilter, outcome) = time_scan(&mut scanner, &database, buffer);
+        report_scan(name, buffer.len(), best, prefilter, &outcome, database.len());
         if outcome.detected() {
             print_detections(&outcome, &database);
         }
@@ -191,8 +220,8 @@ fn run() -> ExitCode {
             println!("  {:<40} unreadable, skipped", short(file));
             continue;
         };
-        let (best, outcome) = time_scan(&mut scanner, &data);
-        report_scan(&short(file), data.len(), best, &outcome, database.len());
+        let (best, prefilter, outcome) = time_scan(&mut scanner, &database, &data);
+        report_scan(&short(file), data.len(), best, prefilter, &outcome, database.len());
         if outcome.detected() {
             print_detections(&outcome, &database);
             detections += 1;
@@ -218,7 +247,29 @@ fn run() -> ExitCode {
 }
 
 /// The best of several runs, to leave out the first pass's page faults.
-fn time_scan(scanner: &mut Scanner<'_>, data: &[u8]) -> (Duration, av_rules::scanner::ScanOutcome) {
+fn time_scan(
+    scanner: &mut Scanner<'_>,
+    database: &RuleDatabase,
+    data: &[u8],
+) -> (Duration, Duration, av_rules::scanner::ScanOutcome) {
+    // The prefilter's own cost, measured by calling it the way the scanner
+    // does. Without this split the timings say the scan is dominated by "string
+    // searches", which is a guess: the automaton visits every atom match in the
+    // buffer, and on a large binary that is millions of them. Which of the two
+    // is the cost decides what to optimize next, so it is measured rather than
+    // reasoned about.
+    let prefilter = {
+        let mut scratch = database.prefilter().scratch();
+        let mut out = Vec::new();
+        let mut best = Duration::MAX;
+        for _ in 0..3 {
+            let started = Instant::now();
+            database.prefilter().candidates(data, &mut scratch, &mut out);
+            best = best.min(started.elapsed());
+        }
+        best
+    };
+
     let mut best = Duration::MAX;
     let mut last = None;
     for _ in 0..3 {
@@ -227,19 +278,25 @@ fn time_scan(scanner: &mut Scanner<'_>, data: &[u8]) -> (Duration, av_rules::sca
         best = best.min(started.elapsed());
         last = Some(outcome);
     }
-    (best, last.expect("at least one run"))
+    (best, prefilter, last.expect("at least one run"))
 }
 
 fn report_scan(
     name: &str,
     len: usize,
     elapsed: Duration,
+    prefilter: Duration,
     outcome: &av_rules::scanner::ScanOutcome,
     rules: usize,
 ) {
     let throughput = len as f64 / elapsed.as_secs_f64() / 1e6;
     println!(
         "\n  {name}  ({len} bytes, {throughput:.0} MB/s, {elapsed:?})",
+    );
+    println!(
+        "    {prefilter:?} in the prefilter ({:.0}%), {:?} after it",
+        percent_f(prefilter, elapsed),
+        elapsed.saturating_sub(prefilter)
     );
     println!(
         "    {:>6} candidates ({:.2}% of the rule set), {} evaluated, {} matched",
@@ -255,8 +312,23 @@ fn report_scan(
         outcome.strings_refuted,
         percent(outcome.strings_refuted, strings)
     );
+    println!(
+        "    {:>6} of those located by a unique atom ({:.0}%), {} searched the long way",
+        outcome.strings_localized,
+        percent(outcome.strings_localized, outcome.strings_searched),
+        outcome.strings_searched - outcome.strings_localized
+    );
     if outcome.global_gate_failed {
         println!("    global gate failed — no rule was considered");
+    }
+    // Not a performance number: the matcher reports giving up before its search
+    // finished, and a scan that reports it may have missed a detection. Printed
+    // whenever it is non-zero so a timing run cannot quietly hide it.
+    if outcome.matcher_failures > 0 {
+        println!(
+            "    WARNING: {} strings were not searched to the end — detections may be missing",
+            outcome.matcher_failures
+        );
     }
     if outcome.vm_failures > 0 {
         println!("    WARNING: {} rules could not be evaluated", outcome.vm_failures);
@@ -284,6 +356,15 @@ fn percent(part: usize, whole: usize) -> f64 {
         0.0
     } else {
         part as f64 * 100.0 / whole as f64
+    }
+}
+
+/// The same, for a duration measured against a duration.
+fn percent_f(part: Duration, whole: Duration) -> f64 {
+    if whole.is_zero() {
+        0.0
+    } else {
+        part.as_secs_f64() * 100.0 / whole.as_secs_f64()
     }
 }
 

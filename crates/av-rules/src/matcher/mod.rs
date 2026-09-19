@@ -167,6 +167,44 @@ impl CompiledString {
         completed
     }
 
+    /// Whether a unique occurrence of this string's atom pins down where its
+    /// matches can start.
+    ///
+    /// True for a string with exactly one form. `$a = "kernel32.dll"` has one,
+    /// so its atom sits at a fixed index of it and every match must start where
+    /// that atom's one occurrence says. `$a = "abc" ascii wide` has two forms
+    /// of different lengths, and the atom the automaton matched belongs to only
+    /// one of them — the other could occur anywhere, so there is nothing to
+    /// derive and a full search is the only correct answer.
+    ///
+    /// Narrow on purpose. It is asked once per string before a search, and
+    /// answering `false` costs a search that was going to happen anyway.
+    pub fn can_use_witness(&self) -> bool {
+        matches!(&self.kind, Kind::Literal(literals) if literals.len() == 1)
+    }
+
+    /// Find every occurrence, given that this string's atom occurs exactly once
+    /// in `data`, at `witness`.
+    ///
+    /// Does nothing for a string [`can_use_witness`](Self::can_use_witness)
+    /// rejects, so the caller must ask that first and search properly when it
+    /// says no. See [`text::Literal::find_all_from_witness`] for why the answer
+    /// is exact rather than an approximation.
+    pub fn find_all_from_witness(&self, data: &[u8], witness: u32, matches: &mut MatchSet) {
+        let Kind::Literal(literals) = &self.kind else {
+            return;
+        };
+        let [only] = literals.as_slice() else {
+            return;
+        };
+        let mut hits: Vec<(u32, u32)> = Vec::new();
+        only.find_all_from_witness(data, witness, &mut hits);
+        for (offset, length) in hits {
+            matches.push(self.slot, Match::new(offset, length));
+        }
+        matches.dedup_slot(self.slot);
+    }
+
     /// Whether this string came from a hex pattern.
     pub fn is_hex(&self) -> bool {
         matches!(self.kind, Kind::Hex(_))
