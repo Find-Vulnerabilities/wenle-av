@@ -21,6 +21,7 @@ smallvec.workspace = true
 aho-corasick.workspace = true
 regex.workspace = true
 memchr.workspace = true
+regex-syntax.workspace = true
 once_cell.workspace = true
 byteorder.workspace = true
 bincode.workspace = true

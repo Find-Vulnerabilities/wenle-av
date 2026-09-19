@@ -35,6 +35,10 @@ crc32fast = "1"
 # --- pattern matching ---------------------------------------------------------
 aho-corasick = "1.1"
 regex = "1"
+# A regular expression's parse tree, used to work out which bytes a regex
+# *requires* — the prefilter cannot ask `regex` itself, which hands back only a
+# compiled matcher with the structure already folded away.
+regex-syntax = "0.8"
 # The substring search every string matcher ultimately performs. `aho-corasick`
 # already depends on it, so this costs a line rather than a crate, and using it
 # directly is what gives the single-pattern search the same SIMD acceleration

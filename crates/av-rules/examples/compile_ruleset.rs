@@ -37,6 +37,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use av_rules::compiler::{compile_rule, CompileError};
+use av_rules::prefilter::{Prefilter, RuleStrings};
 use av_rules::ruleset;
 
 fn main() -> ExitCode {
@@ -86,6 +87,11 @@ fn run() -> ExitCode {
     let mut descriptors = 0usize;
     let mut instructions = 0usize;
     let mut constants = 0usize;
+    // Every compiled rule's strings, in rule order, so the prefilter can be
+    // built from the real rule set rather than from a guess about it.
+    let mut atoms: Vec<RuleStrings> = Vec::new();
+    let mut rules_without_atoms = 0usize;
+    let mut string_refusals: BTreeMap<&'static str, (usize, String)> = BTreeMap::new();
 
     let started = Instant::now();
     let show = env::var("COMPILE_SHOW")
@@ -113,6 +119,34 @@ fn run() -> ExitCode {
                     descriptors += program.string_count as usize;
                     instructions += program.code.len();
                     constants += program.constants.len();
+
+                    // The strings are compiled here as the scanner will compile
+                    // them once and keep. A string the matcher refuses
+                    // contributes no atoms, so its rule ends up unfiltered
+                    // rather than wrongly filtered — the safe direction.
+                    let rule_atoms: RuleStrings = rule
+                        .strings
+                        .iter()
+                        .enumerate()
+                        .map(|(slot, def)| match av_rules::matcher::compile(def, slot as u32) {
+                            Ok(compiled) => compiled.atoms(),
+                            Err(e) => {
+                                let entry = string_refusals
+                                    .entry(e.feature.unwrap_or("invalid string"))
+                                    .or_insert_with(|| (0, String::new()));
+                                entry.0 += 1;
+                                if entry.1.is_empty() {
+                                    entry.1 = format!("{}: {}", rule.name, e.message);
+                                }
+                                av_rules::atoms::StringAtoms::none()
+                            }
+                        })
+                        .collect();
+                    if rule_atoms.iter().all(|atoms| atoms.is_empty()) {
+                        rules_without_atoms += 1;
+                    }
+                    atoms.push(rule_atoms);
+
                     if shown < show {
                         shown += 1;
                         println!(
@@ -182,7 +216,96 @@ fn run() -> ExitCode {
         println!("\n{} distinct features to implement", rows.len());
     }
 
+    if !string_refusals.is_empty() {
+        let refused: usize = string_refusals.values().map(|(n, _)| n).sum();
+        println!("\n=== string refusals: {refused} strings ===");
+        let mut rows: Vec<_> = string_refusals.into_iter().collect();
+        rows.sort_by_key(|(_, (count, _))| Reverse(*count));
+        for (feature, (count, example)) in &rows {
+            println!("{count:>6}  {feature}\n        {example}");
+        }
+    }
+
+    report_prefilter(&atoms, rules_without_atoms);
+
     ExitCode::SUCCESS
+}
+
+/// Build the prefilter from the real rule set and say what it would do.
+///
+/// This is the number that decides whether the engine is usable. A prefilter
+/// that selects most of the rule set on every file has bought nothing, and the
+/// only way to know which way it went is to build one out of the rules that
+/// actually ship and measure it against a buffer.
+fn report_prefilter(atoms: &[RuleStrings], rules_without_atoms: usize) {
+    let started = Instant::now();
+    let prefilter = Prefilter::build(atoms);
+    let stats = prefilter.stats();
+    println!("\n=== prefilter ===");
+    println!(
+        "{:>7} rules, {rules_without_atoms} with no usable atom, built in {:?}",
+        stats.rules,
+        started.elapsed()
+    );
+    println!(
+        "{:>7} distinct atoms ({:.1} per rule), {} case-insensitive",
+        stats.atoms,
+        stats.atoms as f64 / stats.rules.max(1) as f64,
+        stats.case_insensitive_atoms
+    );
+    if stats.rules > 0 {
+        println!(
+            "{:>7} rules unfilterable ({:.2}%) — evaluated on every file",
+            stats.unfiltered_rules,
+            stats.unfiltered_rules as f64 * 100.0 / stats.rules as f64
+        );
+    }
+
+    // How many rules the prefilter selects for buffers of each kind. Real
+    // files are neither all-zero nor random, so the useful figure is the
+    // middle one: text-like data is the hardest case for a signature engine,
+    // because a rule set is full of ASCII strings and a file full of ASCII
+    // will trip some of them no matter what.
+    let mut scratch = prefilter.scratch();
+    let mut out = Vec::new();
+    let zeros = vec![0u8; 1 << 20];
+    let text: Vec<u8> = (0..1usize << 20)
+        .map(|i| b"the quick brown fox jumps over the lazy dog. "[i % 45])
+        .collect();
+    // A cheap deterministic pseudo-random buffer, so the run is reproducible.
+    let mut state = 0x2545F491_4F6CDD1Du64;
+    let random: Vec<u8> = (0..1usize << 20)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect();
+
+    for (name, buffer) in [
+        ("1 MiB of zeros", &zeros),
+        ("1 MiB of text", &text),
+        ("1 MiB random", &random),
+    ] {
+        // Timed over several runs and reported as the best, because the first
+        // pass over a freshly allocated megabyte pays for the page faults and
+        // says nothing about the automaton. The best run is the one closest to
+        // the steady state the scanner will actually be in.
+        let mut best = std::time::Duration::MAX;
+        for _ in 0..5 {
+            let started = Instant::now();
+            prefilter.candidates(buffer, &mut scratch, &mut out);
+            best = best.min(started.elapsed());
+        }
+        let selected = out.len();
+        let percent = selected as f64 * 100.0 / stats.rules.max(1) as f64;
+        let throughput = buffer.len() as f64 / best.as_secs_f64() / 1e6;
+        println!(
+            "{selected:>7} rules selected for {name} ({percent:.2}%) in \
+             {best:?} ({throughput:.0} MB/s)"
+        );
+    }
 }
 
 /// One line naming the rule and one naming the construct at fault.

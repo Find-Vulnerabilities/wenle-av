@@ -34,6 +34,7 @@ pub mod text;
 use std::fmt;
 
 use crate::ast::{Modifiers, StringDef, StringValue};
+use crate::atoms::{group_from_variants, groups_from_runs, runs_of_hex, runs_of_regex, StringAtoms};
 use crate::matches::{Match, MatchSet};
 
 /// A string that could not be compiled into a matcher.
@@ -82,6 +83,17 @@ enum Kind {
     /// A regular expression, matched over bytes rather than characters.
     Regex {
         regex: Box<regex::bytes::Regex>,
+        /// The parse tree the regex was built from, kept because the compiled
+        /// matcher has the structure folded away and the prefilter needs to ask
+        /// which byte sequences the pattern *requires*.
+        ///
+        /// Parsed case-*sensitively* even when the pattern is not, so that the
+        /// literals come back as themselves rather than as classes; the
+        /// case-insensitivity is recorded beside it and applied to the atoms.
+        hir: Box<regex_syntax::hir::Hir>,
+        /// Whether matching ignores ASCII case, which decides whether the atoms
+        /// this yields go into the case-insensitive automaton.
+        nocase: bool,
         fullword: bool,
     },
 }
@@ -120,7 +132,9 @@ impl CompiledString {
                 true
             }
             Kind::Hex(pattern) => pattern.find_all(data, &mut hits),
-            Kind::Regex { regex, fullword } => {
+            Kind::Regex {
+                regex, fullword, ..
+            } => {
                 for m in regex.find_iter(data) {
                     // A regex that can match the empty string reports a hit at
                     // every offset. Those carry no information and would make
@@ -157,6 +171,32 @@ impl CompiledString {
     pub fn is_hex(&self) -> bool {
         matches!(self.kind, Kind::Hex(_))
     }
+
+    /// The bytes a matching file must contain.
+    ///
+    /// The contract the prefilter depends on is one-directional: if this string
+    /// matches a buffer, the buffer satisfies every group returned. It says
+    /// nothing about the converse, which is why a satisfied group selects a
+    /// rule as a *candidate* rather than deciding it.
+    ///
+    /// Empty means the string imposes no constraint — every form it could take
+    /// is too short or too vague to have an atom — and the prefilter has to let
+    /// its rule through untested. That is the safe direction to fail in.
+    pub fn atoms(&self) -> StringAtoms {
+        match &self.kind {
+            Kind::Literal(literals) => {
+                let variants: Vec<(&[u8], bool)> = literals
+                    .iter()
+                    .map(|literal| (literal.bytes.as_slice(), literal.nocase))
+                    .collect();
+                group_from_variants(&variants)
+            }
+            Kind::Hex(pattern) => groups_from_runs(&runs_of_hex(&pattern.tokens), false),
+            Kind::Regex { hir, nocase, .. } => {
+                groups_from_runs(&runs_of_regex(hir), *nocase)
+            }
+        }
+    }
 }
 
 /// Whether a `fullword` match is delimited by non-word bytes.
@@ -181,8 +221,11 @@ pub fn compile(def: &StringDef, slot: u32) -> Result<CompiledString, MatcherErro
             Kind::Hex(pattern::Pattern::compile(pattern).map_err(MatcherError::invalid)?)
         }
         StringValue::Regex { body, flags } => {
+            let nocase = def.modifiers.nocase || flags.contains('i');
             Kind::Regex {
                 regex: Box::new(build_regex(body, flags, &def.modifiers)?),
+                hir: Box::new(parse_for_atoms(body)?),
+                nocase,
                 fullword: def.modifiers.fullword,
             }
         }
@@ -193,6 +236,29 @@ pub fn compile(def: &StringDef, slot: u32) -> Result<CompiledString, MatcherErro
         private: def.modifiers.private,
         kind,
     })
+}
+
+/// Parse a regex body into the tree the atom extractor walks.
+///
+/// A second parse of a pattern already parsed once, which is the price of
+/// keeping the two questions separate: `regex` answers "does this match" and
+/// keeps its structure to itself, and only the parse tree can answer "what must
+/// be there".
+///
+/// The settings are the ones `regex::bytes::RegexBuilder` uses, with two
+/// deliberate differences. `utf8(false)` matches the bytes API, without which
+/// `\d` is rejected as a class that could match invalid UTF-8. And
+/// case-insensitivity is *not* set even when the pattern asks for it: folding
+/// here would turn every literal letter into a class and there would be no
+/// literals left to extract. The caller records the flag and marks the atoms
+/// instead.
+fn parse_for_atoms(body: &str) -> Result<regex_syntax::hir::Hir, MatcherError> {
+    regex_syntax::ParserBuilder::new()
+        .unicode(false)
+        .utf8(false)
+        .build()
+        .parse(body)
+        .map_err(|e| MatcherError::invalid(format!("invalid regular expression: {e}")))
 }
 
 /// Build a byte-oriented regex from a body and its flag letters.

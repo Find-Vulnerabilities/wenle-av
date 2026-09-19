@@ -52,12 +52,14 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod ast;
+pub mod atoms;
 pub mod compiler;
 pub mod hex;
 pub mod lexer;
 pub mod matcher;
 pub mod matches;
 pub mod parser;
+pub mod prefilter;
 pub mod program;
 pub mod ruleset;
 pub mod vm;

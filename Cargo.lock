@@ -57,6 +57,7 @@ dependencies = [
  "memmap2",
  "once_cell",
  "regex",
+ "regex-syntax",
  "serde",
  "smallvec",
  "tempfile",
