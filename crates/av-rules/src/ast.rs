@@ -151,33 +151,57 @@ impl HexPattern {
     /// True when the pattern has no wildcards, jumps or alternatives, meaning
     /// it matches exactly one byte sequence. Such patterns can be turned into a
     /// plain literal and fed to the Aho-Corasick prefilter whole.
+    ///
+    /// A single-branch alternative such as `( 4D 5A )` is exact too; the
+    /// parser leaves that wrapper in place, and treating it as inexact would
+    /// needlessly push a precisely known pattern through the general matcher.
     pub fn as_exact_bytes(&self) -> Option<Vec<u8>> {
         let mut out = Vec::new();
-        for token in &self.tokens {
-            match token {
-                HexToken::Byte(b) => out.push(*b),
-                HexToken::Nibble { high: Some(h), low: Some(l) } => {
-                    out.push((h << 4) | l);
-                }
-                _ => return None,
-            }
+        if collect_fixed(&self.tokens, &mut out) {
+            Some(out)
+        } else {
+            None
         }
-        Some(out)
     }
 
     /// Number of leading bytes that are fully determined — the longest exact
     /// prefix. A long fixed prefix makes an excellent prefilter atom.
     pub fn exact_prefix(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        for token in &self.tokens {
-            match token {
-                HexToken::Byte(b) => out.push(*b),
-                HexToken::Nibble { high: Some(h), low: Some(l) } => out.push((h << 4) | l),
-                _ => break,
-            }
-        }
+        // Whether the tail was fixed is irrelevant here: whatever was collected
+        // before the walk stopped is the prefix.
+        let _ = collect_fixed(&self.tokens, &mut out);
         out
     }
+}
+
+/// Append every byte whose value is known, stopping at the first token that is
+/// not fully determined. Returns whether the entire run was fixed.
+///
+/// `as_exact_bytes` wants that boolean; `exact_prefix` discards it and keeps
+/// whatever was collected. Sharing one walk is what makes a parenthesised
+/// pattern such as `( 4D 5A )` behave exactly like `4D 5A`.
+fn collect_fixed(tokens: &[HexToken], out: &mut Vec<u8>) -> bool {
+    for token in tokens {
+        match token {
+            HexToken::Byte(b) => out.push(*b),
+            HexToken::Nibble {
+                high: Some(h),
+                low: Some(l),
+            } => out.push((h << 4) | l),
+            // `( ... )` with one branch constrains nothing extra.
+            HexToken::Alternative(branches) if branches.len() == 1 => {
+                // Propagating the failure matters: if the branch ran into a
+                // wildcard, the prefix ends inside it and the caller must not
+                // keep appending the bytes that follow the parentheses.
+                if !collect_fixed(&branches[0], out) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// One element inside a hex pattern.
@@ -287,8 +311,15 @@ pub struct XorRange {
 impl XorRange {
     pub const FULL: XorRange = XorRange { min: 1, max: 255 };
 
+    /// Number of distinct keys in the range, inclusive of both ends.
     pub fn len(self) -> usize {
-        (self.max as usize).saturating_sub(self.min as usize) + 1
+        (self.max as usize).saturating_sub(self.min as usize).saturating_add(1)
+    }
+
+    /// Always false: a range is empty only if `max < min`, and the parser
+    /// rejects that. Present so `len()` has its conventional companion.
+    pub fn is_empty(self) -> bool {
+        self.max < self.min
     }
 }
 
@@ -610,6 +641,36 @@ mod tests {
                 HexToken::Byte(0x90),
             ],
         };
+        assert_eq!(p.exact_prefix(), vec![0x4D, 0x5A]);
+    }
+
+    #[test]
+    fn exact_prefix_stops_inside_a_parenthesised_branch() {
+        // Regression: the walk must not resume after the closing parenthesis.
+        // `4D ( 5A ?? ) 90` has prefix `4D 5A`, not `4D 5A 90`.
+        let p = HexPattern {
+            tokens: vec![
+                HexToken::Byte(0x4D),
+                HexToken::Alternative(vec![vec![
+                    HexToken::Byte(0x5A),
+                    HexToken::Nibble { high: None, low: None },
+                ]]),
+                HexToken::Byte(0x90),
+            ],
+        };
+        assert_eq!(p.exact_prefix(), vec![0x4D, 0x5A]);
+        assert_eq!(p.as_exact_bytes(), None);
+    }
+
+    #[test]
+    fn a_single_branch_alternative_is_transparent_to_exactness() {
+        let p = HexPattern {
+            tokens: vec![HexToken::Alternative(vec![vec![
+                HexToken::Byte(0x4D),
+                HexToken::Byte(0x5A),
+            ]])],
+        };
+        assert_eq!(p.as_exact_bytes(), Some(vec![0x4D, 0x5A]));
         assert_eq!(p.exact_prefix(), vec![0x4D, 0x5A]);
     }
 

@@ -47,7 +47,12 @@
 //! automaton, and one pass over the buffer tells us which handful of rules
 //! could possibly match. Only those rules reach the virtual machine.
 
+// Tests opt out of the panic-family lints: unwrapping is how an assertion is
+// written, and a panic in a test is the desired outcome, not a defect.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod ast;
+pub mod hex;
 pub mod lexer;
 
 pub use ast::{

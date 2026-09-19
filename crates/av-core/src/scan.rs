@@ -238,13 +238,19 @@ pub struct ScanStats {
 }
 
 impl ScanStats {
+    /// Fold another worker's totals into this one.
+    ///
+    /// Saturating rather than wrapping: a counter that has reached `u64::MAX`
+    /// is already nonsense, and wrapping it to a small number would make a
+    /// finished scan report a plausible-looking wrong total. Saturating leaves
+    /// it obviously absurd instead.
     pub fn merge(&mut self, other: &ScanStats) {
-        self.files_scanned += other.files_scanned;
-        self.files_skipped += other.files_skipped;
-        self.bytes_scanned += other.bytes_scanned;
-        self.threats_found += other.threats_found;
-        self.errors += other.errors;
-        self.cache_hits += other.cache_hits;
+        self.files_scanned = self.files_scanned.saturating_add(other.files_scanned);
+        self.files_skipped = self.files_skipped.saturating_add(other.files_skipped);
+        self.bytes_scanned = self.bytes_scanned.saturating_add(other.bytes_scanned);
+        self.threats_found = self.threats_found.saturating_add(other.threats_found);
+        self.errors = self.errors.saturating_add(other.errors);
+        self.cache_hits = self.cache_hits.saturating_add(other.cache_hits);
     }
 }
 

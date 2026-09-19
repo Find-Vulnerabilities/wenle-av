@@ -93,14 +93,25 @@ unsafe_op_in_unsafe_fn = "deny"
 unused_must_use = "deny"
 
 [workspace.lints.clippy]
-# Arithmetic on file-derived offsets must not wrap silently.
-arithmetic_side_effects = "warn"
-# A scanner that panics on a malformed file is a denial of service.
+# A scanner that panics on a malformed file is a denial of service. Both of
+# these are warnings, not errors, and each crate relaxes them under `cfg(test)`
+# where unwrapping is the correct way to write an assertion.
 unwrap_used = "warn"
 expect_used = "warn"
-panic = "warn"
 # Catch `len() == 0`, `x == false`, and similar.
 bool_comparison = "warn"
 # Iterating a map in hash order makes scan output non-deterministic.
 iter_over_hash_type = "warn"
+#
+# Deliberately *not* enabled:
+#
+# * `arithmetic_side_effects` — a restriction lint that flags every `i += 1` in
+#   a loop counter or a lexer's line tally. Overflow there is impossible in
+#   practice and the lint drowns out real findings. The places where wrapping
+#   would be a security bug (verdict scores, byte offsets into an untrusted
+#   buffer) use saturating or checked arithmetic explicitly, which documents the
+#   intent far better than a blanket lint.
+# * `panic` — fires on every `assert!` and `panic!` in test and test-helper
+#   code. A panic in a test *is* the desired behaviour, so the lint can only be
+#   made useful by relaxing it everywhere it would fire.
 

@@ -158,6 +158,6 @@ mod tests {
     #[test]
     fn sharing_violation_is_transient() {
         assert!(AvError::win32_code("CreateFileW", 0x20).is_transient());
-        assert!(AvError::win32_code("CreateFileW", 0x02).is_transient() == false);
+        assert!(!AvError::win32_code("CreateFileW", 0x02).is_transient());
     }
 }

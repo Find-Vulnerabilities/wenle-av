@@ -422,11 +422,12 @@ impl Default for LoggingConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
     Error,
     Warn,
+    #[default]
     Info,
     Debug,
     Trace,
@@ -441,12 +442,6 @@ impl LogLevel {
             LogLevel::Debug => "debug",
             LogLevel::Trace => "trace",
         }
-    }
-}
-
-impl Default for LogLevel {
-    fn default() -> Self {
-        LogLevel::Info
     }
 }
 
@@ -480,18 +475,13 @@ impl Default for UiConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Theme {
+    #[default]
     System,
     Dark,
     Light,
-}
-
-impl Default for Theme {
-    fn default() -> Self {
-        Theme::System
-    }
 }
 
 #[cfg(test)]

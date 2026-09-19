@@ -189,7 +189,8 @@ impl MatchLocation {
 /// Render matched bytes for human display without leaking control characters
 /// into a log file or a GUI label.
 pub fn render_preview(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len().min(MatchLocation::MAX_PREVIEW) + 3);
+    let mut out =
+        String::with_capacity(bytes.len().min(MatchLocation::MAX_PREVIEW).saturating_add(3));
     for &b in bytes.iter().take(MatchLocation::MAX_PREVIEW) {
         match b {
             0x20..=0x7E => out.push(b as char),
@@ -383,7 +384,12 @@ impl Assessment {
         if self.detections.iter().any(|d| d.decisive) {
             return;
         }
-        let adjusted = (self.score as i32 + adjustment).clamp(0, Self::MAX_SCORE as i32);
+        // Saturating: `adjustment` comes from a trust provider, and a value
+        // near `i32::MIN` must clamp to zero rather than wrap into a huge
+        // positive score.
+        let adjusted = (self.score as i32)
+            .saturating_add(adjustment)
+            .clamp(0, Self::MAX_SCORE as i32);
         self.score = adjusted as u16;
     }
 

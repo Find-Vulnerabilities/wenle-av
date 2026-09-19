@@ -163,6 +163,7 @@ impl fmt::Display for LexError {
 impl std::error::Error for LexError {}
 
 /// Streaming tokeniser over a rule source.
+#[derive(Debug)]
 pub struct Lexer<'a> {
     src: &'a [u8],
     pos: usize,
@@ -299,11 +300,11 @@ impl<'a> Lexer<'a> {
 
         match b {
             b'"' => self.lex_string(start),
-            b'$' | b'#' | b'@' => self.lex_string_ref(start),
+            b'$' | b'#' | b'@' => self.lex_string_ref(start, b),
             // `!` is ambiguous: `!a` is the length of string `a`, but `!=` is
             // the inequality operator. Only the former is a string reference.
             b'!' if matches!(self.peek_at(1), Some(c) if c.is_ascii_alphanumeric() || c == b'_') => {
-                self.lex_string_ref(start)
+                self.lex_string_ref(start, b)
             }
             // `{` opens the rule body, but a `{` directly after `=` opens a
             // hex pattern. The same one-token lookback that disambiguates `/`
@@ -311,7 +312,7 @@ impl<'a> Lexer<'a> {
             // condition (comparison is `==`), so the two uses cannot collide.
             b'{' if self.after_assign => self.lex_hex_block(start),
             b'/' if self.after_assign => self.lex_regex(start),
-            _ => self.lex_operator(start),
+            _ => self.lex_operator(start, b),
         }
     }
 
@@ -469,8 +470,11 @@ impl<'a> Lexer<'a> {
     ///
     /// `$` on its own is legal and means "the current string" inside a
     /// `for ... of` body.
-    fn lex_string_ref(&mut self, start: usize) -> Result<Token, LexError> {
-        let sigil = self.bump().expect("caller verified a byte is present");
+    fn lex_string_ref(&mut self, start: usize, sigil: u8) -> Result<Token, LexError> {
+        // `next_token` already peeked the sigil and passed it in, so consume it
+        // here. Not a `\n`, so the line counter is untouched.
+        debug_assert_eq!(self.peek(), Some(sigil));
+        self.pos += 1;
         let name_start = self.pos;
         while let Some(b) = self.peek() {
             if b.is_ascii_alphanumeric() || b == b'_' || b == b'*' {
@@ -575,8 +579,11 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn lex_operator(&mut self, start: usize) -> Result<Token, LexError> {
-        let b = self.bump().expect("caller verified a byte is present");
+    fn lex_operator(&mut self, start: usize, b: u8) -> Result<Token, LexError> {
+        // Passed in by `next_token`, which already peeked it. No operator
+        // contains a `\n`, so advancing by one is equivalent to `bump`.
+        debug_assert_eq!(self.peek(), Some(b));
+        self.pos += 1;
         let kind = match b {
             b'{' => TokenKind::LBrace,
             b'(' => TokenKind::LParen,

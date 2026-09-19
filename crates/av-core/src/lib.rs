@@ -17,7 +17,9 @@
 //! can never override a decisive detection. This is what keeps the
 //! false-positive rate low without blinding the engine to real threats.
 
-// Lint policy is defined once in the workspace manifest.
+// Lint policy is defined once in the workspace manifest. Tests opt out of the
+// panic-family lints, where unwrapping is how an assertion is written.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod config;
 pub mod error;
