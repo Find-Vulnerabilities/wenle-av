@@ -1,0 +1,12 @@
+# Let git decide what is text and what is binary, so a clone on one platform
+# does not show the whole tree as modified on another.
+* text=auto
+
+# The rule packages are large text files whose content is what the rule
+# database is built from. Never let a line-ending conversion touch them.
+*.yar text eol=lf
+
+# Windows scripts are read by Windows tooling.
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
