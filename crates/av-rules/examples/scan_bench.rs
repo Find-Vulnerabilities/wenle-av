@@ -17,24 +17,29 @@
 //!
 //! # What to look at
 //!
-//! Three filters, in the order a file meets them, each reported so the next one
+//! Four filters, in the order a file meets them, each reported so the next one
 //! has something to be measured against:
 //!
 //! - **candidates** — the prefilter's selectivity, as a fraction of the rule
 //!   set. This is the filter that matters most, because a rule that survives
 //!   here reaches the interpreter.
-//! - **strings refuted** against **strings searched** — the per-string
-//!   handover. On a clean file the refuted count should dwarf the searched one.
-//! - **strings located** against **strings searched** — of the strings that do
-//!   have to be searched for, how many the prefilter's atom offsets placed
-//!   without a pass over the buffer. This is the memory-bandwidth saving, and
-//!   it applies only when every occurrence of the string's atom was kept, so a
-//!   low number here is the honest answer about how much the shortcut buys on
-//!   this file.
+//! - **strings refuted** against **strings searched and swept** — the per-string
+//!   handover. On a clean file the refuted count should dwarf the rest.
+//! - **strings swept** against **strings searched** — of the strings that were
+//!   not refuted, how many the literal sweep answered from the one pass it makes
+//!   over the buffer before any rule is looked at. Each of those is a search the
+//!   scan did not run, which is the whole of what the sweep is for: without it
+//!   the cost of a scan is `strings × file size`, and with it the per-string
+//!   term is gone for every literal in the rule set.
+//! - **strings located** against **strings searched** — of the strings still
+//!   searched for, how many the prefilter's atom offsets placed without a pass
+//!   over the buffer. This applies only when every occurrence of the string's
+//!   atom was kept, and only to a string with one form, so a low number here is
+//!   the honest answer about how much the shortcut buys on this file.
 //!
-//! Each scan also reports its split between the prefilter and everything after
-//! it. The two have different fixes and the aggregate timing cannot tell them
-//! apart, so optimizing without the split is guessing.
+//! Each scan also reports its split between the prefilter, the sweep, and
+//! everything after them. They have different fixes and the aggregate timing
+//! cannot tell them apart, so optimizing without the split is guessing.
 //!
 //! `matcher failures` is not a performance number. It counts strings the
 //! matcher gave up on before finishing its search, which is a correctness
@@ -118,8 +123,11 @@ fn run() -> ExitCode {
     );
     println!(
         "{:>7} private, {} global, {} decisive, {} carry hashes ({} hashes)",
-        stats.private_rules, stats.global_rules, stats.decisive_rules,
-        stats.rules_with_hashes, stats.hashes
+        stats.private_rules,
+        stats.global_rules,
+        stats.decisive_rules,
+        stats.rules_with_hashes,
+        stats.hashes
     );
     let prefilter = database.prefilter().stats();
     println!(
@@ -178,15 +186,11 @@ fn run() -> ExitCode {
         })
         .collect();
 
-    for (name, buffer) in [
-        ("zeros", &zeros),
-        ("text", &text),
-        ("random", &random),
-    ] {
-        let (best, prefilter, outcome) = time_scan(&mut scanner, &database, buffer);
-        report_scan(name, buffer.len(), best, prefilter, &outcome, database.len());
-        if outcome.detected() {
-            print_detections(&outcome, &database);
+    for (name, buffer) in [("zeros", &zeros), ("text", &text), ("random", &random)] {
+        let timing = time_scan(&mut scanner, &database, buffer);
+        report_scan(name, buffer.len(), &timing, database.len());
+        if timing.outcome.detected() {
+            print_detections(&timing.outcome, &database);
         }
     }
 
@@ -220,14 +224,14 @@ fn run() -> ExitCode {
             println!("  {:<40} unreadable, skipped", short(file));
             continue;
         };
-        let (best, prefilter, outcome) = time_scan(&mut scanner, &database, &data);
-        report_scan(&short(file), data.len(), best, prefilter, &outcome, database.len());
-        if outcome.detected() {
-            print_detections(&outcome, &database);
+        let timing = time_scan(&mut scanner, &database, &data);
+        report_scan(&short(file), data.len(), &timing, database.len());
+        if timing.outcome.detected() {
+            print_detections(&timing.outcome, &database);
             detections += 1;
         }
         total_bytes += data.len();
-        total_time += best;
+        total_time += timing.scan;
     }
 
     if total_time > Duration::ZERO {
@@ -246,28 +250,56 @@ fn run() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// What one scan cost, and what it did.
+struct Timing {
+    /// Best of three, to leave out the first pass's page faults.
+    scan: Duration,
+    /// The prefilter's own pass, measured by calling it the way the scanner
+    /// does. Without this split the timings say the scan is dominated by "string
+    /// searches", which is a guess: the automaton visits every atom match in the
+    /// buffer, and on a large binary that is millions of them. Which part is the
+    /// cost decides what to optimize next, so it is measured rather than reasoned
+    /// about.
+    prefilter: Duration,
+    /// The literal sweep's own pass, measured the same way. It runs inside
+    /// `scan`, so it is a part of `scan` rather than something beside it.
+    sweep: Duration,
+    /// Row entries the sweep recorded, before deduplication — one per string per
+    /// occurrence. The half of the sweep's cost that is not the pass itself, and
+    /// the number that says whether a short literal common in real files is
+    /// making the pass expensive.
+    swept_hits: usize,
+    outcome: av_rules::scanner::ScanOutcome,
+}
+
 /// The best of several runs, to leave out the first pass's page faults.
-fn time_scan(
-    scanner: &mut Scanner<'_>,
-    database: &RuleDatabase,
-    data: &[u8],
-) -> (Duration, Duration, av_rules::scanner::ScanOutcome) {
-    // The prefilter's own cost, measured by calling it the way the scanner
-    // does. Without this split the timings say the scan is dominated by "string
-    // searches", which is a guess: the automaton visits every atom match in the
-    // buffer, and on a large binary that is millions of them. Which of the two
-    // is the cost decides what to optimize next, so it is measured rather than
-    // reasoned about.
+fn time_scan(scanner: &mut Scanner<'_>, database: &RuleDatabase, data: &[u8]) -> Timing {
     let prefilter = {
         let mut scratch = database.prefilter().scratch();
         let mut out = Vec::new();
         let mut best = Duration::MAX;
         for _ in 0..3 {
             let started = Instant::now();
-            database.prefilter().candidates(data, &mut scratch, &mut out);
+            database
+                .prefilter()
+                .candidates(data, &mut scratch, &mut out);
             best = best.min(started.elapsed());
         }
         best
+    };
+
+    let (sweep, swept_hits) = {
+        // The hit table is made once and reused, as the scanner reuses its own,
+        // so what is measured is the pass and the rows it writes rather than the
+        // allocation of a table sized for every string in the rule set.
+        let mut hits = database.sweep().hits();
+        let mut best = Duration::MAX;
+        for _ in 0..3 {
+            let started = Instant::now();
+            database.sweep().run(data, &mut hits);
+            best = best.min(started.elapsed());
+        }
+        (best, hits.found())
     };
 
     let mut best = Duration::MAX;
@@ -278,25 +310,32 @@ fn time_scan(
         best = best.min(started.elapsed());
         last = Some(outcome);
     }
-    (best, prefilter, last.expect("at least one run"))
+    Timing {
+        scan: best,
+        prefilter,
+        sweep,
+        swept_hits,
+        outcome: last.expect("at least one run"),
+    }
 }
 
-fn report_scan(
-    name: &str,
-    len: usize,
-    elapsed: Duration,
-    prefilter: Duration,
-    outcome: &av_rules::scanner::ScanOutcome,
-    rules: usize,
-) {
+fn report_scan(name: &str, len: usize, timing: &Timing, rules: usize) {
+    let Timing {
+        scan: elapsed,
+        prefilter,
+        sweep,
+        swept_hits,
+        outcome,
+    } = timing;
+    let (elapsed, prefilter, sweep) = (*elapsed, *prefilter, *sweep);
     let throughput = len as f64 / elapsed.as_secs_f64() / 1e6;
+    println!("\n  {name}  ({len} bytes, {throughput:.0} MB/s, {elapsed:?})",);
     println!(
-        "\n  {name}  ({len} bytes, {throughput:.0} MB/s, {elapsed:?})",
-    );
-    println!(
-        "    {prefilter:?} in the prefilter ({:.0}%), {:?} after it",
+        "    {prefilter:?} in the prefilter ({:.0}%), {sweep:?} in the sweep ({:.0}%), \
+         {:?} after them",
         percent_f(prefilter, elapsed),
-        elapsed.saturating_sub(prefilter)
+        percent_f(sweep, elapsed),
+        elapsed.saturating_sub(prefilter + sweep)
     );
     println!(
         "    {:>6} candidates ({:.2}% of the rule set), {} evaluated, {} matched",
@@ -305,15 +344,22 @@ fn report_scan(
         outcome.evaluated,
         outcome.matches.len()
     );
-    let strings = outcome.strings_searched + outcome.strings_refuted;
+    // The three ways a string can be settled without a search, plus the search,
+    // so the column adds up to what a rule actually asked for.
+    let strings = outcome.strings_searched + outcome.strings_refuted + outcome.strings_swept;
     println!(
-        "    {:>6} strings searched, {} refuted by atoms ({:.0}% avoided)",
+        "    {:>6} strings searched, {} refuted by atoms, {} swept ({:.0}% avoided)",
         outcome.strings_searched,
         outcome.strings_refuted,
-        percent(outcome.strings_refuted, strings)
+        outcome.strings_swept,
+        percent(outcome.strings_refuted + outcome.strings_swept, strings)
     );
     println!(
-        "    {:>6} of those located by a unique atom ({:.0}%), {} searched the long way",
+        "    {:>6} sweep hits recorded before dedup, from one pass over the whole buffer",
+        swept_hits
+    );
+    println!(
+        "    {:>6} of those searched located by a unique atom ({:.0}%), {} searched the long way",
         outcome.strings_localized,
         percent(outcome.strings_localized, outcome.strings_searched),
         outcome.strings_searched - outcome.strings_localized
@@ -331,7 +377,10 @@ fn report_scan(
         );
     }
     if outcome.vm_failures > 0 {
-        println!("    WARNING: {} rules could not be evaluated", outcome.vm_failures);
+        println!(
+            "    WARNING: {} rules could not be evaluated",
+            outcome.vm_failures
+        );
     }
 }
 

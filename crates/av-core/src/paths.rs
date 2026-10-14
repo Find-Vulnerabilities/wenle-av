@@ -14,6 +14,14 @@ use crate::error::{AvError, AvResult};
 /// Directory name used under `%ProgramData%` and as the install folder name.
 pub const PRODUCT_DIR: &str = "WenleAV";
 
+/// Directory name holding rule sources, under either root.
+///
+/// One name for both roots on purpose: the rule compiler reads the *installed*
+/// tree under the data root, and falls back to the tree that shipped beside the
+/// executable, and the two are only interchangeable while they are spelled the
+/// same. See [`AvPaths::shipped_rules_dir`].
+const RULES_DIR: &str = "rules";
+
 /// Resolved filesystem layout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvPaths {
@@ -50,7 +58,7 @@ impl AvPaths {
             config_file: data_dir.join("config.toml"),
             quarantine_dir: data_dir.join("quarantine"),
             log_dir: data_dir.join("logs"),
-            rules_dir: data_dir.join("rules"),
+            rules_dir: data_dir.join(RULES_DIR),
             cache_dir: data_dir.join("cache"),
             db_dir: data_dir.join("db"),
             install_dir,
@@ -66,6 +74,22 @@ impl AvPaths {
             .parent()
             .ok_or_else(|| AvError::Other("executable path has no parent directory".into()))?;
         Ok(Self::new(dir))
+    }
+
+    /// Where the rule sources that ship *beside the executable* live.
+    ///
+    /// Not [`Self::rules_dir`], which is the installed tree under the data root
+    /// and is where a user's own rules go. This one is what a release carries:
+    /// the product has no installer, so a release is unpacked and this tree is
+    /// never copied into the data root. It exists as a method rather than as a
+    /// `join("rules")` at the call site so that the two spellings cannot drift
+    /// apart, and so that the one place that has to know both is here.
+    ///
+    /// The two are the same directory in a portable layout, where the data root
+    /// *is* the install directory — which is why callers compare rather than
+    /// assume they differ.
+    pub fn shipped_rules_dir(&self) -> PathBuf {
+        self.install_dir.join(RULES_DIR)
     }
 
     /// Every directory that must exist for the product to run.
@@ -126,6 +150,47 @@ pub fn default_data_dir() -> PathBuf {
         .join(PRODUCT_DIR)
 }
 
+/// The cargo workspace root a directory sits in, when it sits in one.
+///
+/// Returns the directory that holds the `Cargo.toml`, so a caller's refusal can
+/// name it rather than making the reader work out where the tree starts.
+///
+/// # Why this is a question about two names and not about one
+///
+/// The `Cargo.toml` test is what keeps this from being a guess about the name of
+/// a directory: a directory called `target` is a build tree only when the
+/// directory above it is a cargo workspace. An installation that happens to live
+/// under `D:\target\` is therefore not refused, which matters because the whole
+/// point of the check is to be narrow enough that its refusal can be believed.
+///
+/// # Why it lives here rather than at either caller
+///
+/// Two callers ask it about the same directory for the same reason — a build
+/// tree is the one layout where writing an installation's permissions, or arming
+/// a kernel gate over the installation's files, locks the account doing the
+/// building out of the directory cargo writes into. `av-cli`'s
+/// `wenle protect apply` asks before it writes a DACL; `av-service` asks before
+/// it asks the driver to refuse writes there. The answer must be the same
+/// answer, so it is one function in the crate both can depend on. It was in
+/// `av-cli/src/commands/protect.rs` until `av-service` needed it.
+pub fn cargo_build_tree(install_dir: &Path) -> Option<PathBuf> {
+    let mut dir = Some(install_dir);
+    while let Some(current) = dir {
+        let named_target = current
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("target"));
+        if named_target {
+            if let Some(parent) = current.parent() {
+                if parent.join("Cargo.toml").is_file() {
+                    return Some(parent.to_path_buf());
+                }
+            }
+        }
+        dir = current.parent();
+    }
+    None
+}
+
 /// Lowercase and strip the Windows extended-length prefix so two spellings of
 /// the same path compare equal. Windows paths are case-insensitive.
 fn normalize_for_compare(path: &Path) -> String {
@@ -140,8 +205,14 @@ mod tests {
     #[test]
     fn with_data_dir_derives_every_subdirectory() {
         let p = AvPaths::with_data_dir(r"C:\Program Files\WenleAV", r"C:\ProgramData\WenleAV");
-        assert_eq!(p.config_file, PathBuf::from(r"C:\ProgramData\WenleAV\config.toml"));
-        assert_eq!(p.quarantine_dir, PathBuf::from(r"C:\ProgramData\WenleAV\quarantine"));
+        assert_eq!(
+            p.config_file,
+            PathBuf::from(r"C:\ProgramData\WenleAV\config.toml")
+        );
+        assert_eq!(
+            p.quarantine_dir,
+            PathBuf::from(r"C:\ProgramData\WenleAV\quarantine")
+        );
         assert_eq!(p.log_dir, PathBuf::from(r"C:\ProgramData\WenleAV\logs"));
     }
 

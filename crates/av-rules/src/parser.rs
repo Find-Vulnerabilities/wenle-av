@@ -39,8 +39,8 @@ use std::fmt;
 use av_core::{Platform, Severity, ThreatCategory};
 
 use crate::ast::{
-    ArithOp, BitOp, CmpOp, Expr, MemberPath, MetaValue, Modifiers, PathSegment, Quantifier, Rule,
-    RuleMeta, Span, StringDef, StringOp, StringSet, StringValue, XorRange, Base64Alphabet,
+    ArithOp, Base64Alphabet, BitOp, CmpOp, Expr, MemberPath, MetaValue, Modifiers, PathSegment,
+    Quantifier, Rule, RuleMeta, Span, StringDef, StringOp, StringSet, StringValue, XorRange,
 };
 use crate::hex;
 use crate::lexer::{LexError, Lexer, Token, TokenKind};
@@ -133,7 +133,7 @@ const EOF_TOKEN: Token = Token {
 };
 
 /// A binary operator, with the affinity it was parsed at.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BinOp {
     Or,
     And,
@@ -157,15 +157,25 @@ enum BinOp {
 /// control. Descending one nesting level costs several frames — `parse_binary`,
 /// `parse_operand`, `parse_unary`, `parse_postfix`, `parse_primary` and back
 /// into `parse_binary` — and an unoptimised build makes each of those frames
-/// large, so a bound that merely feels generous is not a bound at all. At 128 a
-/// pathological input needs well under a megabyte, which fits the smallest
-/// stack this is likely to run on.
+/// large, so a bound that merely feels generous is not a bound at all.
+///
+/// Measured on a debug build against a one-megabyte stack, with parentheses
+/// because they are the construct that descends: 60 parentheses — 120 levels,
+/// since a parenthesis costs two — parse, and 64 are refused by this bound.
+/// So a level costs at most about eight kilobytes, 127 levels is what a
+/// megabyte carries, and the bound this replaced — 128 — sat exactly on that
+/// edge rather than inside it. 64 puts the deepest legal input at half the
+/// stack.
 ///
 /// Real rules are nowhere near it: the deepest construct in a 10,764-rule
-/// third-party set nests a handful of levels, and 128 still leaves room for
-/// tens of levels of nesting. Note that a long `or` chain produces a deep
-/// *tree* while parsing iteratively, so [`MAX_NODES`] covers that shape.
-const MAX_DEPTH: u32 = 128;
+/// third-party set nests a handful of levels, and 64 still leaves room for
+/// thirty-odd parentheses.
+///
+/// A long `or` chain is a *separate* hazard and this bound does not cover it: it
+/// is parsed by a loop, so it costs the parser no stack at all while producing a
+/// tree as deep as it is long. [`fold_chain`] answers that one, and
+/// [`MAX_NODES`] bounds how large the tree may get.
+const MAX_DEPTH: u32 = 64;
 
 /// Largest expression a single condition may build.
 ///
@@ -173,11 +183,15 @@ const MAX_DEPTH: u32 = 128;
 /// it returns is: `a or b or c or ...` is parsed by a loop, so a million-term
 /// chain costs the parser constant stack and produces a million-deep tree.
 ///
-/// The saving grace is that a tree's depth can never exceed its node count, so
-/// bounding the nodes bounds the depth as well — and depth is what has to be
-/// bounded, because dropping the tree recurses just as hard as building it did.
-/// Refusing a condition at 4,096 nodes keeps every later traversal, `Drop`
-/// included, inside about a megabyte even in an unoptimised build.
+/// This bounds the tree's *size*, which is what the traversal cost of a rule
+/// scales with and what keeps a hostile rule set from being held in memory
+/// without limit. It is not a depth bound and must not be read as one: a
+/// 4,096-node tree can be one node wide and 4,096 deep, and a spine that deep
+/// is more stack than any of the walks over it can afford — a 73-term left
+/// fold is enough to overflow a one-megabyte stack in a debug build. Depth is
+/// bounded by construction instead: [`fold_chain`] balances every chain whose
+/// value does not depend on its bracketing, and the compiler refuses what
+/// remains past its own, lower, [`crate::compiler`] bound.
 ///
 /// The largest conditions in a 10,764-rule third-party set are a few hundred
 /// nodes — long `or` chains of resource names — so this leaves an order of
@@ -396,7 +410,10 @@ impl Parser {
             }
         }
 
-        self.expect_token(|k| matches!(k, TokenKind::LBrace), "`{` to open the rule body")?;
+        self.expect_token(
+            |k| matches!(k, TokenKind::LBrace),
+            "`{` to open the rule body",
+        )?;
 
         let mut meta = RuleMeta::default();
         if self.check_word("meta") {
@@ -448,10 +465,7 @@ impl Parser {
     fn parse_meta(&mut self, meta: &mut RuleMeta) -> Result<(), ParseError> {
         while !self.at_section_end() {
             let key = self.expect_identifier("a meta key")?;
-            self.expect_token(
-                |k| matches!(k, TokenKind::Assign),
-                "`=` after the meta key",
-            )?;
+            self.expect_token(|k| matches!(k, TokenKind::Assign), "`=` after the meta key")?;
 
             // `quality = -107`. Machine-scored rule sets use a signed meta
             // value as a score adjustment, so a leading `-` is a value and not
@@ -639,7 +653,10 @@ impl Parser {
         } else {
             min
         };
-        self.expect_token(|k| matches!(k, TokenKind::RParen), "`)` after the xor range")?;
+        self.expect_token(
+            |k| matches!(k, TokenKind::RParen),
+            "`)` after the xor range",
+        )?;
         if min > max {
             return Err(self.error_here(format!("xor range 0x{min:02X}-0x{max:02X} is inverted")));
         }
@@ -652,9 +669,8 @@ impl Parser {
             TokenKind::Integer(v) => {
                 let v = *v;
                 self.advance();
-                u8::try_from(v).map_err(|_| {
-                    self.error_at(&tok, format!("{v} does not fit in a single byte"))
-                })
+                u8::try_from(v)
+                    .map_err(|_| self.error_at(&tok, format!("{v} does not fit in a single byte")))
             }
             _ => Err(self.error_at(&tok, "expected a byte value such as `1` or `0xFF`")),
         }
@@ -702,11 +718,34 @@ impl Parser {
             if prec < min_prec {
                 break;
             }
-            self.note_node()?;
-            self.advance();
-            // Left-associative: the right operand must bind strictly tighter.
-            let rhs = self.parse_binary(prec.saturating_add(1))?;
-            lhs = apply_binary(op, lhs, rhs);
+            // Gather one run of a single repeated operator, then fold it whole.
+            //
+            // Folding term by term — `lhs = apply_binary(op, lhs, rhs)` — builds
+            // a left-nested spine as long as the chain, and every walk over the
+            // tree afterwards descends once per term. Real rules do write chains
+            // of hundreds of terms: `or` over a list of resource names or
+            // imphashes is the largest condition shape in the set this is
+            // validated against, and one of them is what found this. See
+            // [`fold_chain`] for what the fold does about it; the run is
+            // gathered here because only this loop can see which operators are
+            // adjacent.
+            let first = lhs;
+            let mut rest = Vec::new();
+            loop {
+                self.note_node()?;
+                self.advance();
+                // Left-associative: the right operand must bind strictly
+                // tighter, so it can never take a term of this run with it.
+                rest.push(self.parse_binary(prec.saturating_add(1))?);
+                match self.peek_binary_op() {
+                    // A different operator at the same precedence ends the run.
+                    // `a + b - c` is deliberately not one chain of one operator,
+                    // and folding it as though it were would change its value.
+                    Some((next_prec, next_op)) if next_prec == prec && next_op == op => {}
+                    _ => break,
+                }
+            }
+            lhs = fold_chain(op, first, rest);
         }
         Ok(lhs)
     }
@@ -851,7 +890,8 @@ impl Parser {
                 // `50% of them` must be recognised before `%` is read as the
                 // modulo operator. Requiring `of` right after the `%` is what
                 // keeps `filesize % 2` working.
-                if self.check(|k| matches!(k, TokenKind::Percent)) && self.peek_at(1).is_word("of") {
+                if self.check(|k| matches!(k, TokenKind::Percent)) && self.peek_at(1).is_word("of")
+                {
                     self.advance(); // `%`
                     self.advance(); // `of`
                     let percent = u8::try_from(v).unwrap_or(0).min(100);
@@ -870,9 +910,12 @@ impl Parser {
                 Ok(Expr::Bool(b))
             }
             TokenKind::Literal(bytes) => {
-                let text = String::from_utf8_lossy(bytes).into_owned();
+                // Cloned rather than converted: the lexer's `Vec<u8>` is the
+                // literal, escapes already applied, and every conversion from
+                // here would be a lossy one. See [`Expr::Str`].
+                let bytes = bytes.clone();
                 self.advance();
-                Ok(Expr::Str(text))
+                Ok(Expr::Str(bytes))
             }
             TokenKind::StringRef(name) => {
                 let name = name.clone();
@@ -1011,7 +1054,10 @@ impl Parser {
             if self.eat_kind(|k| matches!(k, TokenKind::Comma)) {
                 continue;
             }
-            self.expect_token(|k| matches!(k, TokenKind::RParen), "`)` closing the arguments")?;
+            self.expect_token(
+                |k| matches!(k, TokenKind::RParen),
+                "`)` closing the arguments",
+            )?;
             break;
         }
         Ok(args)
@@ -1045,7 +1091,10 @@ impl Parser {
         if self.eat_word("them").is_some() {
             return Ok(StringSet::All);
         }
-        self.expect_token(|k| matches!(k, TokenKind::LParen), "`them` or `(` after `of`")?;
+        self.expect_token(
+            |k| matches!(k, TokenKind::LParen),
+            "`them` or `(` after `of`",
+        )?;
         if self.check(|k| matches!(k, TokenKind::RParen)) {
             return Err(self.error_here("an `of` set must name at least one string"));
         }
@@ -1087,14 +1136,14 @@ impl Parser {
     /// `for any of ($a*) : ( $ )`, `for all i in (0..n) : ( ... )`, and
     /// `for any s in pe.sections : ( ... )`.
     fn parse_for(&mut self) -> Result<Expr, ParseError> {
-        let Some(quantifier) = self.peek_for_quantifier() else {
-            return Err(self.error_here("expected `any`, `all`, `none` or a count after `for`"));
-        };
-        self.advance();
+        let quantifier = self.parse_for_quantifier()?;
 
         if self.eat_word("of").is_some() {
             let set = self.parse_string_set()?;
-            self.expect_token(|k| matches!(k, TokenKind::Colon), "`:` before the loop body")?;
+            self.expect_token(
+                |k| matches!(k, TokenKind::Colon),
+                "`:` before the loop body",
+            )?;
             let body = self.parse_loop_body()?;
             return Ok(Expr::ForOf {
                 quantifier,
@@ -1115,8 +1164,14 @@ impl Parser {
             let first = self.parse_expr()?;
             if self.eat_kind(|k| matches!(k, TokenKind::DotDot)) {
                 let to = self.parse_expr()?;
-                self.expect_token(|k| matches!(k, TokenKind::RParen), "`)` closing the loop range")?;
-                self.expect_token(|k| matches!(k, TokenKind::Colon), "`:` before the loop body")?;
+                self.expect_token(
+                    |k| matches!(k, TokenKind::RParen),
+                    "`)` closing the loop range",
+                )?;
+                self.expect_token(
+                    |k| matches!(k, TokenKind::Colon),
+                    "`:` before the loop body",
+                )?;
                 let body = self.parse_loop_body()?;
                 return Ok(Expr::ForIn {
                     quantifier,
@@ -1144,7 +1199,10 @@ impl Parser {
         var: String,
         iterable: Expr,
     ) -> Result<Expr, ParseError> {
-        self.expect_token(|k| matches!(k, TokenKind::Colon), "`:` before the loop body")?;
+        self.expect_token(
+            |k| matches!(k, TokenKind::Colon),
+            "`:` before the loop body",
+        )?;
         let body = self.parse_loop_body()?;
         Ok(Expr::ForEach {
             quantifier,
@@ -1155,22 +1213,53 @@ impl Parser {
     }
 
     fn parse_loop_body(&mut self) -> Result<Expr, ParseError> {
-        self.expect_token(|k| matches!(k, TokenKind::LParen), "`(` opening the loop body")?;
+        self.expect_token(
+            |k| matches!(k, TokenKind::LParen),
+            "`(` opening the loop body",
+        )?;
         let body = self.parse_expr()?;
-        self.expect_token(|k| matches!(k, TokenKind::RParen), "`)` closing the loop body")?;
+        self.expect_token(
+            |k| matches!(k, TokenKind::RParen),
+            "`)` closing the loop body",
+        )?;
         Ok(body)
     }
 
-    /// The quantifier after `for`: a keyword, or a count.
+    /// The quantifier after `for`: a keyword, or a count expression.
     ///
     /// `for 12 resource in pe.resources : ( ... )` requires at least twelve of
-    /// the resources to satisfy the body. Only the keyword forms used to be
-    /// accepted, so a counted loop was a syntax error.
-    fn peek_for_quantifier(&self) -> Option<Quantifier> {
-        if let TokenKind::Integer(v) = self.peek().kind {
-            return Some(Quantifier::Count(Box::new(Expr::Int(v))));
+    /// the resources to satisfy the body. The count is read as a full
+    /// expression rather than an integer literal, because the number a loop is
+    /// counted by is usually a property of the file — `for
+    /// pe.number_of_sections i in (...)` counts sections. The AST has always
+    /// held an `Expr` here; only this spot refused to read one.
+    fn parse_for_quantifier(&mut self) -> Result<Quantifier, ParseError> {
+        if let Some(keyword) = quantifier_keyword(self.peek()) {
+            self.advance();
+            return Ok(keyword);
         }
-        quantifier_keyword(self.peek())
+
+        // `for i in (...)`: a bare name where the count belongs. Read as a
+        // count it parses as the expression `i`, and the loop variable then
+        // looks like `in` — so the error would name the wrong problem.
+        // `for in (...)`: worse, `in (...)` parses as a *call*, and the
+        // complaint becomes a missing `)` in an argument list. Both are a
+        // missing quantifier, and one token of lookahead says so.
+        //
+        // A name followed by anything else is left alone: a count really can
+        // begin with one — `for pe.number_of_sections i in (...)`.
+        let missing_quantifier = match &self.peek().kind {
+            TokenKind::Identifier(word) if word == "in" => true,
+            TokenKind::Identifier(_) => {
+                matches!(&self.peek_at(1).kind, TokenKind::Identifier(w) if w == "in")
+            }
+            _ => false,
+        };
+        if missing_quantifier {
+            return Err(self.error_here("expected `any`, `all`, `none` or a count after `for`"));
+        }
+
+        Ok(Quantifier::Count(Box::new(self.parse_expr()?)))
     }
 }
 
@@ -1187,6 +1276,88 @@ fn quantifier_keyword(tok: &Token) -> Option<Quantifier> {
         "all" => Some(Quantifier::All),
         "none" => Some(Quantifier::None),
         _ => None,
+    }
+}
+
+/// Whether a chain of `op` means the same thing however its terms are grouped.
+///
+/// Only these may be folded into a balanced tree. The rest are left-handed by
+/// definition: `100 - 30 - 20` is `50`, and grouping it the other way gives
+/// `90`. Balancing one of them would not be a performance change, it would be a
+/// different rule — and a rule that means something other than what it says is
+/// the failure this whole engine exists to avoid.
+///
+/// `and` and `or` qualify on the strength of their operands being pure. The
+/// compiler emits short-circuit jumps for them, so re-grouping changes which
+/// operand is evaluated first and never the answer. The bitwise operators
+/// qualify because integer `|`, `&` and `^` are exact: unlike `+` and `*` they
+/// cannot overflow, so no grouping can differ from another.
+///
+/// `+` and `*` are deliberately absent. As machine integers they overflow, and
+/// `(a + b) + c` can overflow where `a + (b + c)` does not — so a balanced fold
+/// could turn a rule that matches into one that errors, or the reverse.
+fn is_order_independent(op: BinOp) -> bool {
+    matches!(
+        op,
+        BinOp::Or | BinOp::And | BinOp::Bit(BitOp::Or | BitOp::And | BitOp::Xor)
+    )
+}
+
+/// Join a run of terms under one repeated operator.
+///
+/// `first` is the term the run started from and `rest` the terms after it, so
+/// the run is the concatenation of the two. Splitting them this way rather than
+/// passing a vector is what lets this return an `Expr` rather than an
+/// `Option<Expr>`: a run always has at least one term.
+///
+/// # Why the fold is pairwise
+///
+/// The obvious fold is a left spine, and for a chain of `n` terms that is a
+/// tree `n` levels deep. Depth is what costs, because every consumer of the
+/// tree — the compiler, the required-string walk, `Drop` — recurses once per
+/// level, and the frames of an unoptimised compiler are large enough that a
+/// few dozen levels is all a thread's stack carries. A rule set is data, so a
+/// chain length is not something the engine gets to assume.
+///
+/// So for an operator whose value survives re-grouping, the terms are joined
+/// two at a time, then those results two at a time, and so on until one is
+/// left. That is the same value in `ceil(log2(n))` levels: five hundred
+/// alternatives sit nine deep instead of five hundred. The odd term left over
+/// at the end of a round is carried into the next round rather than joined
+/// early, which is what keeps the tree balanced instead of lopsided.
+///
+/// An operator that does *not* survive re-grouping keeps the left spine,
+/// because there is nothing else it can do. [`MAX_DEPTH`] and the compiler's
+/// own bound are what stop those from reaching the stack.
+fn fold_chain(op: BinOp, first: Expr, rest: Vec<Expr>) -> Expr {
+    if rest.is_empty() {
+        return first;
+    }
+    if !is_order_independent(op) {
+        return rest
+            .into_iter()
+            .fold(first, |lhs, rhs| apply_binary(op, lhs, rhs));
+    }
+
+    let mut terms = rest;
+    while terms.len() > 1 {
+        let mut joined = Vec::with_capacity(terms.len().div_ceil(2));
+        let mut iter = terms.into_iter();
+        while let Some(lhs) = iter.next() {
+            match iter.next() {
+                Some(rhs) => joined.push(apply_binary(op, lhs, rhs)),
+                None => joined.push(lhs),
+            }
+        }
+        terms = joined;
+    }
+
+    // The run had at least one term after `first`, and the loop above stops at
+    // exactly one, so this always finds it. Folding nothing would leave `first`
+    // as it stands, which is what the `None` arm would correctly return.
+    match terms.into_iter().next() {
+        Some(tail) => apply_binary(op, first, tail),
+        None => first,
     }
 }
 
@@ -1267,14 +1438,43 @@ fn apply_meta(meta: &mut RuleMeta, key: &str, value: MetaValue) {
                 meta.extra.insert(key.to_string(), value);
             }
         }
+        // A comma-separated list in one string, which is how the corpus writes
+        // it: `tags = "TC_DETECTION, MALICIOUS, MALWARE, FILE"`. Split here
+        // rather than at every reader, so that `info` means the same thing
+        // whether it was written as a tag or on the `rule` line.
+        "tags" | "tag" => {
+            for tag in text(&value).split(',') {
+                let tag = tag.trim();
+                if !tag.is_empty() {
+                    meta.tags.push(tag.to_ascii_lowercase());
+                }
+            }
+        }
         "family" => set_once(&mut meta.family, text(&value)),
         "variant" => set_once(&mut meta.variant, text(&value)),
-        // Both of these are `u16`/`u8` in the typed metadata, so a value that
-        // does not fit is kept verbatim in `extra` instead of being dropped.
-        // Silently discarding `quality = -107` would leave a rule looking
-        // unscored when its author had in fact supplied a score.
+        // Two spellings, two different things, and they are no longer one field.
+        //
+        // `weight` is this product's own point value and is used as written.
+        // `score` is the confidence rating a third-party set carries in its own
+        // units, and it is calibrated onto this engine's ladder rather than read
+        // as points — see [`crate::calibrate::weight_for`] and
+        // [`crate::ast::RuleMeta::score`]. Accepting one spelling for both was
+        // the defect: the corpus writes `score = 75` on 9,236 of its rules, and
+        // that had to be able to mean something other than a hand-written
+        // `weight = 75`.
+        //
+        // Both are `u16`/`u8` in the typed metadata, so a value that does not
+        // fit is kept verbatim in `extra` instead of being dropped. Silently
+        // discarding `quality = -107` would leave a rule looking unscored when
+        // its author had in fact supplied a score.
         "weight" => match parse_u16(&value) {
             Some(w) => set_once(&mut meta.weight, w),
+            None => {
+                meta.extra.insert(key.to_string(), value);
+            }
+        },
+        "score" => match parse_u16(&value) {
+            Some(s) => set_once(&mut meta.score, s),
             None => {
                 meta.extra.insert(key.to_string(), value);
             }
@@ -1288,7 +1488,10 @@ fn apply_meta(meta: &mut RuleMeta, key: &str, value: MetaValue) {
         "decisive" => {
             meta.decisive = match &value {
                 MetaValue::Boolean(b) => *b,
-                other => matches!(other.to_string().to_ascii_lowercase().as_str(), "true" | "yes" | "1"),
+                other => matches!(
+                    other.to_string().to_ascii_lowercase().as_str(),
+                    "true" | "yes" | "1"
+                ),
             };
         }
         _ => {
@@ -1367,7 +1570,9 @@ mod tests {
 
     #[test]
     fn an_empty_tag_list_is_rejected() {
-        assert!(err("rule r : { condition: true }").message.contains("at least one tag"));
+        assert!(err("rule r : { condition: true }")
+            .message
+            .contains("at least one tag"));
     }
 
     #[test]
@@ -1415,8 +1620,7 @@ mod tests {
 
     #[test]
     fn regex_flags_are_captured_verbatim() {
-        let file =
-            parse_file(r#"rule r { strings: $a = /ab/i condition: $a }"#).unwrap();
+        let file = parse_file(r#"rule r { strings: $a = /ab/i condition: $a }"#).unwrap();
         assert_eq!(
             file.rules[0].strings[0].value,
             StringValue::Regex {
@@ -1467,10 +1671,8 @@ mod tests {
 
     #[test]
     fn anonymous_strings_get_synthesised_identifiers() {
-        let file = parse_file(
-            r#"rule r { strings: $ = "a" $ = "b" condition: any of them }"#,
-        )
-        .unwrap();
+        let file =
+            parse_file(r#"rule r { strings: $ = "a" $ = "b" condition: any of them }"#).unwrap();
         let ids: Vec<&str> = file.rules[0]
             .strings
             .iter()
@@ -1536,11 +1738,34 @@ mod tests {
     }
 
     #[test]
-    fn hashes_are_lowercased_so_the_blocklist_can_compare_them() {
+    fn the_two_scoring_fields_do_not_land_in_the_same_place() {
+        // `weight` is this product's own points and `score` is a third-party
+        // set's confidence rating, and one field held both until the difference
+        // was measured: 86% of the vendored corpus states `score = 75`, and read
+        // as 75 points against a 100-point conviction threshold, any two of its
+        // rules condemned a file. A parser that merged the two spellings again
+        // would reintroduce exactly that, so the separation is asserted here
+        // rather than left to the calibration tests downstream.
         let file = parse_file(
-            r#"rule r { meta: hash = "AABBCCDD" condition: true }"#,
+            r#"
+            rule r {
+                meta:
+                    weight = 120
+                    score = 75
+                condition:
+                    true
+            }
+            "#,
         )
         .unwrap();
+        let m = &file.rules[0].meta;
+        assert_eq!(m.weight, Some(120), "as written");
+        assert_eq!(m.score, Some(75), "and kept apart from it");
+    }
+
+    #[test]
+    fn hashes_are_lowercased_so_the_blocklist_can_compare_them() {
+        let file = parse_file(r#"rule r { meta: hash = "AABBCCDD" condition: true }"#).unwrap();
         assert_eq!(file.rules[0].meta.hashes, vec!["aabbccdd"]);
     }
 
@@ -1559,8 +1784,7 @@ mod tests {
 
     #[test]
     fn unknown_meta_keys_are_preserved() {
-        let file =
-            parse_file(r#"rule r { meta: tlp = "WHITE" condition: true }"#).unwrap();
+        let file = parse_file(r#"rule r { meta: tlp = "WHITE" condition: true }"#).unwrap();
         assert_eq!(
             file.rules[0].meta.extra.get("tlp"),
             Some(&MetaValue::Text("WHITE".into()))
@@ -1570,10 +1794,9 @@ mod tests {
     #[test]
     fn a_meta_key_named_condition_does_not_end_the_section_early() {
         // Only a section header is followed by `:`.
-        let file = parse_file(
-            r#"rule r { meta: condition = "looks like a header" condition: true }"#,
-        )
-        .unwrap();
+        let file =
+            parse_file(r#"rule r { meta: condition = "looks like a header" condition: true }"#)
+                .unwrap();
         assert_eq!(
             file.rules[0].meta.extra.get("condition"),
             Some(&MetaValue::Text("looks like a header".into()))
@@ -1600,8 +1823,16 @@ mod tests {
     fn arithmetic_binds_tighter_than_comparison() {
         let e = cond("filesize + 4 > 100");
         match e {
-            Expr::Compare { op: CmpOp::Gt, lhs, .. } => {
-                assert!(matches!(*lhs, Expr::Arithmetic { op: ArithOp::Add, .. }));
+            Expr::Compare {
+                op: CmpOp::Gt, lhs, ..
+            } => {
+                assert!(matches!(
+                    *lhs,
+                    Expr::Arithmetic {
+                        op: ArithOp::Add,
+                        ..
+                    }
+                ));
             }
             other => panic!("expected a comparison at the root, got {other:?}"),
         }
@@ -1611,8 +1842,18 @@ mod tests {
     fn multiplication_binds_tighter_than_addition() {
         let e = cond("1 + 2 * 3");
         match e {
-            Expr::Arithmetic { op: ArithOp::Add, rhs, .. } => {
-                assert!(matches!(*rhs, Expr::Arithmetic { op: ArithOp::Mul, .. }));
+            Expr::Arithmetic {
+                op: ArithOp::Add,
+                rhs,
+                ..
+            } => {
+                assert!(matches!(
+                    *rhs,
+                    Expr::Arithmetic {
+                        op: ArithOp::Mul,
+                        ..
+                    }
+                ));
             }
             other => panic!("expected addition at the root, got {other:?}"),
         }
@@ -1622,7 +1863,9 @@ mod tests {
     fn bitwise_or_binds_looser_than_bitwise_and() {
         let e = cond("1 | 2 & 3");
         match e {
-            Expr::Bitwise { op: BitOp::Or, rhs, .. } => {
+            Expr::Bitwise {
+                op: BitOp::Or, rhs, ..
+            } => {
                 assert!(matches!(*rhs, Expr::Bitwise { op: BitOp::And, .. }));
             }
             other => panic!("expected `|` at the root, got {other:?}"),
@@ -1633,8 +1876,18 @@ mod tests {
     fn subtraction_is_left_associative() {
         let e = cond("10 - 3 - 2");
         match e {
-            Expr::Arithmetic { op: ArithOp::Sub, lhs, .. } => {
-                assert!(matches!(*lhs, Expr::Arithmetic { op: ArithOp::Sub, .. }));
+            Expr::Arithmetic {
+                op: ArithOp::Sub,
+                lhs,
+                ..
+            } => {
+                assert!(matches!(
+                    *lhs,
+                    Expr::Arithmetic {
+                        op: ArithOp::Sub,
+                        ..
+                    }
+                ));
             }
             other => panic!("expected `-` at the root, got {other:?}"),
         }
@@ -1672,8 +1925,14 @@ mod tests {
         assert_eq!(cond("#a"), Expr::StringCount("a".into()));
         assert_eq!(cond("@a"), Expr::StringOffset("a".into(), None));
         assert_eq!(cond("!a"), Expr::StringLength("a".into(), None));
-        assert_eq!(cond("@a[2]"), Expr::StringOffset("a".into(), Some(Box::new(Expr::Int(2)))));
-        assert_eq!(cond("!a[3]"), Expr::StringLength("a".into(), Some(Box::new(Expr::Int(3)))));
+        assert_eq!(
+            cond("@a[2]"),
+            Expr::StringOffset("a".into(), Some(Box::new(Expr::Int(2))))
+        );
+        assert_eq!(
+            cond("!a[3]"),
+            Expr::StringLength("a".into(), Some(Box::new(Expr::Int(3))))
+        );
     }
 
     #[test]
@@ -1684,11 +1943,7 @@ mod tests {
         );
         assert_eq!(
             cond("$a in (0..100)"),
-            Expr::StringIn(
-                "a".into(),
-                Box::new(Expr::Int(0)),
-                Box::new(Expr::Int(100))
-            )
+            Expr::StringIn("a".into(), Box::new(Expr::Int(0)), Box::new(Expr::Int(100)))
         );
     }
 
@@ -1698,7 +1953,13 @@ mod tests {
         match e {
             Expr::And(lhs, _) => match *lhs {
                 Expr::StringAt(_, offset) => {
-                    assert!(matches!(*offset, Expr::Arithmetic { op: ArithOp::Add, .. }));
+                    assert!(matches!(
+                        *offset,
+                        Expr::Arithmetic {
+                            op: ArithOp::Add,
+                            ..
+                        }
+                    ));
                 }
                 other => panic!("expected `at` on the left, got {other:?}"),
             },
@@ -1741,7 +2002,10 @@ mod tests {
     #[test]
     fn parses_a_count_quantifier() {
         match cond("3 of them") {
-            Expr::Of { quantifier: Quantifier::Count(n), .. } => assert_eq!(*n, Expr::Int(3)),
+            Expr::Of {
+                quantifier: Quantifier::Count(n),
+                ..
+            } => assert_eq!(*n, Expr::Int(3)),
             other => panic!("expected a count, got {other:?}"),
         }
     }
@@ -1750,7 +2014,10 @@ mod tests {
     fn a_count_may_be_a_module_field() {
         // `pe.number_of_sections of them` is real and common.
         match cond("pe.number_of_sections of them") {
-            Expr::Of { quantifier: Quantifier::Count(n), .. } => {
+            Expr::Of {
+                quantifier: Quantifier::Count(n),
+                ..
+            } => {
                 assert!(matches!(*n, Expr::Field { .. }));
             }
             other => panic!("expected a computed count, got {other:?}"),
@@ -1760,7 +2027,10 @@ mod tests {
     #[test]
     fn parses_a_percentage_quantifier() {
         match cond("50% of them") {
-            Expr::Of { quantifier: Quantifier::Percentage(p), .. } => assert_eq!(p, 50),
+            Expr::Of {
+                quantifier: Quantifier::Percentage(p),
+                ..
+            } => assert_eq!(p, 50),
             other => panic!("expected a percentage, got {other:?}"),
         }
     }
@@ -1771,7 +2041,13 @@ mod tests {
         let e = cond("filesize % 2 == 0");
         match e {
             Expr::Compare { lhs, .. } => {
-                assert!(matches!(*lhs, Expr::Arithmetic { op: ArithOp::Mod, .. }));
+                assert!(matches!(
+                    *lhs,
+                    Expr::Arithmetic {
+                        op: ArithOp::Mod,
+                        ..
+                    }
+                ));
             }
             other => panic!("expected a modulo comparison, got {other:?}"),
         }
@@ -1780,7 +2056,10 @@ mod tests {
     #[test]
     fn parses_a_string_set_with_names_and_prefixes() {
         match cond("2 of ($a, $b, $c*)") {
-            Expr::Of { set: StringSet::List { names, prefixes }, .. } => {
+            Expr::Of {
+                set: StringSet::List { names, prefixes },
+                ..
+            } => {
                 assert_eq!(names, vec!["a", "b"]);
                 assert_eq!(prefixes, vec!["c"]);
             }
@@ -1791,7 +2070,10 @@ mod tests {
     #[test]
     fn a_bare_star_prefix_matches_every_string() {
         match cond("any of ($*)") {
-            Expr::Of { set: StringSet::List { prefixes, .. }, .. } => {
+            Expr::Of {
+                set: StringSet::List { prefixes, .. },
+                ..
+            } => {
                 assert_eq!(prefixes, vec![""]);
             }
             other => panic!("expected a list set, got {other:?}"),
@@ -1809,7 +2091,11 @@ mod tests {
     #[test]
     fn parses_a_for_of_loop() {
         match cond("for any of ($a*) : ( $ at entrypoint )") {
-            Expr::ForOf { quantifier, set, body } => {
+            Expr::ForOf {
+                quantifier,
+                set,
+                body,
+            } => {
                 assert_eq!(quantifier, Quantifier::Any);
                 assert!(matches!(set, StringSet::List { .. }));
                 assert!(matches!(*body, Expr::StringAt(_, _)));
@@ -1849,7 +2135,10 @@ mod tests {
         match cond("pe.number_of_sections") {
             Expr::Field { path } => {
                 assert_eq!(path.root, "pe");
-                assert_eq!(path.segments, vec![PathSegment::Field("number_of_sections".into())]);
+                assert_eq!(
+                    path.segments,
+                    vec![PathSegment::Field("number_of_sections".into())]
+                );
             }
             other => panic!("expected a field, got {other:?}"),
         }
@@ -1910,7 +2199,11 @@ mod tests {
     #[test]
     fn a_regex_operand_keeps_its_body_and_flags() {
         match cond("\"a\" matches /ab+c/i") {
-            Expr::StringOp { op: StringOp::Matches, rhs, .. } => {
+            Expr::StringOp {
+                op: StringOp::Matches,
+                rhs,
+                ..
+            } => {
                 assert_eq!(
                     *rhs,
                     Expr::Regex {
@@ -1929,7 +2222,10 @@ mod tests {
         // entry point", and an empty name is how the placeholder is spelled.
         match cond("for any of them : ( $ at entrypoint )") {
             Expr::ForOf { body, .. } => {
-                assert_eq!(*body, Expr::StringAt(String::new(), Box::new(Expr::EntryPoint)));
+                assert_eq!(
+                    *body,
+                    Expr::StringAt(String::new(), Box::new(Expr::EntryPoint))
+                );
             }
             other => panic!("expected a for-of loop, got {other:?}"),
         }
@@ -2018,8 +2314,7 @@ mod tests {
         // The lexer captures the body verbatim, so the parser has to feed it
         // to the hex parser unaltered — including the braces being adjacent to
         // the bytes.
-        let file =
-            parse_file(r#"rule r { strings: $a = {4D5A} condition: $a }"#).unwrap();
+        let file = parse_file(r#"rule r { strings: $a = {4D5A} condition: $a }"#).unwrap();
         match &file.rules[0].strings[0].value {
             StringValue::Hex(p) => {
                 assert_eq!(p.tokens, vec![HexToken::Byte(0x4D), HexToken::Byte(0x5A)]);
@@ -2096,6 +2391,51 @@ mod tests {
     }
 
     #[test]
+    fn a_for_loop_quantifier_may_be_an_expression_and_not_just_a_literal() {
+        // A count of sections is the natural way to write a loop over them, so
+        // the quantifier is read as an expression. The loop variable still ends
+        // it: `i` after a dotted path is not part of the path.
+        let e = cond("for pe.number_of_sections i in (0..3) : ( true )");
+        match e {
+            Expr::ForIn {
+                quantifier, var, ..
+            } => {
+                assert_eq!(var, "i");
+                assert!(
+                    matches!(quantifier, Quantifier::Count(_)),
+                    "a dotted path is a count, not a keyword: {quantifier:?}"
+                );
+            }
+            other => panic!("expected a counted `for .. in`, got {other:?}"),
+        }
+
+        // And an arithmetic one, which is what a loop over a half-open-looking
+        // range is written with.
+        let e = cond("for 1 + 1 i in (0..3) : ( true )");
+        match e {
+            Expr::ForIn { quantifier, .. } => match quantifier {
+                Quantifier::Count(count) => {
+                    assert!(matches!(*count, Expr::Arithmetic { .. }), "{count:?}");
+                }
+                other => panic!("expected a count, got {other:?}"),
+            },
+            other => panic!("expected a counted `for .. in`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bare_name_where_the_count_belongs_is_still_a_missing_quantifier() {
+        // Both of these would otherwise be read as a count and reported as some
+        // other problem entirely: `for i in (...)` parses `i` as the count and
+        // then wants `in` to be the loop variable, and `for in (...)` parses
+        // `in (...) ` as a call and complains about an unclosed argument list.
+        for source in ["for i in (0..1) : ( true )", "for in (0..1) : ( true )"] {
+            let e = err(&format!("rule r {{ condition: {source} }}"));
+            assert!(e.message.contains("after `for`"), "{source}: {e}");
+        }
+    }
+
+    #[test]
     fn a_for_loop_can_iterate_a_module_array() {
         let e = cond(r#"for any s in pe.sections : ( s.name == ".text" )"#);
         match e {
@@ -2132,7 +2472,9 @@ mod tests {
         // while parsing, which silently turned one into the other.
         let e = cond("for all i in (0 .. pe.number_of_sections) : ( i > 0 )");
         match e {
-            Expr::ForIn { quantifier, var, .. } => {
+            Expr::ForIn {
+                quantifier, var, ..
+            } => {
                 assert_eq!(quantifier, Quantifier::All);
                 assert_eq!(var, "i");
             }
@@ -2204,6 +2546,153 @@ mod tests {
         let src = format!("rule r {{ condition: {terms} }}");
         let file = parse_file(&src).unwrap_or_else(|e| panic!("{e}"));
         assert!(matches!(file.rules[0].condition, Expr::Or(_, _)));
+    }
+
+    // -- chain folding ------------------------------------------------------
+
+    /// How deep the tree under `expr` goes.
+    ///
+    /// Recursive, and that is the point: this is the cost every consumer of the
+    /// tree pays, so a test that measures it is measuring the thing that
+    /// overflows. Only ever called on trees a passing test built.
+    fn depth(expr: &Expr) -> usize {
+        let (lhs, rhs): (Option<&Expr>, Option<&Expr>) = match expr {
+            Expr::Or(a, b) | Expr::And(a, b) => (Some(a), Some(b)),
+            Expr::Arithmetic { lhs, rhs, .. }
+            | Expr::Bitwise { lhs, rhs, .. }
+            | Expr::Compare { lhs, rhs, .. }
+            | Expr::StringOp { lhs, rhs, .. } => (Some(lhs), Some(rhs)),
+            Expr::Not(a) | Expr::Defined(a) | Expr::Negate(a) | Expr::BitNot(a) => (Some(a), None),
+            _ => (None, None),
+        };
+        let under = lhs.into_iter().chain(rhs).map(depth).max();
+        match under {
+            Some(deepest) => deepest + 1,
+            None => 1,
+        }
+    }
+
+    /// The leaves of `expr` in the order the rule wrote them.
+    fn leaves(expr: &Expr, out: &mut Vec<Expr>) {
+        match expr {
+            Expr::Or(a, b) | Expr::And(a, b) => {
+                leaves(a, out);
+                leaves(b, out);
+            }
+            other => out.push(other.clone()),
+        }
+    }
+
+    #[test]
+    fn a_flat_or_chain_is_folded_into_a_balanced_tree() {
+        // 500 alternatives written flat used to parse into a 500-deep left
+        // spine, which is 500 levels of recursion for the compiler and for
+        // `Drop`. Balanced, it is nine.
+        let terms = vec!["uint16(0) == 1"; 500].join(" or ");
+        let expr = cond(&terms);
+        // 499 terms pair off in nine rounds, the term the chain started from
+        // joins at the top, and each term is itself a comparison two levels
+        // down — twelve, where the left spine was five hundred.
+        assert!(
+            depth(&expr) <= 12,
+            "a 500-term chain folded to depth {}",
+            depth(&expr)
+        );
+        assert!(matches!(expr, Expr::Or(_, _)));
+    }
+
+    #[test]
+    fn folding_a_chain_keeps_every_term_and_their_order() {
+        // Balancing re-brackets; it must not reorder, drop or duplicate. A fold
+        // that lost a term would be a rule that silently matches less, and one
+        // that reordered would be a rule that matches something else.
+        let terms: Vec<String> = (0..37).map(|i| format!("uint16(0) == {i}")).collect();
+        let mut found = Vec::new();
+        leaves(&cond(&terms.join(" or ")), &mut found);
+        assert_eq!(found.len(), terms.len());
+        for (index, term) in terms.iter().enumerate() {
+            assert_eq!(found[index], cond(term), "term {index} moved");
+        }
+    }
+
+    #[test]
+    fn a_chain_of_an_operator_that_cannot_be_re_bracketed_keeps_its_left_fold() {
+        // `100 - 30 - 20` is `50`. Balanced it would be `90`, which is not a
+        // performance difference, it is a different rule.
+        let expr = cond("100 - 30 - 20");
+        match expr {
+            Expr::Arithmetic {
+                op: ArithOp::Sub,
+                lhs,
+                rhs,
+            } => {
+                assert!(matches!(*rhs, Expr::Int(20)), "got {rhs:?}");
+                assert!(matches!(
+                    *lhs,
+                    Expr::Arithmetic {
+                        op: ArithOp::Sub,
+                        ..
+                    }
+                ));
+            }
+            other => panic!("expected a left-folded subtraction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_change_of_operator_ends_the_run_even_at_one_precedence() {
+        // `+` and `-` share a precedence level. Gathering them into one chain
+        // because the level matched would fold `a + b - c` as though it were
+        // all one operator.
+        let expr = cond("1 + 2 - 3");
+        match expr {
+            Expr::Arithmetic {
+                op: ArithOp::Sub,
+                lhs,
+                rhs,
+            } => {
+                assert!(matches!(*rhs, Expr::Int(3)), "got {rhs:?}");
+                assert!(matches!(
+                    *lhs,
+                    Expr::Arithmetic {
+                        op: ArithOp::Add,
+                        ..
+                    }
+                ));
+            }
+            other => panic!("expected `-` at the root, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_two_term_chain_keeps_the_shape_it_always_had() {
+        // Two terms have only one bracketing, so the fold must leave them
+        // exactly as the term-by-term version built them. Every rule in the
+        // set this is validated against that pairs two strings is unaffected,
+        // which is nearly all of them.
+        assert_eq!(
+            cond("true or false"),
+            Expr::Or(Box::new(Expr::Bool(true)), Box::new(Expr::Bool(false)))
+        );
+        assert_eq!(
+            cond("true and false"),
+            Expr::And(Box::new(Expr::Bool(true)), Box::new(Expr::Bool(false)))
+        );
+    }
+
+    #[test]
+    fn a_folded_chain_is_regrouped_but_never_reordered_or_shortened() {
+        // Three terms are where the fold first has a choice, and for an
+        // associative operator the choice is free: `a or (b or c)` and
+        // `(a or b) or c` are the same claim. What matters is that all three
+        // are still there, in the order the rule wrote them.
+        let mut found = Vec::new();
+        leaves(&cond("true or false or true"), &mut found);
+        assert_eq!(
+            found,
+            vec![Expr::Bool(true), Expr::Bool(false), Expr::Bool(true)]
+        );
+        assert!(depth(&cond("true or false or true")) <= 3);
     }
 
     #[test]

@@ -1,0 +1,66 @@
+[package]
+name = "av-realtime"
+description = "Realtime protection: noticing a file the moment it appears and scanning it before it runs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+av-core.workspace = true
+av-quarantine.workspace = true
+av-scan.workspace = true
+
+# The machine's local profiles, for the default watch set. One question, and the
+# crate that already reads the registry is the one that can answer it: under
+# `LocalSystem` every "the current user's folders" call answers with the system
+# profile, so the default plan cannot be built from this process's own identity.
+# See `standard_paths` and `av_integration::profiles`.
+av-integration.workspace = true
+
+log.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+crossbeam-channel.workspace = true
+
+# The standard watch set is the user's real folders — Downloads, Desktop,
+# Documents — and this is what resolves them. Re-deriving them from
+# `SHGetKnownFolderPath` would be a second, subtly different answer to a question
+# `av-core` already answers through the same crate.
+dirs.workspace = true
+# Walking a watched tree after the kernel tells us it dropped events. Used for
+# that one job: everything else this crate reads, it reads by path.
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+serde_json.workspace = true
+# The end-to-end test needs an engine, and an engine needs a rule database. A
+# test-only dependency: nothing in the library knows how a rule is compiled, and
+# the engine arrives as an `Arc<ScanEngine>` from whoever assembles the product.
+av-rules.workspace = true
+
+# The directory handle and the overlapped read. Feature by feature:
+#
+#   Win32_Foundation         HANDLE, CloseHandle, the WAIT_* results
+#   Win32_Security           required by the generated `CreateFileW` and
+#                            `CreateEventW`, both of which take a
+#                            `SECURITY_ATTRIBUTES` the caller passes as null
+#   Win32_Storage_FileSystem CreateFileW, ReadDirectoryChangesW, the FILE_* flags
+#   Win32_System_IO          OVERLAPPED and GetOverlappedResult
+#   Win32_System_Threading   CreateEventW, ResetEvent, WaitForSingleObject
+#
+# Nothing else is enabled: this crate is user mode, and a feature that pulled in
+# a driver-facing header would be a claim it does not make.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+] }

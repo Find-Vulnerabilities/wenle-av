@@ -1,0 +1,166 @@
+[package]
+name = "av-gui"
+description = "The graphical front end: an egui application over the scanner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "wenle-gui"
+path = "src/main.rs"
+
+[dependencies]
+av-core.workspace = true
+# The walk. `std::fs::read_dir` reaches `FindFirstFileW`, which is
+# DACL-subject: a directory this account may not list is never descended
+# into and its files are never offered, so a window that walked that way
+# could not report what it had missed. `av-fs` lists through
+# `SeBackupPrivilege` and reports a refusal as a value naming the
+# directory.
+av-fs.workspace = true
+av-rules.workspace = true
+av-scan.workspace = true
+av-quarantine.workspace = true
+# The trust layer's catalog index. Without it the window would report every
+# catalog-signed Microsoft binary in `System32` as suspicious — see
+# `scan.rs::catalog_index`, which carries the measurement.
+av-signatures.workspace = true
+# The per-user registrations the Settings tab's General section turns on: the
+# entry that starts this window at sign-in and the name the shell attributes its
+# notifications to. This is the only thing the window does that changes the
+# machine rather than reading it, and it belongs in the crate that owns the
+# registry rather than in a second set of key paths written here. Nothing in the
+# window's scan path reaches it; see `av-integration`'s own documentation for
+# what that crate refuses to be linked into.
+av-integration.workspace = true
+# The control protocol, and the client half of the named pipe that carries it.
+#
+# `av-ipc` is the protocol — framing, versioning, the message vocabulary — and
+# `av-service::pipe` is the transport, which lives in the service crate because
+# it is the same code on both ends and the crate that builds the server is the
+# one that can test the pair. `wenle` (the console) depends on `av-service` for
+# exactly this, and the window takes the same route rather than writing a second
+# named-pipe client: a second implementation of one transport is a second answer
+# to "can this window reach the service", and the copy that is wrong is the one
+# that silently does nothing.
+#
+# What the window does with it is ask the service to restore, delete or allow an
+# item, because the vault has one writer and the service is it. See
+# `service.rs` for what the window still performs itself and why.
+av-ipc.workspace = true
+av-service.workspace = true
+
+eframe.workspace = true
+# The command line, which a graphical program still has: `--data-dir` is the
+# flag that makes a portable install possible, and it has to mean here exactly
+# what it means to `wenle` or the two front ends would keep their state in two
+# different places. See `main.rs` for why the same flag, in the same words,
+# matters more than the handful of lines a hand-written parser would save.
+clap.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+env_logger.workspace = true
+
+# The scan itself runs on a pool of its own, built per scan so that a changed
+# thread count takes effect on the next one. The console installs rayon's global
+# pool instead, which is right for a process that does one thing; see
+# `scan.rs::rayon_pool` for why that is wrong here.
+rayon.workspace = true
+
+# The directory walk. The window has to enumerate the target itself before it
+# can hand files to the engine, and the console's walker lives in the `av-cli`
+# binary where nothing can depend on it — see the module documentation of
+# `scan.rs` for what is duplicated and why.
+# The scan thread reports to the window over this. `crossbeam-channel` rather
+# than `std::sync::mpsc` because the window drains it from the drawing code
+# every frame and needs a non-blocking receive; `std::mpsc`'s only non-blocking
+# receive is `try_recv`, which is there too, but the crate is already in the
+# workspace for the engine's own worker channels and one channel type across the
+# product is one fewer thing to reason about.
+crossbeam-channel.workspace = true
+# Quarantine entries carry and display timestamps. `av-core` re-exports none of
+# this, and a window that rendered a quarantine date itself would be a second
+# opinion about what a date looks like.
+chrono.workspace = true
+# The current file name the scan thread publishes for the window to read is
+# shared behind a mutex, and it is written once per file. `parking_lot` has no
+# poisoning, which matters here: a panic while holding this lock would be a
+# panic in a formatting path, and with `std::sync::Mutex` every later frame
+# would then have to decide what to do about a poisoned lock on a string that
+# only ever holds a path.
+parking_lot.workspace = true
+
+# The native file and folder pickers, and the only dependency in this crate
+# that is declared here rather than inherited from `[workspace.dependencies]`:
+# it has exactly one consumer, it is compiled on one platform, and the
+# workspace table is a shared file that every crate's change has to go through.
+# See `picker.rs` for what the Windows-only scoping costs on other platforms and
+# why the two picker functions return `None` there rather than not existing.
+#
+# `default-features = false` is not a trim of anything on Windows: rfd's default
+# features are the Linux portal backend and its async runtime, neither of which
+# is compiled here. The Windows backend is unconditional.
+[target.'cfg(windows)'.dependencies]
+rfd = { version = "0.15.4", default-features = false }
+
+# The single-instance claim and the pipe a second launch reports through — see
+# `single.rs` for what those are and why the two obvious alternatives do not
+# work. There is no `[workspace.dependencies]` entry to inherit: `av-service` is
+# the only other consumer and declares the same version with a different feature
+# set, and a shared entry would have to be the union of the two, which would
+# compile the service's IPC surface into the window.
+#
+# The features are the ones the calls need rather than a convenience list:
+# `CreateFileW`, `CreateMutexW` and `CreateNamedPipeW` are each gated on
+# `Win32_Security` because their signatures take an `Option<*const
+# SECURITY_ATTRIBUTES>` even when it is `None`; `ReadFile` is gated on
+# `Win32_System_IO` for the same reason with `OVERLAPPED`. Pulling the gate in
+# without calling anything behind it costs a few definitions, and leaving it out
+# costs a build that does not see the function at all.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    # The notification-area icon: `Shell_NotifyIconW` and the struct it takes,
+    # and `ExtractIconExW`, which takes this executable's own icon out of its
+    # resources. `Win32_Graphics_Gdi` is not called into — it is the module
+    # `WNDCLASSW`'s background-brush field is declared in, so the struct does not
+    # exist without it. See `tray.rs`.
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_LibraryLoader",
+    "Win32_Graphics_Gdi",
+    # The notification. Not a `Win32_` namespace, because a toast is not a
+    # Win32 API: `ToastNotificationManager` is WinRT, and the document it takes
+    # is built with the WinRT XML DOM rather than a string of our own
+    # concatenation. `Win32_System_WinRT` is `RoInitialize` and its
+    # `RO_INIT_MULTITHREADED`, which the posting thread has to call before any
+    # of the rest will activate at all. See `notify.rs` for what was measured
+    # about which of these calls need the application identifier to be
+    # registered and which do not — the answer is not what it looks like.
+    "UI_Notifications",
+    "Data_Xml_Dom",
+    "Win32_System_WinRT",
+] }
+
+[dev-dependencies]
+# Temp directories for the scan-driver tests, which compile a real rule
+# database, write it to a directory and scan files with it. The engine is the
+# thing under test as much as the driver is, so the tests use the engine's own
+# database format rather than a stub.
+tempfile.workspace = true
+# Building a real zip for the test that scans one, because the accounting this
+# crate does for an archive's members is the thing under test and a hand-written
+# stub of the container format would be a second implementation of it. This is
+# the product's own reader; see `av-archive`'s `testing` module.
+av-archive.workspace = true

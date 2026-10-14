@@ -126,9 +126,8 @@ impl Pattern {
         // nobody needs — past 64 Ki positions, the cost is dominated by
         // actually reading the file rather than by the walk.
         let budget = Cell::new(
-            STEPS_PER_CANDIDATE.saturating_mul(
-                u32::try_from(data.len()).unwrap_or(u32::MAX).min(1 << 16),
-            ),
+            STEPS_PER_CANDIDATE
+                .saturating_mul(u32::try_from(data.len()).unwrap_or(u32::MAX).min(1 << 16)),
         );
 
         // One candidate start, one full walk. Returns whether the walk finished
@@ -278,7 +277,9 @@ fn seq(
         HexToken::Jump { min, max } => {
             // The gap may not take the match past the limit, so an unbounded
             // jump stops at the buffer end rather than at `u32::MAX`.
-            let high = max.map_or(limit, |m| at.saturating_add(m as usize)).min(limit);
+            let high = max
+                .map_or(limit, |m| at.saturating_add(m as usize))
+                .min(limit);
             let mut gap = *min as usize;
             while at.saturating_add(gap) <= high {
                 if seq(data, rest, at + gap, limit, budget, k) {
@@ -367,7 +368,10 @@ mod tests {
         // inexact would push a precisely known pattern through the general
         // matcher for no reason.
         let p = compile("( 4D 5A )");
-        assert_eq!(HexPattern { tokens: p.tokens }.as_exact_bytes(), Some(b"MZ".to_vec()));
+        assert_eq!(
+            HexPattern { tokens: p.tokens }.as_exact_bytes(),
+            Some(b"MZ".to_vec())
+        );
     }
 
     // -- wildcard nibbles --------------------------------------------------
@@ -500,7 +504,11 @@ mod tests {
         // is the negation. Consuming both bytes would make the token's length
         // depend on what it matched, and would stop it matching a lone `41` at
         // the end of a buffer.
-        assert_eq!(at("~ ( 41 42 )", b"AC", 0), Some(1), "`41` not followed by `42`");
+        assert_eq!(
+            at("~ ( 41 42 )", b"AC", 0),
+            Some(1),
+            "`41` not followed by `42`"
+        );
         assert_eq!(at("~ ( 41 42 )", b"AB", 0), None, "the sequence itself");
         assert_eq!(at("~ ( 41 42 ) 43", b"AC", 0), Some(2));
     }

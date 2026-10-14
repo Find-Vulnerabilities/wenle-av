@@ -301,7 +301,10 @@ mod tests {
     fn in_needs_the_whole_match_inside_the_range() {
         let s = set(&[(0, 0, 8)]);
         assert!(s.in_range(0, 0, 8), "the range is inclusive of the end");
-        assert!(!s.in_range(0, 0, 7), "a match overrunning the end is not inside");
+        assert!(
+            !s.in_range(0, 0, 7),
+            "a match overrunning the end is not inside"
+        );
         assert!(!s.in_range(0, 1, 100));
     }
 

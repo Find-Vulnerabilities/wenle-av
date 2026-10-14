@@ -48,7 +48,10 @@ pub enum TokenKind {
     /// A quoted string, already unescaped into raw bytes.
     Literal(Vec<u8>),
     /// The body of a `/.../ ` regex, without the slashes, plus flags.
-    Regex { body: String, flags: String },
+    Regex {
+        body: String,
+        flags: String,
+    },
     /// The raw inner text of a `{ ... }` hex pattern, un-tokenised.
     HexBlock(String),
     Integer(i64),
@@ -357,8 +360,12 @@ impl<'a> Lexer<'a> {
             }
             let text = std::str::from_utf8(&self.src[digits_start..self.pos])
                 .map_err(|_| self.error("invalid hex literal", start))?;
-            let value = i64::from_str_radix(text, 16)
-                .map_err(|_| self.error(format!("hex literal `0x{text}` does not fit in 64 bits"), start))?;
+            let value = i64::from_str_radix(text, 16).map_err(|_| {
+                self.error(
+                    format!("hex literal `0x{text}` does not fit in 64 bits"),
+                    start,
+                )
+            })?;
             self.value_expected = false;
             return Ok(self.make(TokenKind::Integer(value), start));
         }
@@ -384,9 +391,7 @@ impl<'a> Lexer<'a> {
         let mut multiplier: i64 = 1;
         if let Some(b) = self.peek() {
             let upper = b.to_ascii_uppercase();
-            if matches!(upper, b'K' | b'M' | b'G')
-                && matches!(self.peek_at(1), Some(b'B' | b'b'))
-            {
+            if matches!(upper, b'K' | b'M' | b'G') && matches!(self.peek_at(1), Some(b'B' | b'b')) {
                 self.bump();
                 self.bump();
                 multiplier = match upper {
@@ -573,8 +578,8 @@ impl<'a> Lexer<'a> {
                     depth -= 1;
                     if depth == 0 {
                         let body_end = self.pos - 1;
-                        let body = String::from_utf8_lossy(&self.src[body_start..body_end])
-                            .into_owned();
+                        let body =
+                            String::from_utf8_lossy(&self.src[body_start..body_end]).into_owned();
                         self.value_expected = false;
                         return Ok(self.make(TokenKind::HexBlock(body), start));
                     }
@@ -628,10 +633,7 @@ impl<'a> Lexer<'a> {
                     self.bump();
                     TokenKind::Ne
                 } else {
-                    return Err(self.error(
-                        "`!` must be followed by a string name or `=`",
-                        start,
-                    ));
+                    return Err(self.error("`!` must be followed by a string name or `=`", start));
                 }
             }
             b'<' => {
@@ -659,10 +661,7 @@ impl<'a> Lexer<'a> {
             b'&' => TokenKind::Amp,
             b'|' => TokenKind::Pipe,
             other => {
-                return Err(self.error(
-                    format!("unexpected character `{}`", other as char),
-                    start,
-                ));
+                return Err(self.error(format!("unexpected character `{}`", other as char), start));
             }
         };
         if !matches!(kind, TokenKind::Assign) {
@@ -889,7 +888,9 @@ mod tests {
     fn unterminated_constructs_are_reported() {
         assert!(err(r#""abc"#).message.contains("unterminated string"));
         assert!(err("$a = { 4D 5A").message.contains("unterminated hex"));
-        assert!(err("/* nope").message.contains("unterminated block comment"));
+        assert!(err("/* nope")
+            .message
+            .contains("unterminated block comment"));
         assert!(err("$a = /abc").message.contains("unterminated regex"));
     }
 

@@ -136,7 +136,13 @@ fn run() -> ExitCode {
             println!("  {:<24} unreadable, skipped", short(file));
             continue;
         };
-        let (agreed, matched) = compare(&database, &mut filtered, &mut unfiltered, &short(file), &data);
+        let (agreed, matched) = compare(
+            &database,
+            &mut filtered,
+            &mut unfiltered,
+            &short(file),
+            &data,
+        );
         disagreements += usize::from(!agreed);
         total_matched += matched;
     }
@@ -300,7 +306,10 @@ fn source_slices(source: &str) -> Vec<(String, &[u8])> {
     const SLICE: usize = 1 << 20;
     let bytes = source.as_bytes();
     let mut out = Vec::new();
-    for (name, start) in [("rules (first MiB)", 0usize), ("rules (middle MiB)", bytes.len() / 2)] {
+    for (name, start) in [
+        ("rules (first MiB)", 0usize),
+        ("rules (middle MiB)", bytes.len() / 2),
+    ] {
         let start = start.min(bytes.len());
         let end = (start + SLICE).min(bytes.len());
         // Cut on a line boundary so the buffer is text rather than half a

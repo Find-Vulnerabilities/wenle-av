@@ -1,0 +1,42 @@
+# Build flags for the product's user-mode binaries.
+#
+# # Why the CRT is linked statically
+#
+# The MSVC toolchain links the C runtime dynamically by default: every binary
+# imports `VCRUNTIME140.dll` and a handful of `api-ms-win-crt-*.dll`. Those are
+# not part of Windows. They arrive with a Visual Studio installation or with the
+# separately downloadable "Visual C++ Redistributable", and a machine that has
+# neither cannot start this product at all -- it fails at load with
+# `STATUS_DLL_NOT_FOUND` before a line of this code runs, which to a user looks
+# like a corrupt download.
+#
+# `+crt-static` puts the runtime inside each executable instead. The build
+# products then depend on nothing from Microsoft, which matters most on exactly
+# the machines this product is for: debloated, freshly imaged, embedded and
+# server-core installations are where the redistributable is missing, and they
+# are also where an antivirus has to work.
+#
+# The alternative -- shipping the redistributable's DLLs beside the executable
+# -- is worse on three counts: it redistributes Microsoft's files under their
+# own terms, it adds a DLL next to the executable for something to load in place
+# of the real one, and it can still fail if the files are not deployed. Static
+# linking costs a few hundred kilobytes per binary and cannot fail.
+#
+# `crates/av-amsi` gains the most from this. It is a `cdylib` loaded into
+# somebody else's process -- `powershell.exe`, a script host, whatever
+# registered it -- and a provider that shares the host's CRT is a provider that
+# breaks when the host's version differs. A private, static runtime is the
+# recommended shape for an in-process COM server and this is that.
+#
+# # Scope
+#
+# Target-scoped, so it applies to the MSVC target and nothing else. The kernel
+# driver in `crates/av-driver` is a separate workspace whose own
+# `.cargo/config.toml` already asks for the same thing -- cargo joins the
+# `rustflags` arrays from both files, so the driver is built with the flag
+# twice, which is idempotent.
+#
+# `cargo build` after changing this rebuilds every crate: the flag is part of
+# the fingerprint, which is the point.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

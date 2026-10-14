@@ -9,6 +9,20 @@
 # Compiled rule databases are build artefacts, not sources.
 *.avdb
 
+# A vendored `libclang` 17 for the driver's bindgen, which does not understand
+# the installed LLVM 22. 103 MB of somebody else's DLL, fetched by the command
+# in `crates/av-driver/.libclang/README`. It is not deleted and not checked in:
+# the driver build needs it, and it is not source.
+crates/av-driver/.libclang/
+
+# An installed layout from an old build. Not source, and not the directory a
+# running installation uses. See the Build section of the README.
+/dist/
+
+# `tools/` keeps the sources and scripts of the diagnostic tools. The binaries
+# built from them are not sources. (`*.pdb` above already covers their symbols.)
+/tools/*.exe
+
 # Local runtime state
 /data/quarantine
 /data/logs

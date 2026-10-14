@@ -1,0 +1,47 @@
+[package]
+name = "av-quarantine"
+description = "The quarantine vault: an encrypted, integrity-checked store for detected files, with restore, retention and eviction"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+av-core.workspace = true
+
+serde.workspace = true
+bincode.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+log.workspace = true
+
+# AES-256-GCM for the payloads and the index. A vetted implementation and not a
+# hand-written stream cipher: the whole point of encrypting the vault is that
+# the sample cannot be recovered from the disk image, and a cipher written here
+# would be the weakest link in that claim rather than its foundation.
+aes-gcm = "0.10"
+# Overwrites the master key's bytes when it is dropped. Best-effort — copies
+# made by the allocator or the kernel are beyond reach — but it removes the
+# obvious copy an attacker could find with a memory dump of this process.
+zeroize = "1"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+# `CryptProtectData` wraps the master key so that the vault, copied to another
+# machine, cannot be opened there. The ACLs on the data directory and the
+# self-protection rules are the primary boundary — this is the layer that
+# survives someone walking off with the disk.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_System_Threading",
+] }
+
+[lints]
+workspace = true

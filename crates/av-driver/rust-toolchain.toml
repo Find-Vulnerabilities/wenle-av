@@ -1,0 +1,10 @@
+# Nightly, and only for this directory. The parent workspace pins stable in its
+# own `rust-toolchain.toml` and everything in it builds on stable; the driver
+# needs nightly for `-Z build-std`, which is what lets `wdk-sys` rebuild `core`
+# and `alloc` with the kernel's target features. See `.cargo/config.toml`.
+#
+# `rust-src` is the component `-Z build-std` reads.
+[toolchain]
+channel = "nightly"
+components = ["rust-src", "rustfmt", "clippy"]
+targets = ["x86_64-pc-windows-msvc"]

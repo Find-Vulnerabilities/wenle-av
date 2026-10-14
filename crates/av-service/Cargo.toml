@@ -1,0 +1,90 @@
+[package]
+name = "av-service"
+description = "The Wenle AV background service: the SCM host, the control-pipe listener, and the wiring of the scanner, the vault and the watcher"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "wenle-av-service"
+path = "src/main.rs"
+
+[dependencies]
+av-core.workspace = true
+av-driver-proto.workspace = true
+# Self-protection: this service protects its own process, its own directories
+# and its own SCM recovery policy at start-up, through the functions `wenle
+# protect …` already used. Until 2026-10-09 only the command-line tool depended
+# on this crate, which is why the product's self-protection ran when somebody
+# remembered to type the command and not when the service started.
+av-guard.workspace = true
+av-ipc.workspace = true
+av-memory.workspace = true
+av-quarantine.workspace = true
+av-realtime.workspace = true
+av-rules.workspace = true
+av-scan.workspace = true
+av-signatures.workspace = true
+
+serde.workspace = true
+toml.workspace = true
+log.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+crossbeam-channel.workspace = true
+walkdir.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+env_logger.workspace = true
+# The provider itself, so that `tests/control_pipe.rs` can drive the real
+# worker thread and the real protocol across a real pipe. A dev-dependency and
+# not a dependency, and the direction is the reason: the provider calls the
+# service and the service never calls the provider, so nothing in `src` has any
+# business naming this crate. Everything else here is a stand-in for it —
+# `av-ipc`'s in-memory loopback, or a hand-built `Request` — and the one thing
+# a stand-in cannot check is that the bytes this product's own provider sends
+# are the bytes this product's own service answers.
+av-amsi.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    # `ConvertStringSecurityDescriptorToSecurityDescriptorW` and
+    # `GetSecurityInfo` are the two calls behind `pipe::CONTROL_PIPE_SDDL`: one
+    # writes the control pipe's permission list, the other reads it back off the
+    # created object. They live in `Win32_Security_Authorization` rather than in
+    # `Win32_Security`, which is where the `SECURITY_ATTRIBUTES` structure and
+    # the `DACL_SECURITY_INFORMATION` flag the calls take come from.
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    # `ConnectNamedPipe`, `ReadFile` and `WriteFile` are gated on this in the
+    # `windows` crate even though the pipe functions themselves are not: the
+    # signatures take an `Option<*mut OVERLAPPED>`, and the type has to exist
+    # for the function to be callable with `None`.
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    # `WTSGetActiveConsoleSessionId` is how `peer` finds out which session the
+    # person at this machine's keyboard is in — the clause that lets the
+    # product's own front ends work at all, since the service runs as
+    # `LocalSystem` in session 0 and matches no ordinary account.
+    # `ProcessIdToSessionId`, used by that module's test, is here too.
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Services",
+    "Win32_System_Threading",
+    # `FilterConnectCommunicationPort`, `FilterGetMessage` and
+    # `FilterReplyMessage` are the user-mode half of the filter manager, and the
+    # `windows` crate files them under installable file systems rather than under
+    # a filter-manager module, which does not exist. The feature depends on
+    # `Win32_Storage`, which is why it is spelled out here.
+    "Win32_Storage_InstallableFileSystems",
+] }
+
+[lints]
+workspace = true

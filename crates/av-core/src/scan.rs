@@ -5,8 +5,41 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::archive::ArchiveSummary;
 use crate::error::AvError;
 use crate::verdict::{Assessment, Detection, Verdict};
+
+/// The slowest rate a scan of one byte is taken to run at, from measurement.
+///
+/// # Where this number comes from, and what it is for
+///
+/// Anything in this product that has to wait for, or bound, a scan needs to
+/// know how long a scan takes. A flat number of seconds cannot answer that,
+/// because "how long" is a function of "how much" — and two separate flat
+/// numbers had already produced two separate faults before this constant was
+/// extracted:
+///
+/// * the scan-memory budget waited a flat thirty seconds for a file's
+///   reservation to come back, which a file at the default size cap outlives;
+/// * the per-file time budget was a flat thirty seconds, which made every file
+///   above about thirty megabytes permanently `Unknown` — `libclang.dll`,
+///   81.7 MB, completed in 27.6 s and was still reported as one.
+///
+/// Both were the same mistake with the same shape, so they now share one
+/// number.
+///
+/// # The measurement
+///
+/// A large executable is scanned at about 3 MB/s on one core — 81,704,960
+/// bytes in 27.6 s, measured. The figure here is the pessimistic *floor* and
+/// not the measurement, because everything that reads it is computing a bound
+/// rather than a prediction, and a bound that a slow machine can exceed is not
+/// a bound. It is a third of what was measured, which is the margin a machine
+/// with a busier disk, a colder cache or a slower core is expected to need.
+///
+/// It is deliberately a rate and not a duration: a caller multiplies it by
+/// what it is waiting for, which is the whole point of extracting it.
+pub const FLOOR_BYTES_PER_SEC: u64 = 1024 * 1024;
 
 /// What the user asked us to scan.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -18,7 +51,10 @@ pub enum ScanTarget {
     Drive(PathBuf),
     /// A running process, by PID. The name is carried alongside purely so that
     /// reports stay readable after the process has exited.
-    Process { pid: u32, name: String },
+    Process {
+        pid: u32,
+        name: String,
+    },
     /// Every process we can open.
     AllProcesses,
     /// The registry hives that hold persistence points.
@@ -111,7 +147,13 @@ pub struct ScanOptions {
     pub archive_max_expansion: u64,
     /// Run static heuristics (entropy, packing, imports) alongside signatures.
     pub heuristics: bool,
-    /// Evaluate rules against executable memory of running processes.
+    /// Evaluate rules against the executable memory of running processes.
+    ///
+    /// Read by the layer that enumerates processes, not by the engine: the
+    /// engine is handed bytes and a path, cannot open a process, and so has no
+    /// way to obtain the memory this asks about. A caller that does not itself
+    /// own a process list is free to leave it at `false`, which every default
+    /// here does.
     pub memory: bool,
     /// Consult the trust layer (signature, path, publisher reputation) and let
     /// it discount weak detections.
@@ -120,9 +162,34 @@ pub struct ScanOptions {
     pub archives: bool,
     /// Stop the whole scan at the first malicious verdict.
     pub stop_on_first: bool,
-    /// Per-file wall-clock budget. A file that exceeds it is recorded as
-    /// [`Verdict::Unknown`] rather than silently reported clean.
+    /// Per-file wall-clock budget *for a file of no size at all*.
+    ///
+    /// This is the slack, not the budget: the budget a file is actually held
+    /// to is this plus the time its own size justifies, which is what
+    /// [`ScanOptions::per_file_budget_for`] computes. A file that exceeds that
+    /// is recorded as [`Verdict::Unknown`] rather than silently reported
+    /// clean.
+    ///
+    /// # Why the size is added rather than configured
+    ///
+    /// Because a flat number is the wrong shape for a budget over an operation
+    /// whose cost is proportional to what it is given, and this one had already
+    /// gone wrong in exactly that way: at a flat thirty seconds and a measured
+    /// three megabytes a second, **every file larger than about thirty
+    /// megabytes was permanently `Unknown`** — including a legitimate, signed
+    /// 81.7 MB DLL that the engine scanned correctly and then threw away. A
+    /// file is not slow because it is big. It is slow because something is
+    /// wrong with it, and that is what this budget is for: it fires on a small
+    /// file that took far longer than its size can explain.
     pub per_file_timeout: Option<Duration>,
+}
+
+/// How long a file of `size` bytes is allowed to take beyond the slack.
+///
+/// See [`FLOOR_BYTES_PER_SEC`] for the rate and for the two faults that put it
+/// here.
+fn size_allowance(size: u64) -> Duration {
+    Duration::from_secs(size / FLOOR_BYTES_PER_SEC)
 }
 
 impl Default for ScanOptions {
@@ -144,6 +211,15 @@ impl Default for ScanOptions {
 }
 
 impl ScanOptions {
+    /// The wall-clock budget a file of `size` bytes is held to.
+    ///
+    /// `None` when this configuration sets no budget at all. See
+    /// [`ScanOptions::per_file_timeout`] for why the configured number is a
+    /// slack that the file's own size is added to.
+    pub fn per_file_budget_for(&self, size: u64) -> Option<Duration> {
+        self.per_file_timeout.map(|slack| slack + size_allowance(size))
+    }
+
     /// Fast, low-cost scan for real-time interception: no archives, no
     /// heuristics, tight timeout. Matches what a file-open hook can afford.
     pub fn realtime() -> Self {
@@ -211,8 +287,21 @@ pub struct FileScanReport {
     /// Set when the file could not be scanned. The verdict is then
     /// [`Verdict::Unknown`]; it is never silently reported clean.
     pub error: Option<String>,
-    /// Path of the containing archive, when this entry came from one.
-    pub container: Option<PathBuf>,
+    /// What was found inside this file when it was opened as a container.
+    ///
+    /// `None` means the file was scanned as the single file it is: either it is
+    /// not a container, or archive scanning is off, or the options set
+    /// `archive_depth` to zero. `Some` with `examined == 0` is a different
+    /// statement — the file *is* a container, it was opened, and nothing in it
+    /// was worth reading. A report that could not tell those apart would make
+    /// "we looked inside" and "we never looked" read the same.
+    ///
+    /// Note that a member's findings are detections on *this* report, not
+    /// reports of their own: the report list stays one entry per file on disk,
+    /// which is what every consumer — quarantine, statistics, exit codes —
+    /// already assumes. Where inside the container a finding was is carried by
+    /// [`MatchLocation::container`](crate::MatchLocation::container).
+    pub archive: Option<ArchiveSummary>,
 }
 
 impl FileScanReport {
@@ -235,6 +324,32 @@ pub struct ScanStats {
     pub errors: u64,
     /// Files whose verdict came from cache.
     pub cache_hits: u64,
+    /// Files the engine opened, recognised as data it must not run its own
+    /// rules against, and therefore did not examine.
+    ///
+    /// One counter for both kinds of recognition, and the front end is where
+    /// they are told apart if it can: the console does, by digest against
+    /// shape, because it has the report in hand. A front end that only has the
+    /// totals says what is true of both — which is that they were recognised
+    /// and not examined.
+    pub files_declined: u64,
+    /// The size of those files, as read.
+    ///
+    /// Kept beside [`ScanStats::files_scanned`] rather than inside it: a scan
+    /// reports the bytes it examined, and a rule corpus is a file made of the
+    /// strings its own rules search for, so counting it as examined is the
+    /// error the recognition exists to prevent.
+    pub bytes_declined: u64,
+    /// Rule sources the engine declined *inside* files that it did examine,
+    /// counted in members.
+    ///
+    /// A count and not a size, because a member's length is not a fact about
+    /// the container's — see `av_scan::own::declined_members`, which is where
+    /// the note this is read from is written. Nothing is subtracted from
+    /// [`ScanStats::files_scanned`] or [`ScanStats::bytes_scanned`] for it: the
+    /// container was opened, walked and scanned, and this says that a part of
+    /// it was not.
+    pub declined_members: u64,
 }
 
 impl ScanStats {
@@ -251,6 +366,9 @@ impl ScanStats {
         self.threats_found = self.threats_found.saturating_add(other.threats_found);
         self.errors = self.errors.saturating_add(other.errors);
         self.cache_hits = self.cache_hits.saturating_add(other.cache_hits);
+        self.files_declined = self.files_declined.saturating_add(other.files_declined);
+        self.bytes_declined = self.bytes_declined.saturating_add(other.bytes_declined);
+        self.declined_members = self.declined_members.saturating_add(other.declined_members);
     }
 }
 
@@ -276,6 +394,20 @@ pub struct ScanReport {
     pub detections: Vec<FileScanReport>,
     /// Files that could not be scanned, with the reason.
     pub failures: Vec<(PathBuf, String)>,
+    /// Files the rules matched and trust then cleared, so that they are not in
+    /// [`Self::detections`] and not in [`Self::failures`] either.
+    ///
+    /// The third thing a scan of a whole disk can do to a file, and the one with
+    /// no line of its own until this counter existed: the file is not reported
+    /// (the verdict is `Clean`), it did not fail, and it is not merely quiet —
+    /// rules were run against it and some of them matched. What cleared it is on
+    /// the file's own [`Assessment::remediation_withheld`], which is where a
+    /// reader who wants the rule ids and the reason should go; this is the tally
+    /// a summary needs so that "nothing found" is not said over a run that threw
+    /// matches away.
+    ///
+    /// [`Assessment::remediation_withheld`]: crate::Assessment::remediation_withheld
+    pub cleared: usize,
     /// True when the user or a policy stopped the scan before it finished.
     pub cancelled: bool,
 }
@@ -289,6 +421,7 @@ impl ScanReport {
             stats: ScanStats::default(),
             detections: Vec::new(),
             failures: Vec::new(),
+            cleared: 0,
             cancelled: false,
         }
     }
@@ -370,6 +503,55 @@ mod tests {
     }
 
     #[test]
+    fn a_files_time_budget_grows_with_the_file() {
+        // The fault this is written against: a flat thirty-second budget made
+        // every file above about thirty megabytes permanently `Unknown`. The
+        // one that exposed it was a legitimate 81.7 MB DLL, `libclang.dll`,
+        // which the engine scanned correctly in 27.6 s and then threw away —
+        // and the budget did not even save the time, because it is applied
+        // after the scan rather than interrupting it.
+        let options = ScanOptions::default();
+        let empty = options.per_file_budget_for(0).expect("the default sets one");
+        assert_eq!(empty, Duration::from_secs(30), "the slack is the whole budget for nothing");
+
+        let libclang = options
+            .per_file_budget_for(81_704_960)
+            .expect("the default sets one");
+        assert!(
+            libclang > Duration::from_secs(60),
+            "{libclang:?} is not enough for a file that takes 27.6 s to scan"
+        );
+
+        // Monotone, so a bigger file is never held to a tighter budget.
+        let capped = options
+            .per_file_budget_for(256 * 1024 * 1024)
+            .expect("the default sets one");
+        assert!(capped > libclang, "{capped:?} vs {libclang:?}");
+    }
+
+    #[test]
+    fn a_file_is_held_to_a_budget_its_size_can_explain() {
+        // What the budget is *for*: a small file that took far longer than its
+        // size can account for is the pathological case, and it still fires.
+        // Ten megabytes is ten seconds of allowance, so a ten-megabyte file
+        // that took a minute is over — which the flat budget caught too, and
+        // this must not have lost.
+        let options = ScanOptions::default();
+        let small = options.per_file_budget_for(10 * 1024 * 1024).expect("set");
+        assert!(small < Duration::from_secs(60), "{small:?}");
+        assert!(small > Duration::from_secs(30), "{small:?}");
+    }
+
+    #[test]
+    fn a_configuration_with_no_budget_still_has_none() {
+        // The size allowance is added to a budget that exists; it does not
+        // invent one. `--deep` sets no budget on purpose.
+        let options = ScanOptions::deep();
+        assert_eq!(options.per_file_budget_for(0), None);
+        assert_eq!(options.per_file_budget_for(512 * 1024 * 1024), None);
+    }
+
+    #[test]
     fn worst_verdict_picks_malicious_over_suspicious() {
         let mut report = ScanReport::new(ScanTarget::FullSystem);
         let mut a = Assessment::clean();
@@ -384,7 +566,7 @@ mod tests {
             scanned_bytes: 0,
             from_cache: false,
             error: None,
-            container: None,
+            archive: None,
         });
         let mut b = Assessment::clean();
         b.verdict = Verdict::Malicious;
@@ -398,7 +580,7 @@ mod tests {
             scanned_bytes: 0,
             from_cache: false,
             error: None,
-            container: None,
+            archive: None,
         });
         assert_eq!(report.worst_verdict(), Verdict::Malicious);
     }
@@ -418,10 +600,33 @@ mod tests {
             threats_found: 4,
             errors: 5,
             cache_hits: 6,
+            ..ScanStats::default()
         };
         a.merge(&a.clone());
         assert_eq!(a.files_scanned, 2);
         assert_eq!(a.cache_hits, 12);
+    }
+
+    #[test]
+    fn the_declined_counters_are_folded_in_with_the_rest() {
+        // The three counters a merge can silently drop, because a scan of a
+        // tree is walked by several workers and each of them can decline a file:
+        // a merge that carried the examined totals and not these would report a
+        // run as having examined a rule corpus, which is the one claim this
+        // product's own accounting is built not to make.
+        let mut a = ScanStats {
+            files_declined: 1,
+            bytes_declined: 2,
+            declined_members: 3,
+            ..ScanStats::default()
+        };
+        a.merge(&a.clone());
+        assert_eq!(a.files_declined, 2);
+        assert_eq!(a.bytes_declined, 4);
+        assert_eq!(a.declined_members, 6);
+        // And the examined totals are untouched by them.
+        assert_eq!(a.files_scanned, 0);
+        assert_eq!(a.bytes_scanned, 0);
     }
 
     #[test]

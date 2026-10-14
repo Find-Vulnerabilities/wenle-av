@@ -53,17 +53,24 @@
 
 pub mod ast;
 pub mod atoms;
+pub mod calibrate;
 pub mod compiler;
+pub mod content;
 pub mod database;
+pub mod family;
 pub mod hex;
 pub mod lexer;
 pub mod matcher;
 pub mod matches;
 pub mod parser;
 pub mod prefilter;
+#[cfg(feature = "memory-probe")]
+pub mod probe;
 pub mod program;
 pub mod ruleset;
 pub mod scanner;
+pub mod source;
+pub mod sweep;
 pub mod vm;
 
 pub use ast::{

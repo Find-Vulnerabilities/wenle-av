@@ -42,6 +42,7 @@
 use crate::database::{CompiledRule, RuleDatabase};
 use crate::matches::MatchSet;
 use crate::prefilter::StringState;
+use crate::sweep::{LiteralSweep, SweepHits};
 use crate::vm::{Input, Vm};
 
 /// What a rule's match means, which is not always "a detection".
@@ -115,6 +116,22 @@ pub struct ScanOutcome {
     /// difference between a scan measured in milliseconds and one measured in
     /// seconds.
     pub strings_localized: usize,
+    /// Strings answered by the literal sweep instead of a search of their own.
+    ///
+    /// Every literal form in the rule set goes into one automaton, and one pass
+    /// over the buffer finds the occurrences of all of them. A string the
+    /// automaton carries is decided by that pass, so it costs the buffer once
+    /// for the whole rule set rather than once per string — which is the
+    /// difference between a scan that is linear in the file and one that is
+    /// linear in the file times the rule set.
+    ///
+    /// These are deliberately *not* in `strings_searched`. That counter is the
+    /// multiplier in the cost model the bench reports — `strings × size` — and
+    /// keeping swept strings in it would leave the arithmetic reading as if the
+    /// work had still been done. A string counted here was not searched for, and
+    /// not refuted either: it was found, or proved absent, by the pass that had
+    /// already happened.
+    pub strings_swept: usize,
     /// Strings whose matcher gave up before finishing its search.
     ///
     /// A hex pattern with enough jumps that the number of ways it can align
@@ -161,6 +178,15 @@ pub struct Scanner<'a> {
     /// Where the prefilter says the current string's matches could be. Reused
     /// across strings, and empty whenever the search is done the ordinary way.
     witnesses: Vec<u32>,
+    /// The literal automatons, and this thread's rows of what they found.
+    ///
+    /// The automatons belong to the database and are shared; the rows are this
+    /// scanner's, and they are what a scan writes.
+    sweep: &'a LiteralSweep,
+    hit_rows: SweepHits,
+    /// Search for every string one at a time, the way the engine did before the
+    /// sweep existed. See [`Scanner::without_sweep`].
+    no_sweep: bool,
     /// Resolved once, because the prefilter must not be allowed to filter a
     /// global rule and asking "which rules are global" per scan would be a
     /// linear pass over the rule set per file.
@@ -176,6 +202,9 @@ impl<'a> Scanner<'a> {
             candidates: Vec::new(),
             working: MatchSet::default(),
             witnesses: Vec::new(),
+            sweep: database.sweep(),
+            hit_rows: database.sweep().hits(),
+            no_sweep: false,
             globals: database
                 .rules()
                 .iter()
@@ -213,6 +242,27 @@ impl<'a> Scanner<'a> {
         }
     }
 
+    /// A scanner that searches for every string one at a time, as the engine
+    /// did before the literal automaton existed.
+    ///
+    /// The sweep replaces a search per string with one pass over the buffer, and
+    /// it is an optimization of exactly the kind that can lose a detection: an
+    /// overlapping occurrence the automaton failed to report, a `fullword` hit
+    /// accepted through a word character, a row that still holds the previous
+    /// file's offsets. Each of those arguments is sound as written, and a
+    /// soundness argument is only as good as its premises.
+    ///
+    /// So the per-string path is kept, and the differential test in this file
+    /// runs both over the same binaries and compares every reported rule and
+    /// every offset. It is slower by the amount the sweep saves, which is what
+    /// makes it a test rather than a mode.
+    pub fn without_sweep(database: &'a RuleDatabase) -> Self {
+        Self {
+            no_sweep: true,
+            ..Self::new(database)
+        }
+    }
+
     pub fn database(&self) -> &'a RuleDatabase {
         self.database
     }
@@ -231,7 +281,37 @@ impl<'a> Scanner<'a> {
     /// Scan one buffer with a known entry point, for `entrypoint` in a
     /// condition.
     pub fn scan_with(&mut self, data: &[u8], input: &Input<'_>) -> ScanOutcome {
+        // One verdict per corpus rule, refusals included: these are the slots
+        // `Op::RuleRef` indexes, so a rule written in terms of another rule
+        // reads what this scan recorded for it. Sized from the database rather
+        // than from the number of rules that will be tried, because the two
+        // differ by every refused rule and it is the corpus position that a
+        // reference carries.
+        self.vm.begin_scan(self.database.result_len());
+        self.scan_rules(data, input)
+    }
+
+    /// The scan itself, over a `vm` whose result slots are already sized.
+    fn scan_rules(&mut self, data: &[u8], input: &Input<'_>) -> ScanOutcome {
         let mut outcome = ScanOutcome::default();
+
+        // One pass over the buffer against every literal form in the rule set,
+        // before any rule is looked at.
+        //
+        // Here rather than per rule because the pass is the same whatever is
+        // being searched for: its cost is the buffer, and its result is the
+        // occurrences of every string in the rule set. Before the global rules
+        // rather than after them, because a gate's strings are searched for like
+        // any other rule's.
+        //
+        // It runs for the unfiltered scanner too, even though that one exists to
+        // be an honest baseline. What `unfiltered` removes is the prefilter's
+        // *selection*, and running both scanners with the sweep is what keeps
+        // that comparison about one thing: a sweep mistake present on both sides
+        // is invisible there and is what `without_sweep` is for.
+        if !self.no_sweep {
+            self.sweep.run(data, &mut self.hit_rows);
+        }
 
         // Global rules first, and not through the prefilter's selection: a
         // global rule the prefilter skipped would leave the gate open. They are
@@ -242,7 +322,7 @@ impl<'a> Scanner<'a> {
         for index in 0..self.globals.len() {
             let rule = self.globals[index];
             outcome.candidates += 1;
-            if !self.evaluate(rule, data, input, &mut outcome) {
+            if !self.evaluate_recording(rule, data, input, &mut outcome) {
                 outcome.global_gate_failed = true;
                 return outcome;
             }
@@ -257,7 +337,7 @@ impl<'a> Scanner<'a> {
                 if self.database.rule(rule).is_some_and(|r| r.global) {
                     continue;
                 }
-                let _matched = self.evaluate(rule, data, input, &mut outcome);
+                let _matched = self.evaluate_recording(rule, data, input, &mut outcome);
             }
             return outcome;
         }
@@ -277,10 +357,32 @@ impl<'a> Scanner<'a> {
             }
             // Whether it matched, and the match itself, are recorded by
             // `evaluate`; the caller has nothing left to decide.
-            let _matched = self.evaluate(rule, data, input, &mut outcome);
+            let _matched = self.evaluate_recording(rule, data, input, &mut outcome);
         }
 
         outcome
+    }
+
+    /// Evaluate one rule, and leave its verdict where a rule that reads it will
+    /// find it.
+    ///
+    /// The write happens after the machine has run, never before: a rule that
+    /// read its own slot mid-evaluation would be reading a default rather than a
+    /// verdict. The corpus refuses a rule that reads itself, so this is not the
+    /// rule that catches that — it is what makes the array's contents a function
+    /// of the rule set alone, whatever order the candidates arrive in.
+    fn evaluate_recording(
+        &mut self,
+        rule_index: u32,
+        data: &[u8],
+        input: &Input<'_>,
+        outcome: &mut ScanOutcome,
+    ) -> bool {
+        let matched = self.evaluate(rule_index, data, input, outcome);
+        if let Some(rule) = self.database.rule(rule_index) {
+            self.vm.record(rule.corpus_index, matched);
+        }
+        matched
     }
 
     /// Match a rule's strings and run its condition. Returns whether it held.
@@ -371,12 +473,12 @@ impl<'a> Scanner<'a> {
 
     /// Search for one of a rule's strings, and say whether it is there.
     ///
-    /// Three things can make a string absent without a search: the atoms can
-    /// refute it, or the matcher can refuse it, and both mean the condition
-    /// will see it as never matching. Only the third — a search that runs and
-    /// finds nothing — costs anything, and the return value does not
-    /// distinguish between them, because the caller is asking one question:
-    /// can the condition see this string at all.
+    /// Four things can settle a string. The sweep can hand over what its
+    /// automaton found, the atoms can refute it, or the matcher can refuse it —
+    /// and none of those three costs a search. Only the fourth, a search that
+    /// runs, costs anything, and the return value does not distinguish between
+    /// them, because the caller is asking one question: can the condition see
+    /// this string at all.
     ///
     /// The counters do distinguish them, so that a scan can be read back and
     /// the work attributed.
@@ -423,6 +525,26 @@ impl<'a> Scanner<'a> {
             // honest reading.
             return false;
         };
+
+        // The automaton pass has already looked for every literal form this
+        // string can take, so its occurrences are known without going over the
+        // buffer again. `None` means the sweep does not answer this string — a
+        // hex pattern, a regex, one the matcher refused — and the search below
+        // is what it gets.
+        //
+        // Asked after the prefilter's verdict rather than before it: a string
+        // the atoms refuted has nothing to find, so moving it out of
+        // `strings_refuted` and into `strings_swept` would cost that counter its
+        // meaning — "the prefilter proved these absent" — to save nothing.
+        if !self.no_sweep {
+            if let Some(found) = self.sweep.matches(&self.hit_rows, rule_index, slot) {
+                for m in found {
+                    self.working.push(slot, *m);
+                }
+                outcome.strings_swept += 1;
+                return !found.is_empty();
+            }
+        }
 
         outcome.strings_searched += 1;
         // If the automaton saw every occurrence of this string's atom, they say
@@ -473,6 +595,21 @@ mod tests {
         (outcome, db)
     }
 
+    /// The same scan with the literal sweep switched off.
+    ///
+    /// For the tests that are about the per-string path the sweep stands in for:
+    /// the witness offsets, and the counters that say how a string was found. A
+    /// literal string never reaches the matcher on an ordinary scanner — the
+    /// sweep answers it from the pass it already made — so a test of the matcher
+    /// has to ask for the scanner that still calls it.
+    fn scan_without_sweep(source: &str, data: &[u8]) -> (ScanOutcome, RuleDatabase) {
+        let (db, report) = RuleDatabase::compile(source);
+        assert_eq!(report.refused(), 0, "refusals: {:?}", report.refusals);
+        let mut scanner = Scanner::without_sweep(&db);
+        let outcome = scanner.scan(data);
+        (outcome, db)
+    }
+
     /// The names of the rules that *detected*, in order, for a readable
     /// assertion. Gates and helpers are deliberately left out: they are not
     /// findings, and a helper that collected them would let a test pass while
@@ -496,7 +633,10 @@ rule needle {
 
     #[test]
     fn a_rule_matches_when_its_string_is_present() {
-        assert_eq!(matched(NEEDLE, b"prefix this is a needle suffix"), ["needle"]);
+        assert_eq!(
+            matched(NEEDLE, b"prefix this is a needle suffix"),
+            ["needle"]
+        );
         assert!(matched(NEEDLE, b"nothing of interest here").is_empty());
     }
 
@@ -523,9 +663,18 @@ rule two {
 }
 "#;
         let (outcome, _) = scan(source, b"has aaaaaaaaaaaa but not the others");
-        assert_eq!(outcome.candidates, 1, "selected on $a, the one string it needs");
-        assert_eq!(outcome.strings_searched, 1, "$a searched, $b and $c skipped");
-        assert_eq!(outcome.strings_refuted, 2);
+        assert_eq!(
+            outcome.candidates, 1,
+            "selected on $a, the one string it needs"
+        );
+        // `$a` is a literal, so the sweep answers it from the pass it already
+        // made and no search runs for it either. What this test is about is the
+        // two strings that were never looked for at all, and they are still
+        // refuted rather than swept: a string the atoms proved absent is settled
+        // before the sweep is consulted.
+        assert_eq!(outcome.strings_searched, 0);
+        assert_eq!(outcome.strings_swept, 1, "$a, from the automaton");
+        assert_eq!(outcome.strings_refuted, 2, "$b and $c, never looked for");
         assert!(outcome.matches.is_empty(), "neither $b nor $c is present");
     }
 
@@ -543,6 +692,11 @@ rule two {
     /// distinct from the padding, so the test does not depend on which window
     /// the atom chooser picks: whichever it is, it occurs exactly once in the
     /// first buffer and twice in the second.
+    ///
+    /// Run without the sweep, because the sweep answers this string from the
+    /// pass it already made and the witness path would never be reached. What is
+    /// under test is the path a string takes when the automaton cannot carry it
+    /// — which is every hex pattern and every regex at least.
     #[test]
     fn a_string_whose_atom_occurrences_are_known_is_located_rather_than_searched() {
         let source = r#"
@@ -554,7 +708,7 @@ rule located {
 }
 "#;
         let once = b"padding zzqqxxjjvv padding";
-        let (outcome, _) = scan(source, once);
+        let (outcome, _) = scan_without_sweep(source, once);
         assert_eq!(outcome.strings_localized, 1, "the witness must be used");
         assert_eq!(outcome.strings_searched, 1);
         assert_eq!(outcome.matches.len(), 1);
@@ -566,12 +720,16 @@ rule located {
         // at the right offsets. This half is what makes the test about
         // equivalence rather than just about the fast path being taken.
         let twice = b"padding zzqqxxjjvv padding padding zzqqxxjjvv padding";
-        let (outcome, _) = scan(source, twice);
+        let (outcome, _) = scan_without_sweep(source, twice);
         assert_eq!(outcome.strings_localized, 1, "two occurrences, both known");
         assert_eq!(outcome.strings_searched, 1);
         assert_eq!(outcome.matches.len(), 1);
         let found = outcome.matches[0].strings.first(0).unwrap();
-        assert_eq!((found.offset, found.length), (8, 10), "the first of the two");
+        assert_eq!(
+            (found.offset, found.length),
+            (8, 10),
+            "the first of the two"
+        );
         assert_eq!(outcome.matches[0].strings.count(0), 2, "both were found");
 
         // More occurrences than the prefilter keeps offsets for. The list it
@@ -583,7 +741,7 @@ rule located {
         for _ in 0..occurrences {
             too_many.extend_from_slice(b"zzqqxxjjvv padding ");
         }
-        let (outcome, _) = scan(source, &too_many);
+        let (outcome, _) = scan_without_sweep(source, &too_many);
         assert_eq!(
             outcome.strings_localized, 0,
             "an incomplete list of offsets is not usable"
@@ -640,8 +798,14 @@ rule located {
             !data.windows(LITERAL.len()).any(|w| w == LITERAL),
             "the string must not be in the buffer, or this tests nothing"
         );
-        let (outcome, _) = scan(source, &data);
-        assert_eq!(outcome.strings_searched, 1, "the atom is there, so it is searched");
+        // Without the sweep, for the reason the test above gives: the sweep
+        // would answer this string from its own pass and the witness path — the
+        // one that has to reject an atom's coincidence — would never run.
+        let (outcome, _) = scan_without_sweep(source, &data);
+        assert_eq!(
+            outcome.strings_searched, 1,
+            "the atom is there, so it is searched"
+        );
         assert_eq!(
             outcome.strings_localized, 1,
             "and located, because its atom occurs once"
@@ -710,7 +874,10 @@ rule either {
         assert_eq!(db.prefilter().stats().conjunctive_rules, 0);
         assert_eq!(outcome.candidates, 1);
         assert_eq!(outcome.evaluated, 1);
-        assert_eq!(matched(source, b"first marker here and nothing else"), ["either"]);
+        assert_eq!(
+            matched(source, b"first marker here and nothing else"),
+            ["either"]
+        );
     }
 
     /// A rule selected by one string whose other strings are all absent must
@@ -733,7 +900,10 @@ rule both {
         let (outcome, _) = scan(source, b"first marker here and nothing else");
         assert_eq!(outcome.candidates, 1, "selected on $a");
         assert_eq!(outcome.evaluated, 1, "and evaluated");
-        assert!(outcome.matches.is_empty(), "but $a occurs once, not six times");
+        assert!(
+            outcome.matches.is_empty(),
+            "but $a occurs once, not six times"
+        );
     }
 
     // -- string semantics through the scanner ---------------------------------
@@ -1059,7 +1229,14 @@ rule four {
 "#;
         let (outcome, _) = scan(source, b"only cccccccccccc is here");
         assert_eq!(outcome.candidates, 1);
-        assert_eq!(outcome.strings_searched, 1, "only the string that is present");
+        // The one string that is present is answered by the sweep rather than
+        // searched for — it is a literal, so the pass the scan had already made
+        // found it — and the three that are not never reach either path. So the
+        // four strings of this rule cost one automaton pass and no search at
+        // all, which is more avoided work than the count used to report rather
+        // than less.
+        assert_eq!(outcome.strings_searched, 0);
+        assert_eq!(outcome.strings_swept, 1, "only the string that is present");
         assert_eq!(outcome.strings_refuted, 3);
         assert_eq!(outcome.evaluated, 1);
         assert_eq!(outcome.matches.len(), 1);
@@ -1087,5 +1264,297 @@ rule rare {
         let (outcome, _) = scan(NEEDLE, b"");
         assert!(outcome.matches.is_empty());
         assert!(!outcome.detected());
+    }
+}
+
+/// The real-file check for the literal sweep: two scanners, one answer.
+///
+/// [`Scanner::without_sweep`] is the engine as it was before the sweep existed,
+/// so it is the honest baseline the sweep is measured against — not for speed,
+/// which is the whole point of the sweep, but for whether it changes anything.
+/// An optimization of this kind fails by losing a match: an overlapping
+/// occurrence the automaton did not report, a `fullword` hit accepted through a
+/// word character, a row left holding the previous file's offsets. Each of those
+/// is argued away in `sweep.rs`, and an argument is only as good as its
+/// premises, so the conclusion is checked against real binaries instead.
+///
+/// Rule set and files both matter here. The sweep is only exercised by binaries
+/// that contain the literals the rules are about, and a clean system binary
+/// matches almost nothing — so the rule set's own source is scanned as well. It
+/// contains the literal of every rule in it, most rules therefore find
+/// themselves, and the run compares thousands of non-empty answers rather than
+/// five empty ones.
+///
+/// ```text
+/// cargo test -p av-rules -- --ignored --nocapture
+/// ```
+///
+/// `MRT.exe` is not in the list. It is 231 MB, and the scanner this test has to
+/// run beside the sweep costs a search over the whole buffer for every string
+/// the prefilter does not refute: measured at roughly 2 GB/s of memory traffic,
+/// that is minutes for this one file, on top of the sweep pass that exists to
+/// avoid exactly it. The four files below are the same test at a size that
+/// finishes.
+#[cfg(test)]
+mod real_files {
+    use super::*;
+    use std::path::Path;
+    use std::time::Instant;
+
+    /// The rule set the engine ships.
+    ///
+    /// Read from the repository rather than from a build artefact, because what
+    /// this test is checking is the sweep over the rule set that will be loaded
+    /// in production, and a fixture small enough to be a constant would put a
+    /// few hundred literals in the automaton instead of sixty-five thousand.
+    const RULESET: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../rules/converted/yara-forge-extended-0.9.1.yar"
+    );
+
+    /// System binaries to compare on, in ascending order of size.
+    const BINARIES: &[&str] = &["notepad.exe", "kernel32.dll", "ntdll.dll", "shell32.dll"];
+
+    /// How much of the rule set's own source to scan, and where.
+    ///
+    /// A rule set is alphabetically ordered, so a slice of it is a coherent
+    /// family of rules rather than a random sample, and two slices a rule set
+    /// apart cover two families. The second is taken from the middle for that
+    /// reason.
+    const SLICE: usize = 1 << 20;
+
+    /// One reported match, reduced to what must be identical between two scans.
+    ///
+    /// The rule and its role, then every string's occurrences as
+    /// `(offset, length)` in slot order. The offsets are in there because `at`,
+    /// `in`, `#a` and `@a[i]` are computed from them: a sweep that reported a
+    /// string at the wrong offset, or one occurrence too few, would keep the
+    /// verdict of most rules and change what they mean.
+    type Finding = (u32, MatchRole, Vec<Vec<(u32, u32)>>);
+
+    fn findings(outcome: &ScanOutcome) -> Vec<Finding> {
+        let mut out: Vec<Finding> = outcome
+            .matches
+            .iter()
+            .map(|m| {
+                let slots = (0..m.strings.string_count() as u32)
+                    .map(|slot| {
+                        m.strings
+                            .matches(slot)
+                            .iter()
+                            .map(|found| (found.offset, found.length))
+                            .collect()
+                    })
+                    .collect();
+                (m.rule, m.role, slots)
+            })
+            .collect();
+        // Sorted, because the two scans visit rules in different orders — the
+        // swept one in whatever order its sweep answered them — and the
+        // comparison is about the set, not the sequence.
+        out.sort_by_key(|(rule, ..)| *rule);
+        out
+    }
+
+    #[test]
+    #[ignore = "reads the shipped rule set and the system binaries"]
+    fn the_sweep_changes_no_verdict_on_a_real_binary() {
+        // Compiling this rule set recurses over a deep expression tree, so it
+        // gets the same bounded stack every other tool in this crate uses.
+        let handle = std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(compare_over_real_inputs)
+            .expect("spawning the worker thread");
+        handle.join().expect("the comparison must not panic");
+    }
+
+    fn compare_over_real_inputs() {
+        let source =
+            std::fs::read_to_string(RULESET).expect("the shipped rule set must be readable");
+        let started = Instant::now();
+        let (database, report) = RuleDatabase::compile(&source);
+        println!(
+            "{} rules compiled from {} seen ({} refused) in {:?}",
+            database.len(),
+            report.rules_seen,
+            report.refused(),
+            started.elapsed()
+        );
+        assert_eq!(
+            report.refused(),
+            0,
+            "the shipped rule set must compile whole"
+        );
+
+        let stats = database.sweep().stats();
+        println!(
+            "sweep: {} strings answered of {} slots in {} rules, {} literals ({} case-insensitive)",
+            stats.strings,
+            database.stats().strings,
+            stats.rules,
+            stats.literals,
+            stats.case_insensitive_literals
+        );
+
+        let mut swept = Scanner::new(&database);
+        let mut plain = Scanner::without_sweep(&database);
+        let mut compared = 0usize;
+        let mut matched = 0usize;
+
+        let root = std::env::var_os("SystemRoot").expect("a Windows installation");
+        let mut inputs: Vec<(String, Vec<u8>)> = Vec::new();
+        for name in BINARIES {
+            let path = Path::new(&root).join("System32").join(name);
+            match std::fs::read(&path) {
+                Ok(data) => inputs.push(((*name).to_string(), data)),
+                Err(_) => println!("  {name:<22} unreadable, skipped"),
+            }
+        }
+        inputs.extend(source_slices(&source));
+
+        for (name, data) in &inputs {
+            matched += compare(&database, &mut swept, &mut plain, name, data);
+            compared += 1;
+        }
+
+        assert!(
+            compared > 0,
+            "no input was readable, so nothing was compared"
+        );
+        // Two empty results agreeing proves nothing, and on a clean machine the
+        // system binaries are the empty half — which is why the rule set's own
+        // source is in the list.
+        assert!(
+            matched > 0,
+            "{compared} inputs compared, and nothing matched in any of them"
+        );
+        println!("\n{compared} inputs agreed on {matched} reported matches");
+    }
+
+    /// Scan one buffer both ways, check them, and say how many matches agreed.
+    ///
+    /// The panic carries only the file name: the two sets are thousands of
+    /// offsets each, and a failed `assert_eq!` on them would bury the one line
+    /// that says which rule differs. `describe` prints that first.
+    fn compare(
+        database: &RuleDatabase,
+        swept: &mut Scanner<'_>,
+        plain: &mut Scanner<'_>,
+        name: &str,
+        data: &[u8],
+    ) -> usize {
+        let started = Instant::now();
+        let fast = swept.scan(data);
+        let swept_time = started.elapsed();
+        let started = Instant::now();
+        let slow = plain.scan(data);
+        let plain_time = started.elapsed();
+
+        let ours = findings(&fast);
+        let theirs = findings(&slow);
+        println!(
+            "  {name:<22} {:>9} bytes  sweep {swept_time:?}, without it {plain_time:?} ({:.1}x)  \
+             {} matches, {} swept, {} searched",
+            data.len(),
+            plain_time.as_secs_f64() / swept_time.as_secs_f64().max(f64::MIN_POSITIVE),
+            ours.len(),
+            fast.strings_swept,
+            fast.strings_searched
+        );
+
+        // Not equality on its own. The two scans have to have run the thing they
+        // are supposed to: a baseline that quietly used the sweep would agree
+        // with the swept scan by construction, and a matcher that gave up early
+        // would make both answers incomplete in the same way only by luck.
+        assert_eq!(
+            slow.strings_swept, 0,
+            "{name}: the baseline used the sweep, so this compared nothing"
+        );
+        for (which, outcome) in [("the swept scan", &fast), ("the baseline", &slow)] {
+            assert_eq!(
+                outcome.matcher_failures, 0,
+                "{name}: a matcher gave up early on {which}, so its answers are incomplete"
+            );
+            assert_eq!(
+                outcome.vm_failures, 0,
+                "{name}: a rule could not be evaluated by {which}"
+            );
+        }
+
+        if ours != theirs {
+            describe(database, &ours, &theirs);
+            panic!("{name}: the sweep changed the result — the differences are above");
+        }
+        ours.len()
+    }
+
+    /// Which rule differs, and in which direction.
+    ///
+    /// Printing both sets whole buries the answer in thousands of offsets. What
+    /// a person needs is which rule, and whether the swept scan lost a match or
+    /// invented one.
+    fn describe(database: &RuleDatabase, ours: &[Finding], theirs: &[Finding]) {
+        for (rule, role, slots) in theirs {
+            match ours.iter().find(|(r, ..)| r == rule) {
+                None => println!(
+                    "    MISSED   {} ({role:?}) — the baseline matched it",
+                    rule_name(database, *rule)
+                ),
+                Some((_, _, mine)) if mine != slots => {
+                    println!(
+                        "    DIFFER   {} — same rule, different offsets",
+                        rule_name(database, *rule)
+                    );
+                    for slot in 0..mine.len().max(slots.len()) {
+                        let mine = mine.get(slot).cloned().unwrap_or_default();
+                        let theirs = slots.get(slot).cloned().unwrap_or_default();
+                        if mine != theirs {
+                            println!("      slot {slot}: swept {mine:?}, baseline {theirs:?}");
+                        }
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+        for (rule, role, slots) in ours {
+            if !theirs.iter().any(|(r, ..)| r == rule) {
+                println!(
+                    "    EXTRA    {} ({role:?}) — only the swept scan matched it, with {slots:?}",
+                    rule_name(database, *rule)
+                );
+            }
+        }
+    }
+
+    fn rule_name(database: &RuleDatabase, rule: u32) -> String {
+        database
+            .rule(rule)
+            .map_or_else(|| format!("#{rule}"), |r| r.name.clone())
+    }
+
+    /// Two slices of the rule set's source, as buffers to scan.
+    ///
+    /// The whole file would be the better input and is too slow to search
+    /// without the sweep, so it is taken in pieces from two places. Cut on a
+    /// line boundary, so the buffer is text rather than half a literal: a torn
+    /// string at the seam is noise, not a test.
+    fn source_slices(source: &str) -> Vec<(String, Vec<u8>)> {
+        let bytes = source.as_bytes();
+        let mut out = Vec::new();
+        for (name, start) in [
+            ("rules (first MiB)", 0usize),
+            ("rules (middle MiB)", bytes.len() / 2),
+        ] {
+            let start = start.min(bytes.len());
+            let end = (start + SLICE).min(bytes.len());
+            let end = match bytes[end..].iter().position(|b| *b == b'\n') {
+                Some(offset) if end + offset < bytes.len() => end + offset,
+                _ => end,
+            };
+            if end > start {
+                out.push((name.to_string(), bytes[start..end].to_vec()));
+            }
+        }
+        out
     }
 }

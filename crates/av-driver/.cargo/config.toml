@@ -1,0 +1,43 @@
+# Build flags for the kernel driver only.
+#
+# Note on scope: cargo reads every `.cargo/config.toml` from the working
+# directory *upwards*, so this file and the workspace root's both apply here.
+# That is why `rustflags` below is under `[target.<triple>]` rather than under
+# `[build]`: those two keys are mutually exclusive and `target.<triple>` wins,
+# so a flag written under `[build]` here would be silently ignored in favour of
+# the root file's. Same key in both files means the arrays are joined, and the
+# result is the same flag twice, which is idempotent.
+[build]
+target = "x86_64-pc-windows-msvc"
+
+# Required by `wdk-build`, which refuses to configure a driver without it. A
+# driver links against no CRT: the kernel is the runtime, and a dynamically
+# linked CRT would be a user-mode DLL loaded at `DISPATCH_LEVEL`.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[unstable]
+# Rebuild the sysroot for the kernel. A driver links against no `std`, so `core`
+# and `alloc` have to be compiled here, from `rust-src`. `std` is deliberately
+# absent: a driver that linked `std` would pull in a user-mode runtime that is
+# not there.
+build-std = ["core", "alloc"]
+
+# There is deliberately no `build-std-features` line here. Naming
+# `compiler-builtins-mem` looks like the obvious way to keep the libm math that
+# wants `fma` out of the sysroot, and it was tried: the crate that failed to link
+# afterwards was bit-for-bit the same failure. `compiler-builtins/src/lib.rs`
+# declares `pub mod math;` unconditionally, so no feature set removes it. The
+# lever that works is `opt-level`, and `Cargo.toml` and `build.rs` say why.
+
+[env]
+# `wdk-sys` generates its bindings with `bindgen`, and `bindgen` 0.71 does not
+# understand a `libclang` as new as the LLVM 22 that is installed on this
+# machine: it emits every kernel structure as an opaque `{ _address: u8 }` and
+# then asserts their real sizes, which does not compile. The version the WDK
+# bindings are written against is LLVM 17.
+#
+# So the driver vendors one, inside its own directory, rather than requiring a
+# machine-wide downgrade of a tool other projects may be using. `README` in
+# `.libclang/` has the one command that puts it there.
+LIBCLANG_PATH = { value = ".libclang/17", relative = true }

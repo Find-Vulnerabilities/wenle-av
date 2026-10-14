@@ -1,11 +1,59 @@
 [workspace]
 resolver = "2"
-members = ["crates/av-core", "crates/av-rules"]
+members = [
+    "crates/av-core",
+    "crates/av-fs",
+    "crates/av-patterns",
+    "crates/av-rules",
+    "crates/av-pe",
+    "crates/av-signatures",
+    "crates/av-authenticode",
+    "crates/av-archive",
+    "crates/av-scan",
+    "crates/av-quarantine",
+    "crates/av-cli",
+    "crates/av-memory",
+    "crates/av-realtime",
+    "crates/av-sandbox",
+    "crates/av-gui",
+    "crates/av-driver-proto",
+    "crates/av-ipc",
+    "crates/av-service",
+    "crates/av-guard",
+    "crates/av-integration",
+    "crates/av-amsi",
+]
 
 # The kernel driver lives in its own workspace (see crates/av-driver) because it
 # requires the WDK, a nightly toolchain and `-Z build-std`. Keeping it out of the
 # default member set means `cargo build` never tries to compile it.
-default-members = ["crates/av-core", "crates/av-rules"]
+#
+# `av-driver-proto` is a normal member, and that is the point of it: the
+# protocol, the decision state machine and the path logic are ordinary logic
+# that needs no kernel, so they live in a crate whose tests run here on stable
+# Rust. Only the KMDF shell is left in the excluded workspace. See
+# `crates/av-driver-proto/src/lib.rs`.
+default-members = [
+    "crates/av-core",
+    "crates/av-fs",
+    "crates/av-rules",
+    "crates/av-pe",
+    "crates/av-signatures",
+    "crates/av-authenticode",
+    "crates/av-archive",
+    "crates/av-scan",
+    "crates/av-quarantine",
+    "crates/av-cli",
+    "crates/av-memory",
+    "crates/av-realtime",
+    "crates/av-sandbox",
+    "crates/av-gui",
+    "crates/av-ipc",
+    "crates/av-service",
+    "crates/av-guard",
+    "crates/av-integration",
+    "crates/av-amsi",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -45,8 +93,31 @@ regex-syntax = "0.8"
 # the multi-pattern automaton has.
 memchr = "2"
 
+# --- compression --------------------------------------------------------------
+# The one place this workspace takes a third-party decoder for a hostile input.
+#
+# Writing DEFLATE by hand was considered and rejected. The decoder would be
+# several hundred lines of bit-twiddling over bytes chosen by whoever wrote the
+# archive, exercised by every zip a user opens, and reachable before any rule
+# has judged the file — which makes it the single largest attack surface in the
+# product, and one whose bugs would be ours alone. `miniz_oxide` is pure Rust,
+# has no `unsafe` in its decoding path, and is the backend of the `flate2` build
+# selected below.
+#
+# `default-features = false` with `rust_backend` is spelled out rather than left
+# implied: the default feature set is exactly this today, and a future `flate2`
+# release that changed its default to a C zlib would otherwise add a C
+# dependency, and a C attack surface, without a line changing here.
+#
+# What the rule engine does *not* do is delegate: rules, matching and scoring
+# are this workspace's own, and nothing in this list touches them.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
 # --- binary parsing -----------------------------------------------------------
-pelite = "0.10"
+# `pelite` was the obvious candidate and is deliberately not used: see the
+# `av-pe` crate documentation for why the parser is written here instead. Left
+# out of this list rather than left unused in it, so that nothing can start
+# depending on it by accident.
 
 # --- concurrency --------------------------------------------------------------
 rayon = "1"
@@ -66,6 +137,36 @@ dirs = "6"
 log = "0.4"
 env_logger = "0.11"
 
+# --- interface ------------------------------------------------------------------
+# Argument parsing for the command-line tools and the service's control pipe. The
+# derive macros are what make a subcommand's help text and its parser the same
+# declaration, so the two cannot drift.
+clap = { version = "4", features = ["derive", "wrap_help"] }
+# Progress and table drawing for the console front end. A dependency and not a
+# hand-rolled escape-code writer, because getting cursor handling wrong on a
+# redirected stream produces garbage in a log file rather than on a screen.
+console = "0.15"
+
+# The graphical front end. `egui` is immediate-mode, which is the right shape for
+# this application: the interface is a view of a scan that is already running and
+# updates as it reports, and a retained widget tree would mean mirroring every
+# engine event into it and keeping the two in step.
+#
+# Pinned to 0.31 rather than the newest 0.36 for one reason: 0.36 declares a
+# minimum rustc of 1.95, and this workspace's `rust-version` is 1.82 — a promise
+# stated in every crate's manifest. Raising it for a UI toolkit would raise it
+# for the scanner as well, and what separates the two releases is styling API
+# this front end has no use for.
+#
+# `default-features = false` drops the X11 and Wayland backends. This product
+# targets one platform, and leaving them on would put a Linux windowing stack in
+# `Cargo.lock` for code that can never run.
+eframe = { version = "0.31", default-features = false, features = [
+    "glow",
+    "default_fonts",
+    "accesskit",
+] }
+
 # --- misc utilities -----------------------------------------------------------
 chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
@@ -77,14 +178,71 @@ byteorder = "1"
 
 # --- internal crates ----------------------------------------------------------
 av-core = { path = "crates/av-core" }
+# Reading files a scan would otherwise be refused, and the backup
+# privilege that makes that possible. Below `av-core` and above
+# everything that reads a file. See `crates/av-fs/src/lib.rs`.
+av-fs = { path = "crates/av-fs" }
 av-rules = { path = "crates/av-rules" }
+# The fixed-length atom matcher the prefilter searches with. It sits below
+# `av-rules` rather than inside it because it is a self-contained algorithm
+# with no opinion about rules: it is handed byte strings and an offset is
+# reported for each. See `crates/av-patterns/src/lib.rs`.
+av-patterns = { path = "crates/av-patterns" }
+av-pe = { path = "crates/av-pe" }
+av-signatures = { path = "crates/av-signatures" }
+av-authenticode = { path = "crates/av-authenticode" }
+av-archive = { path = "crates/av-archive" }
+av-scan = { path = "crates/av-scan" }
+av-quarantine = { path = "crates/av-quarantine" }
+av-memory = { path = "crates/av-memory" }
+av-realtime = { path = "crates/av-realtime" }
+av-sandbox = { path = "crates/av-sandbox" }
+av-ipc = { path = "crates/av-ipc" }
+av-service = { path = "crates/av-service" }
+av-driver-proto = { path = "crates/av-driver-proto" }
+# Self-protection. It sits above `av-core` (for the layout) and above
+# `av-authenticode` (for the signature half of the tamper check) and below
+# `av-service` and `av-cli`, which are its callers. The direction matters:
+# `av-service` installs the service that this crate hardens, and a hardening
+# crate that depended on the service would be unable to harden a service that
+# failed to start.
+av-guard = { path = "crates/av-guard" }
+# The Windows Shell integration: the Explorer right-click "scan this" verbs and
+# the typed registry wrapper they are written against. It sits above `av-core`
+# and depends on nothing else, because registering a menu item is not a thing
+# the scanner should have to be linked to do.
+av-integration = { path = "crates/av-integration" }
+# The AMSI provider. It sits beside `av-integration` rather than above it: both
+# are ways of attaching this product to something Windows already runs, and
+# neither needs the other. It depends on `av-ipc` and nothing else of ours,
+# because it is loaded into somebody else's process and every dependency is paid
+# for by that process. See `crates/av-amsi/src/lib.rs`.
+av-amsi = { path = "crates/av-amsi" }
 
 [profile.release]
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-panic = "abort"
 strip = "symbols"
+
+# `unwind`, and the reason is one crate.
+#
+# `av-amsi` is an in-process COM server that Windows loads into whatever process
+# asks AMSI a question — `powershell.exe`, `wscript.exe`, Office. A panic under
+# `abort` there is the host process dying, and a security product that kills a
+# user's PowerShell window is a security product that gets uninstalled. That
+# crate catches panics at every COM entry point, and `catch_unwind` catches only
+# what unwinds.
+#
+# The profile cannot be set per package — Cargo refuses `panic` in
+# `[profile.<name>.package.<name>]` — so it is set here, for every user-mode
+# crate. The cost is a little unwind table in binaries that never use it, and
+# the alternative is a released DLL that aborts the process it was loaded into.
+#
+# `av-driver` is unaffected and deliberate: it is a separate workspace with its
+# own profile, and it keeps `panic = "abort"`. A bugcheck in a filesystem filter
+# corrupts a machine; a caught panic in a scanner does not.
+panic = "unwind"
 
 # Scanning is extremely hot; make debug builds of the scanner usable too.
 [profile.dev.package."*"]
@@ -100,6 +258,23 @@ opt-level = 2
 missing_debug_implementations = "warn"
 unsafe_op_in_unsafe_fn = "deny"
 unused_must_use = "deny"
+
+[workspace.lints.rustdoc]
+# Neither `cargo build` nor `cargo clippy` resolves an intra-doc link. Only
+# `cargo doc` does, so a doc comment naming a type that was renamed, one that
+# names a private item, or one that names a type that was never written at all
+# compiles cleanly and reads as fact. A measured sweep of this workspace found
+# exactly that: a protocol field documented as "a `RequestFlags` bit" for a
+# type that exists nowhere, a method named in a doc comment that the struct
+# does not have, and a dozen links to private items.
+#
+# The cost of denying is that `cargo doc` is now part of the verification pass
+# rather than something nobody runs. That is the point: a claim in a doc
+# comment is checkable for the price of one `cargo doc`, and documentation
+# that has quietly stopped being true is worse than no documentation, because
+# it is believed.
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "deny"
 
 [workspace.lints.clippy]
 # A scanner that panics on a malformed file is a denial of service. Both of

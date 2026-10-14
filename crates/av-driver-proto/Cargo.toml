@@ -1,0 +1,29 @@
+[package]
+name = "av-driver-proto"
+description = "The kernel driver's protocol, decision state machine and path logic, as a user-mode-testable crate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# No dependencies at all, and that is a load-bearing choice rather than an
+# accident of scope.
+#
+# This crate is compiled twice: once by `cargo test` on stable Rust in user
+# mode, and once by the kernel driver in `crates/av-driver`, which is a separate
+# workspace that builds with `-Z build-std` against `no_std`. A dependency here
+# is a dependency the kernel build has to satisfy as well, and almost nothing in
+# this workspace qualifies: `av-core` pulls `serde`, `av-signatures` pulls
+# `sha2`, and neither compiles for a driver. Keeping the dependency list empty
+# means the driver links exactly the code whose tests run here.
+#
+# It also means the crate can be `no_std` without qualification, which is what
+# makes the driver build possible in the first place. See the crate
+# documentation.
+
+[dependencies]
+
+[lints]
+workspace = true

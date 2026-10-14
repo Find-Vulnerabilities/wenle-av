@@ -1,0 +1,51 @@
+[package]
+name = "av-fs"
+description = "Reading files a scanner would otherwise be refused: the backup privilege, and an honest answer when it does not help"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+av-core.workspace = true
+
+thiserror.workspace = true
+log.workspace = true
+# The process-wide reader is created once and shared by every thread that
+# scans. `once_cell` is how the rest of the workspace spells that; see
+# `av-core`'s dependencies.
+once_cell.workspace = true
+
+# `SeBackupPrivilege`, `CreateFileW`, `ReadFile`. The crate is a thin, honest
+# layer over these and has no use for a wrapper library: what it has to get
+# right is *which* flags to pass and *what to say* when the open fails, and a
+# wrapper would hide exactly those two things.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    # `OpenProcessToken`, `AdjustTokenPrivileges`, `LookupPrivilegeValueW`,
+    # `GetTokenInformation(TokenPrivileges)` — the privilege half.
+    "Win32_Security",
+    "Win32_System_Threading",
+    # `CreateFileW`, `GetFileSizeEx`, `GetFileInformationByHandle` — the
+    # reading half.
+    "Win32_Storage_FileSystem",
+    # `ReadFile` alone lives behind this one rather than behind
+    # `Win32_Storage_FileSystem`, which is not where a reader of the call site
+    # would look for it.
+    "Win32_System_IO",
+    # `GlobalMemoryStatusEx`, which lives in `Win32_System_SystemInformation`.
+    # This is how the memory budget learns how much this machine can still
+    # commit — the number that was 836 MB when a three-file scan aborted in the
+    # allocator. A constant here would impose one machine's answer on every
+    # other machine.
+    "Win32_System_SystemInformation",
+] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -229,6 +229,27 @@ pub struct RealtimeConfig {
     /// Block execution of a detected file instead of only reporting it.
     pub block_on_detect: bool,
     /// Terminate a process confirmed malicious after it started.
+    ///
+    /// # What "confirmed" means here, because the word is doing the work
+    ///
+    /// It is not "a rule matched in memory". The match has to point at a *file*,
+    /// that file has to convict on its own evidence under the same engine and the
+    /// same thresholds that judge a file the watcher found, and the file must not
+    /// be one the user allowed. A region nothing on disk backs — the shape of
+    /// injected code, and a real detection — is reported and is **not** grounds
+    /// for terminating anything, because those bytes say nothing about which
+    /// program wrote them and the process could be the victim.
+    ///
+    /// # Why it is on by default
+    ///
+    /// Because it was measured before it was switched on, which is the only order
+    /// that is honest for an irreversible action. `wenle memory` over every
+    /// process this account can open, against the shipped 10,764-rule database:
+    /// five consecutive runs on 2026-10-09, 82 to 86 processes examined, 135,594
+    /// regions walked, 201 worth reading, 32.7 MB read in 4.4 s, and **no finding
+    /// in any run**. The processes that could not be opened — 159 of them, which
+    /// is the ordinary case and not a fault — are not covered by that
+    /// measurement and were not examined; what is claimed is what was measured.
     pub terminate_malicious_process: bool,
     /// Directories watched by the user-mode fallback. Empty means "the
     /// standard set": Downloads, Desktop, Documents, Temp, Startup, and every
@@ -250,7 +271,7 @@ impl Default for RealtimeConfig {
             scan_on_execute: true,
             scan_on_process_start: true,
             block_on_detect: true,
-            terminate_malicious_process: false,
+            terminate_malicious_process: true,
             watched_paths: Vec::new(),
             extra_watched_paths: Vec::new(),
             worker_threads: 0,
@@ -310,7 +331,27 @@ pub struct QuarantineConfig {
     pub retention_days: Option<u64>,
     /// Upper bound on the vault size; the oldest items are evicted first.
     pub max_size_bytes: u64,
-    /// Automatically quarantine without prompting.
+    /// Take a confirmed detection into the vault, without asking first.
+    ///
+    /// **On by default, and that is the product's whole shape.** A detection
+    /// that stops a program but leaves the file where it is has to be acted on
+    /// again at the next execution, and the user has no moment at which to
+    /// decide anything. Taking the file is what makes the decision a real one:
+    /// the program cannot run because its bytes are no longer at that path, and
+    /// the user answers "put it back" or "destroy it" afterwards, from the
+    /// vault, at their leisure. See [`crate::config`]'s sibling
+    /// `general.exclusions` for the other half — allowing a file has to mean
+    /// the engine will not take it again.
+    ///
+    /// Turning it off is a supported choice and means report-only: a detection
+    /// is still reported, and the driver still refuses the program, but nothing
+    /// is moved. That was the default before this round and is kept as the
+    /// meaning of the switch.
+    ///
+    /// The cost of the default is stated where it is paid: a false positive is
+    /// now a file that leaves its path. It stays recoverable, because the vault
+    /// keeps the bytes and [`GeneralConfig::exclusions`] can be written from
+    /// the window, but it is no longer a log line.
     pub auto_quarantine: bool,
     /// Try to restore an item before quarantining, so that a false positive on
     /// a system file is recoverable.
@@ -323,7 +364,7 @@ impl Default for QuarantineConfig {
             encrypt: true,
             retention_days: Some(30),
             max_size_bytes: 2 * 1024 * 1024 * 1024,
-            auto_quarantine: false,
+            auto_quarantine: true,
             backup_before_quarantine: true,
         }
     }
@@ -490,7 +531,9 @@ mod tests {
 
     #[test]
     fn defaults_are_valid() {
-        AvConfig::default().validate().expect("defaults must validate");
+        AvConfig::default()
+            .validate()
+            .expect("defaults must validate");
     }
 
     #[test]
@@ -555,7 +598,8 @@ mod tests {
 
     #[test]
     fn missing_file_yields_defaults() {
-        let cfg = AvConfig::load_or_default(Path::new(r"C:\definitely\not\here\config.toml")).unwrap();
+        let cfg =
+            AvConfig::load_or_default(Path::new(r"C:\definitely\not\here\config.toml")).unwrap();
         assert_eq!(cfg, AvConfig::default());
     }
 

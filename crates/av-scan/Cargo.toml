@@ -1,0 +1,32 @@
+[package]
+name = "av-scan"
+description = "Turns a rule database and a file into weighted detections and a three-band verdict."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+av-core = { workspace = true }
+# How a file is opened and read. `av-scan` used to call `std::fs::read`, which
+# reports every file whose permissions exclude the scanning account as
+# unreadable — and the files that matters for are exactly the ones a scan is
+# asked about. See `av-fs`'s crate documentation, including what it can and
+# cannot reach.
+av-fs = { workspace = true }
+av-rules = { workspace = true }
+av-pe = { workspace = true }
+av-archive = { workspace = true }
+av-authenticode = { workspace = true }
+av-signatures = { workspace = true }
+
+serde = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

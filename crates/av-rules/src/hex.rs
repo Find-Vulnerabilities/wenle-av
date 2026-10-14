@@ -197,7 +197,9 @@ impl<'a> Parser<'a> {
         // it — an error that points one column past the problem is worse than
         // useless when the pattern is a wall of hex.
         let at = self.pos;
-        let b = self.bump().ok_or_else(|| self.error("truncated hex pattern"))?;
+        let b = self
+            .bump()
+            .ok_or_else(|| self.error("truncated hex pattern"))?;
         match b {
             b'0'..=b'9' => Ok(b - b'0'),
             b'a'..=b'f' => Ok(b - b'a' + 10),
@@ -361,9 +363,7 @@ impl<'a> Parser<'a> {
             if !b.is_ascii_digit() {
                 break;
             }
-            value = value
-                .saturating_mul(10)
-                .saturating_add(u64::from(b - b'0'));
+            value = value.saturating_mul(10).saturating_add(u64::from(b - b'0'));
             if value > u64::from(u32::MAX) {
                 return Err(HexError {
                     message: "number in a jump is too large".into(),
@@ -423,9 +423,18 @@ mod tests {
         assert_eq!(
             p("?? ?A 4?").tokens,
             vec![
-                HexToken::Nibble { high: None, low: None },
-                HexToken::Nibble { high: None, low: Some(0xA) },
-                HexToken::Nibble { high: Some(4), low: None },
+                HexToken::Nibble {
+                    high: None,
+                    low: None
+                },
+                HexToken::Nibble {
+                    high: None,
+                    low: Some(0xA)
+                },
+                HexToken::Nibble {
+                    high: Some(4),
+                    low: None
+                },
             ]
         );
     }
@@ -434,23 +443,29 @@ mod tests {
     fn parses_fixed_and_ranged_jumps() {
         assert_eq!(
             p("[4]").tokens,
-            vec![HexToken::Jump { min: 4, max: Some(4) }]
+            vec![HexToken::Jump {
+                min: 4,
+                max: Some(4)
+            }]
         );
         assert_eq!(
             p("[2-6]").tokens,
-            vec![HexToken::Jump { min: 2, max: Some(6) }]
+            vec![HexToken::Jump {
+                min: 2,
+                max: Some(6)
+            }]
         );
-        assert_eq!(
-            p("[4-]").tokens,
-            vec![HexToken::Jump { min: 4, max: None }]
-        );
+        assert_eq!(p("[4-]").tokens, vec![HexToken::Jump { min: 4, max: None }]);
     }
 
     #[test]
     fn whitespace_inside_a_jump_is_tolerated() {
         assert_eq!(
             p("[ 2 - 6 ]").tokens,
-            vec![HexToken::Jump { min: 2, max: Some(6) }]
+            vec![HexToken::Jump {
+                min: 2,
+                max: Some(6)
+            }]
         );
     }
 
@@ -471,7 +486,10 @@ mod tests {
             HexToken::Alternative(branches) => {
                 assert_eq!(branches.len(), 2);
                 assert_eq!(branches[0], vec![HexToken::Byte(0x41)]);
-                assert_eq!(branches[1], vec![HexToken::Byte(0x42), HexToken::Byte(0x43)]);
+                assert_eq!(
+                    branches[1],
+                    vec![HexToken::Byte(0x42), HexToken::Byte(0x43)]
+                );
             }
             other => panic!("expected an alternative, got {other:?}"),
         }
@@ -506,7 +524,9 @@ mod tests {
 
     #[test]
     fn unterminated_alternative_is_reported() {
-        assert!(err("( 41 | 42").message.contains("unterminated alternative"));
+        assert!(err("( 41 | 42")
+            .message
+            .contains("unterminated alternative"));
     }
 
     #[test]
@@ -562,7 +582,10 @@ mod tests {
 
     #[test]
     fn lowercase_hex_digits_are_accepted() {
-        assert_eq!(p("4d 5a").tokens, vec![HexToken::Byte(0x4D), HexToken::Byte(0x5A)]);
+        assert_eq!(
+            p("4d 5a").tokens,
+            vec![HexToken::Byte(0x4D), HexToken::Byte(0x5A)]
+        );
     }
 
     #[test]

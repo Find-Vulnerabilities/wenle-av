@@ -215,7 +215,12 @@ impl Literal {
 /// the very start or end of the buffer counts as delimited, because there is
 /// nothing there to contradict it; and a byte that is not ASCII — one half of a
 /// UTF-8 sequence, say — is not a word character, so it delimits.
-fn is_whole_word(data: &[u8], at: usize, len: usize) -> bool {
+///
+/// Read by [`crate::sweep`] as well, which checks each hit its automaton
+/// reports. One definition rather than two, because two would be two answers to
+/// "is this a whole word" and the one that drifted would be a string matched in
+/// the wrong places.
+pub(crate) fn is_whole_word(data: &[u8], at: usize, len: usize) -> bool {
     let before = at.checked_sub(1).and_then(|i| data.get(i)).copied();
     let after = data.get(at + len).copied();
     let is_word = |b: Option<u8>| b.is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_');
@@ -485,7 +490,10 @@ mod tests {
     /// piece of logic that would need testing in turn; the tests that care
     /// assert against `find` directly instead.
     fn witness_agrees_with_the_full_search(literal: &Literal, data: &[u8]) {
-        assert!(!literal.nocase, "use the direct assertions for a nocase literal");
+        assert!(
+            !literal.nocase,
+            "use the direct assertions for a nocase literal"
+        );
         let atom = atom_of(literal);
         let mut union: Vec<(u32, u32)> = Vec::new();
         for witness in occurrences_ignoring_case_exact(&atom, data) {
@@ -727,7 +735,9 @@ mod tests {
         assert!(
             v.iter().any(|l| l.bytes == b"Zm9vYmFy"),
             "{:?}",
-            v.iter().map(|l| String::from_utf8_lossy(&l.bytes)).collect::<Vec<_>>()
+            v.iter()
+                .map(|l| String::from_utf8_lossy(&l.bytes))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -781,7 +791,8 @@ mod tests {
         let has = |needle: &[u8]| v.iter().any(|l| l.bytes == needle);
         assert!(has(b"+/+/") || has(b"+/+") || has(b"v7+/"), "{v:?}");
         assert!(
-            v.iter().any(|l| l.bytes.contains(&b'-') || l.bytes.contains(&b'_')),
+            v.iter()
+                .any(|l| l.bytes.contains(&b'-') || l.bytes.contains(&b'_')),
             "the URL-safe spelling must be present: {v:?}"
         );
     }
@@ -797,7 +808,10 @@ mod tests {
         let v = variants(b"f", &base64_only()).unwrap();
         let found: Vec<&[u8]> = v.iter().map(|l| l.bytes.as_slice()).collect();
         assert!(found.contains(&b"f".as_slice()), "the ascii form: {v:?}");
-        assert!(found.contains(&b"Z".as_slice()), "at a group boundary: {v:?}");
+        assert!(
+            found.contains(&b"Z".as_slice()),
+            "at a group boundary: {v:?}"
+        );
         assert!(found.contains(&b"m".as_slice()), "two bytes in: {v:?}");
         assert_eq!(found.len(), 3, "and nothing from alignment one: {v:?}");
     }
@@ -817,7 +831,8 @@ mod tests {
         let v = variants(b"ab", &m).unwrap();
         let wide_encoding = encode_base64(b"a\0b\0");
         assert!(
-            !v.iter().any(|l| l.bytes == wide_encoding || wide_encoding.starts_with(&l.bytes) && l.bytes.len() > 3),
+            !v.iter().any(|l| l.bytes == wide_encoding
+                || wide_encoding.starts_with(&l.bytes) && l.bytes.len() > 3),
             "the wide form must not be base64-encoded: {v:?}"
         );
     }
@@ -869,7 +884,11 @@ mod tests {
         // buffer.
         let literal = Literal::new(b"this is a needle".to_vec(), false, false);
         let data = [b"padding ".as_slice(), &atom_of(&literal), b" padding"].concat();
-        assert_eq!(find(&literal, &data), Vec::new(), "the literal is not there");
+        assert_eq!(
+            find(&literal, &data),
+            Vec::new(),
+            "the literal is not there"
+        );
         assert_eq!(
             occurrences_ignoring_case_exact(&atom_of(&literal), &data).len(),
             1,
@@ -913,7 +932,11 @@ mod tests {
         assert_eq!(witnesses.len(), 1, "the atom is in the data once");
         let mut localized = Vec::new();
         loose.find_all_from_witness(&data, witnesses[0], &mut localized);
-        assert_eq!(localized, find(&loose, &data), "a nocase literal must match");
+        assert_eq!(
+            localized,
+            find(&loose, &data),
+            "a nocase literal must match"
+        );
         assert_eq!(localized, vec![(5, 12)]);
 
         // The same bytes, read case-sensitively, must find nothing — and must

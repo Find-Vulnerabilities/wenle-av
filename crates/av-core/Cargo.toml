@@ -20,10 +20,21 @@ hex.workspace = true
 log.workspace = true
 once_cell.workspace = true
 dirs.workspace = true
+# The three digests the rule language names, and the substring search the byte
+# counter uses. See `hash.rs` for why these are here and CRC-32 is not.
+md-5.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+memchr.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
     "Win32_Security",
+    # `GlobalMemoryStatusEx`, for the out-of-memory report in `alloc`. It is
+    # the only way to state, at the moment an allocation fails, how much the
+    # machine had left to commit -- which is the number that turns "it crashed"
+    # into a diagnosis.
+    "Win32_System_SystemInformation",
 ] }

@@ -302,7 +302,9 @@ pub fn group_from_variants(variants: &[(&[u8], bool)]) -> StringAtoms {
     }
     group.sort();
     group.dedup();
-    StringAtoms { groups: vec![group] }
+    StringAtoms {
+        groups: vec![group],
+    }
 }
 
 /// The fixed byte runs a hex pattern must contain.
@@ -389,8 +391,7 @@ pub fn runs_of_regex(hir: &regex_syntax::hir::Hir) -> Vec<Vec<u8>> {
         HirKind::Capture(capture) => runs_of_regex(&capture.sub),
         HirKind::Concat(parts) => parts.iter().flat_map(runs_of_regex).collect(),
         HirKind::Alternation(alternatives) => {
-            let per_branch: Vec<Vec<Vec<u8>>> =
-                alternatives.iter().map(runs_of_regex).collect();
+            let per_branch: Vec<Vec<Vec<u8>>> = alternatives.iter().map(runs_of_regex).collect();
             shared_runs(&per_branch)
         }
     }

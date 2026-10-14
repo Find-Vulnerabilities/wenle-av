@@ -1,0 +1,19 @@
+[package]
+name = "av-pe"
+description = "Bounds-checked PE parsing: headers, sections, imports, exports, resources, rich header, version info and Authenticode signatures"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+# MD5, and only for the imphash. Not a security primitive here: the imphash is a
+# grouping key over a file's own import list, and MD5 is what the format's tools
+# define it as. A different digest would produce a different string for every
+# file and match none of the 371 rules that compare against one.
+md-5.workspace = true

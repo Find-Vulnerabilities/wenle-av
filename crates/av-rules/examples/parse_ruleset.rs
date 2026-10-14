@@ -125,7 +125,9 @@ fn run() -> ExitCode {
                 }
             }
             Err(e) => {
-                let entry = failures.entry(bucket(&e.message)).or_insert((0, String::new()));
+                let entry = failures
+                    .entry(bucket(&e.message))
+                    .or_insert((0, String::new()));
                 entry.0 += 1;
                 if entry.1.is_empty() {
                     entry.1 = format!("line {line}: {e}");
@@ -136,7 +138,10 @@ fn run() -> ExitCode {
 
     let failed = chunks.len().saturating_sub(parsed_chunks);
     println!("\nparsed {parsed_chunks} chunks containing {rule_count} rules");
-    println!("failed {failed} chunks ({:.3}%)", percent(failed, chunks.len()));
+    println!(
+        "failed {failed} chunks ({:.3}%)",
+        percent(failed, chunks.len())
+    );
     println!("split {split_elapsed:?}, parse {parse_elapsed:?}");
 
     if !failures.is_empty() {

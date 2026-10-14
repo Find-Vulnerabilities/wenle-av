@@ -1,0 +1,37 @@
+[package]
+name = "av-authenticode"
+description = "Verified Authenticode: the signature over the file, checked against a chain the platform built."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+av-pe.workspace = true
+av-signatures.workspace = true
+
+sha1.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+# The chain engine and the root store are the platform's, and this is the only
+# dependency that reaches them. The split is deliberate and is documented at
+# length in `store`: *which certificates this machine trusts* is a fact about
+# the machine and is asked for; *whether this signature over this file is good*
+# is answered by this crate's own code and nowhere else.
+#
+# `Win32_Security_Cryptography` carries `CertGetCertificateChain` and the
+# `CERT_*` structures; `Win32_Security_WinTrust` carries `WinVerifyTrust` and is
+# pulled in only so the comparison in the store module's documentation can be
+# reproduced by anyone who wants to re-run it.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_Security_WinTrust",
+] }
+
+[lints]
+workspace = true

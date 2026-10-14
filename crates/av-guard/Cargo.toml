@@ -1,0 +1,68 @@
+[package]
+name = "av-guard"
+description = "Self-protection: process, service, directory and file hardening, and the tamper check that notices when any of it is undone"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Where the product keeps its files. The layout is resolved once, by `av-core`,
+# and this crate hardens exactly the directories that layout names — including
+# the ones it deliberately leaves alone. See `crate::files`.
+av-core.workspace = true
+
+# The tamper check asks whether a replaced binary is still signed, and this is
+# the crate that answers it. Depending on it rather than re-deriving an
+# Authenticode check here is the same rule the rest of the workspace follows:
+# one implementation of a security decision, in the place that documents it.
+# The dependency direction is acyclic — `av-authenticode` depends on `av-pe` and
+# `av-signatures` and on nothing else in this workspace — and it is stated here
+# because a cycle would have been the reason to leave the check out.
+av-authenticode.workspace = true
+
+# The driver's installed name, for the manifest entry that records it. A second
+# spelling of `WenleAvFilter.sys` here would be a second thing to rename, and it
+# would fail the way a renamed file always does — the check would look for a
+# file that has moved and report the driver as missing, which reads as tampering.
+# The crate has no dependencies of its own and is `no_std`, so this costs this
+# crate nothing at all; see its `src/install.rs`.
+av-driver-proto.workspace = true
+
+serde.workspace = true
+bincode.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+# The Windows API, called directly. No `winreg`, no `windows-service`, no
+# wrapper of any kind: the two things this crate does that a wrapper would hide
+# are the *shape of a security descriptor* and the *error a service call
+# returns*, and both are exactly what has to be visible here. See
+# `crate::acl` for the descriptor half and `crate::service` for the other.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    # `CheckRemoteDebuggerPresent` and `IsDebuggerPresent`.
+    "Win32_System_Diagnostics_Debug",
+    # `ProcessBasicInformation`, which is where `PEB->BeingDebugged` is read
+    # from. `Win32_System_Kernel` is the `PEB` type itself; the `windows` crate
+    # gates it behind that feature even though nothing else there is used.
+    "Win32_System_Kernel",
+    "Win32_System_Services",
+    "Win32_System_Threading",
+    # `NtQueryInformationProcess`, which lives in the WDK half of the `windows`
+    # crate rather than the Win32 half — see `crate::tamper` for why the third
+    # debugger check is worth an unusual feature gate.
+    "Wdk_System_Threading",
+] }
+
+[lints]
+workspace = true

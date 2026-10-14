@@ -300,10 +300,7 @@ mod tests {
             ThreatCategory::from_tag("RANSOMWARE"),
             Some(ThreatCategory::Ransomware)
         );
-        assert_eq!(
-            ThreatCategory::from_tag("pup"),
-            Some(ThreatCategory::Pua)
-        );
+        assert_eq!(ThreatCategory::from_tag("pup"), Some(ThreatCategory::Pua));
         assert_eq!(ThreatCategory::from_tag("nonsense"), None);
     }
 

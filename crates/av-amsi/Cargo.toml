@@ -1,0 +1,99 @@
+[package]
+name = "av-amsi"
+description = "The AMSI provider: script content handed to the engine before the host runs it"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+# `cdylib` is the product: this is an in-process COM server that Windows loads
+# into whatever process asks AMSI a question, and it is reached through
+# `DllGetClassObject` rather than by linking.
+#
+# `rlib` is there so the rest of the workspace can `use` the crate — the
+# registration constants are one answer that the command line and the DLL must
+# not each write down, and `cargo test` needs something to link against. An
+# `rlib` alongside a `cdylib` costs nothing at run time: the linker pulls an
+# object file out of an archive only when something references a symbol in it,
+# so `DllGetClassObject` stays in the DLL and out of anything that merely names
+# this crate.
+crate-type = ["cdylib", "rlib"]
+
+# # Panics, and why this crate needs `panic = "unwind"`
+#
+# A panic in an AMSI provider is a panic inside `powershell.exe`. Under
+# `panic = "abort"` that is the host process dying, which is a far worse outcome
+# than the content going unscanned — so this crate catches panics at every COM
+# boundary, and `catch_unwind` can only catch what unwinds.
+#
+# The setting is **not** here. Cargo ignores `[profile.*]` in a non-root
+# package, so a `panic = "unwind"` written in this file would be silently
+# dropped and the released DLL would abort. It lives in the workspace root's
+# `[profile.release]`, where it applies to every user-mode crate — which is the
+# right scope anyway: `av-driver` is a separate workspace and keeps `abort`,
+# because a bugcheck in a filesystem filter corrupts a machine and a caught
+# panic in a scanner does not.
+
+[dependencies]
+av-core.workspace = true
+
+# The protocol, and only the protocol. The scanning itself happens in
+# `wenle-av-service`, which already holds the compiled rule set — loading a
+# second copy inside every host process that asks an AMSI question would cost
+# each of them the full rule database for the sake of one script block.
+av-ipc.workspace = true
+
+log.workspace = true
+
+# Feature by feature, because an AMSI provider is loaded into somebody else's
+# process and every dependency here is paid for by that process:
+#
+#   Win32_Foundation          HANDLE, HRESULT, CloseHandle, the WAIT_* results
+#   Win32_Security            required by the generated `CreateFileW`, whose
+#                             `SECURITY_ATTRIBUTES` argument is passed null
+#   Win32_Storage_FileSystem  CreateFileW for the service's control pipe
+#   Win32_System_IO           OVERLAPPED, without which the generated
+#                             `ReadFile`/`WriteFile` do not exist
+#   Win32_System_Pipes        WaitNamedPipeW, for a connect that gives up
+#   Win32_System_Com          IClassFactory, which the class object must return
+#   Win32_System_Threading    CreateEventW, WaitForSingleObject: the deadline
+#   Win32_System_Antimalware  IAntimalwareProvider, IAmsiStream, AMSI_RESULT
+#
+# Nothing else. `Win32_System_Registry` is absent on purpose: this crate does
+# not register itself. Writing `HKLM` needs an elevated writer and a decision
+# about whether the DLL's location is safe to load from, and that decision
+# belongs to `wenle integrate`, not to a library that a scripting host has
+# already loaded.
+[target.'cfg(windows)'.dependencies]
+# `windows-core` is named directly, and it is the `#[implement]` macro that
+# forces it. The macro generates code that refers to `::windows_core::...` by
+# absolute path, which resolves only when `windows_core` is in the extern
+# prelude — that is, only when this crate depends on it by name. Reaching it as
+# `windows::core` is not enough, because the path the macro writes does not go
+# through `windows`.
+#
+# It costs nothing at run time and nothing in the lock file: `windows 0.62`
+# already depends on `windows-core 0.62`, so this resolves to the same 0.62.2
+# and the build still links one copy. This line exists to make the name
+# *visible*, not to add a dependency.
+windows-core = "0.62"
+
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Com",
+    "Win32_System_Threading",
+    "Win32_System_Antimalware",
+] }
+
+[dev-dependencies]
+tempfile.workspace = true
+av-rules.workspace = true

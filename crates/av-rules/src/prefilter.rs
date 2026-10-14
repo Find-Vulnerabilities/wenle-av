@@ -6,7 +6,7 @@
 //! searches per file. A scan that did that would take seconds per file, which
 //! is three orders of magnitude away from what a resident scanner needs. The
 //! prefilter is what closes the gap: every atom from every string in the rule
-//! set goes into one Aho-Corasick automaton, one pass over the buffer finds all
+//! set goes into one multi-pattern search, one pass over the buffer finds all
 //! of them at once, and only the rules those atoms point at are worth looking
 //! at closely.
 //!
@@ -15,7 +15,7 @@
 //! **The prefilter may return a rule that does not match. It must never omit a
 //! rule that does.** Everything here is arranged around that asymmetry. An atom
 //! is a byte sequence a match must contain, so its absence proves the string is
-//! absent — but its presence proves nothing, and a rule selected on an atom
+//! absent, but its presence proves nothing, and a rule selected on an atom
 //! still has to be evaluated properly. A missed candidate is a missed
 //! detection, and no amount of speed is worth one.
 //!
@@ -23,7 +23,7 @@
 //!
 //! [`crate::atoms`] turns each string into a conjunction of disjunctions: every
 //! group must be satisfied, and a group is satisfied by any one of its atoms.
-//! A string with no groups — every form of it too short to have an atom —
+//! A string with no groups (every form of it too short to have an atom)
 //! constrains nothing, and a rule with such a string has to be let through
 //! untested. Those rules are collected at build time and reported as
 //! [`PrefilterStats::unfiltered_rules`], and how many there are is the honest
@@ -38,7 +38,7 @@
 //! Read the rule-level test as "some string might be present" and the filter
 //! collapses: a rule with seven indicator strings survives whenever any one of
 //! them is a common byte sequence, and on a Windows DLL most of them are. That
-//! is what `examples/scan_bench.rs` measured — 51% of the rule set selected on
+//! is what `examples/scan_bench.rs` measured: 51% of the rule set selected on
 //! `notepad.exe`, 72% on `shell32.dll`, and 0.4 MB/s. The atoms were right; the
 //! rule-level reading was too weak. With the conjunction read out of the
 //! condition, the same binaries select 5.8% and 12.7%.
@@ -46,29 +46,58 @@
 //! So [`RuleFilter::required`] carries the slots the condition cannot be true
 //! without, from [`crate::compiler::required_slots`]. `$a and $b and $c` gives
 //! all three, and the rule is selected only when *all* of them are still
-//! possible. A condition that proves nothing — `any of them`, `#a == 0` —
+//! possible. A condition that proves nothing (`any of them`, `#a == 0`)
 //! gives an empty list, and the rule falls back to the weaker disjunction. Both
 //! are sound for the same reason: a rule that matches has every required string
 //! matching, so it is never dropped by the stronger test, and the weaker test
 //! drops only what it can prove absent.
 //!
-//! # Two automata, and why
+//! # Two searches, and why
 //!
-//! Aho-Corasick folds case for all of its patterns or none of them, and a rule
-//! set has both kinds. So there are two automatons and two passes over the
-//! buffer — the second is not free, but the alternative is expanding each
-//! case-insensitive atom into its two-to-the-n case variants, which for a
-//! four-byte atom is sixteen times the states to save one pass over a buffer
-//! that is already in cache.
+//! A case rule is a property of all of a matcher's patterns or of none of them,
+//! and a rule set has both kinds. So there are two searches and two passes over
+//! the buffer.
+//!
+//! The case-insensitive half needs the buffer folded first, because the matcher
+//! under this one compares bytes and does not fold as it goes. That is a third
+//! pass, and it is real work this design does not get for free, but it is
+//! cheap next to the alternative, which is expanding each case-insensitive atom
+//! into its two-to-the-n case variants: for a four-byte atom that is sixteen
+//! times the patterns to save one pass over a buffer that is already in cache.
+//! Measured on `shell32.dll`, the fold is 2.9 ms against the 208 ms the search
+//! itself costs, so it is 1.4% of the pair and not worth a second design.
+//!
+//! # What searches, and what only the machine it runs on decides
+//!
+//! [`av_patterns::AtomSet`] rather than a general Aho-Corasick automaton, and
+//! that is the one place this module is fitted to a fact about its input rather
+//! than to the problem. Every atom [`crate::atoms`] produces is three or four
+//! bytes ([`crate::atoms::MIN_ATOM_LEN`] and [`crate::atoms::MAX_ATOM_LEN`] bound it), and a
+//! matcher that knows its patterns are all the same short length need not carry
+//! automaton state between bytes at all. The atom set answers "which atoms
+//! start here" with two tables keyed on the window's own bytes, so the per-byte
+//! cost is a lookup in something that fits in level 2 rather than a miss. The
+//! build asserts the premise: an atom shorter than the gate can use would fall
+//! to a linear path, and a rule set that produced one should say so here rather
+//! than quietly scan slower.
+//!
+//! This is a replacement and not an addition. `av-patterns` was written for
+//! exactly this call site and `examples/pattern_bench.rs` runs both matchers
+//! over the real atom set and the same buffer on the same machine, which is the
+//! only way the claim is worth anything. Aho-Corasick remains in the workspace
+//! for [`crate::sweep`], whose patterns are whole literal forms of any length
+//! and are not this shape.
 //!
 //! # Cost
 //!
-//! Building the automatons is the expensive part and happens once per rule
-//! database, not once per file. The per-file state in [`PrefilterScratch`] is
-//! stamped with an epoch rather than cleared, so a scan touches only what it
-//! matched.
+//! Building the searches is the expensive part and happens once per rule
+//! database, not once per file: the case-sensitive atom set is 5,091 KiB of
+//! tables and the case-insensitive one 851 KiB, which is the memory this module
+//! trades for the per-byte cost it does not pay. The per-file state in
+//! [`PrefilterScratch`] is stamped with an epoch rather than cleared, so a scan
+//! touches only what it matched.
 //!
-//! Measured against the 10,764-rule set this engine is built for — 8,715 rules
+//! Measured against the 10,764-rule set this engine is built for: 8,715 rules
 //! that compile, 92,182 distinct atoms, 156 rules nothing can be said about:
 //!
 //! ```text
@@ -81,35 +110,53 @@
 //! shell32.dll      1,108 rules selected (12.71%)    3 MB/s
 //! ```
 //!
-//! Selection is the number this module owns, and it is now low enough that the
-//! prefilter is no longer where the time goes: it is 17-32% of a real scan, and
-//! the rest is the strings that survived it. Throughput was the weak half and
-//! still is — it is not proportional to the number of *matches*, which is near
-//! zero on the synthetic buffers, but to the size of the automaton: the
-//! transition tables spill out of cache and every byte of the buffer pays for a
-//! miss. `examples/ac_bench.rs` measures the same effect in isolation — 154 MB/s
-//! at a thousand patterns, 84 at ten thousand, 22 at sixty-seven thousand.
+//! Those are whole-scan rates, and they were taken with an Aho-Corasick
+//! automaton in the search position. They are left as they were measured rather
+//! than retouched, because the swap to [`av_patterns::AtomSet`] moved the
+//! end-to-end figure by about 6%, enough that the rows read as the floor and
+//! not as the current number, and not enough to be worth restating a table whose
+//! point is the selection rate. The component numbers below are the ones that
+//! changed, and they are the ones to read.
 //!
-//! That is the range a signature engine of this kind lives in, so it is not
-//! broken; it is the known next thing to fix if scanning turns out to be the
-//! bottleneck. The path is a matcher specialised for fixed-length atoms rather
-//! than a general automaton: bucket the atoms by their first two bytes and
-//! verify the rest directly, which turns the per-byte cost from a cache miss
-//! into a lookup in a table that fits in level 2. The automaton here would
-//! remain the fallback for atoms that do not fit that shape.
+//! Selection is the number this module owns, and it is low enough that the
+//! prefilter is not where the time goes. On `shell32.dll` the whole scan is
+//! 2.04 s and the prefilter is 558 ms of it, 27%, with the sweep at 151 ms and
+//! the remaining 1.33 s spent on the strings that survived the gate.
 //!
-//! The other lever is fewer atoms. Scoring them by how rare they are across the
-//! rule set — and across a corpus of benign files — rather than by their own
-//! bytes, which is what [`crate::atoms::score`] does today, would cut the
-//! automaton, and there is a second pass over the rule set that could do it.
-//! Neither is worth building until something measures the end-to-end scan.
+//! Inside that 558 ms, the search is the part that changed. `pattern_bench` runs
+//! both matchers over the real atom set and the same buffer in one process, so
+//! the comparison has no second machine in it: the two searches cost 208 ms with
+//! [`AtomSet`] against 336 ms with Aho-Corasick, and the case-insensitive half's
+//! fold is a further 2.9 ms timed on its own. The rest of the 558 ms (some
+//! 350 ms) is not the search at all but the work per match, and what makes it
+//! that large is the count: 10.8 million matches on this one file, which is what
+//! a set of three- and four-byte atoms finds in an 8 MB binary.
+//!
+//! `examples/ac_bench.rs` is where the case for the swap was made, and it is
+//! worth keeping in view because it is the measurement that says the old search
+//! could not be tuned out of the problem: 154 MB/s at a thousand patterns, 84 at
+//! ten thousand, 22 at sixty-seven thousand. Flat in the number of matches and
+//! linear in the number of automaton states, which is the shape of a transition
+//! table that has spilled out of cache and charges every input byte for a miss.
+//! Atoms of a fixed short length do not need that table, and this module stopped
+//! paying for it.
+//!
+//! So the next lever is neither a faster search nor the automaton the earlier
+//! version of this comment proposed. That matcher is the one this module now
+//! has. It is **fewer matches to report**, which is a question about the atoms
+//! rather than about the search. Scoring them by how rare they are across the
+//! rule set (and across a corpus of benign files) rather than by their own
+//! bytes, which is what [`crate::atoms::score`] does today, would cut both the
+//! match count and the number of atoms, and there is a second pass over the rule
+//! set that could do it. It is not worth building until something measures the
+//! end-to-end scan, and the numbers above are that measurement.
 //!
 //! # Checking that none of this costs a detection
 //!
 //! Everything above is a filter, and every filter here is an optimization that
 //! can lose a rule if its premise is wrong. `examples/verify_filters.rs` scans
-//! the same buffer twice — once through this module and once with
-//! [`crate::scanner::Scanner::unfiltered`], which decides nothing — and compares
+//! the same buffer twice (once through this module and once with
+//! [`crate::scanner::Scanner::unfiltered`], which decides nothing) and compares
 //! the reported matches, rule by rule and offset by offset. Run it after any
 //! change in this file or in [`crate::atoms`]: on the rule set's own text it
 //! compares about ninety real detections, and it prints the slot and the offset
@@ -119,6 +166,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
+use av_patterns::AtomSet;
 use smallvec::SmallVec;
 
 use crate::atoms::{Atom, StringAtoms};
@@ -191,16 +239,25 @@ impl From<RuleStrings> for RuleFilter {
 
 /// Selects the rules worth evaluating against a buffer.
 pub struct Prefilter {
-    case_sensitive: Option<AhoCorasick>,
-    case_insensitive: Option<AhoCorasick>,
-    /// Automaton pattern index -> unified atom id, one table per automaton.
+    case_sensitive: Option<AtomSet>,
+    /// The same atoms, folded, over a haystack folded to match.
+    ///
+    /// Folded at build time rather than searched case-insensitively, because
+    /// the matcher has no case rule: it compares the bytes it was given. The
+    /// fold of the *buffer* is what the second half of a scan pays for.
+    case_insensitive: Option<AtomSet>,
+    /// Search pattern index -> unified atom id, one table per search.
+    ///
+    /// An [`AtomSet`] reports an index into the slice it was built from, and
+    /// both sets are built from these same two lists in these same orders, so
+    /// this is the whole of the translation.
     sensitive_atom: Vec<u32>,
     insensitive_atom: Vec<u32>,
     /// Unified atom id -> the atom, for its trailer and its case rule.
     ///
-    /// The bytes are in the automaton, but the bytes *after* them are not: a
-    /// four-byte atom is what the automaton can afford, and the trailer is
-    /// checked here at each hit. See [`crate::atoms::TRAILER_LEN`].
+    /// The bytes are in the search, but the bytes *after* them are not: an atom
+    /// stops at `MAX_ATOM_LEN`, so the trailer is checked here at each hit.
+    /// See [`crate::atoms::TRAILER_LEN`].
     atoms: Vec<Atom>,
     /// Unified atom id -> the groups it satisfies. More than one when the same
     /// bytes appear in more than one rule, which is common — `kernel32.dll`
@@ -259,8 +316,8 @@ pub enum StringState {
 
 /// Hand-written rather than derived, because the interesting thing about a
 /// prefilter is its size and not its contents: a derived `Debug` would print
-/// sixty-seven thousand atoms into whatever log it was reached from. The
-/// automata are summarised by their pattern counts, which is the part that
+/// sixty-seven thousand atoms into whatever log it was reached from. The two
+/// searches are summarised by their pattern counts, which is the part that
 /// decides how fast the thing runs.
 impl fmt::Debug for Prefilter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -417,7 +474,7 @@ impl Prefilter {
         }
 
         // A rule is either in the tally list or not, and `unfiltered` is
-        // reported before either automaton runs. The two are disjoint by
+        // reported before either search runs. The two are disjoint by
         // construction — a rule reaches here with `refutable > 0` only when
         // `required_here` is non-empty, which is also the only case the
         // disjunctive push above is suppressed — but a duplicate would cost a
@@ -428,8 +485,9 @@ impl Prefilter {
         // other rule's.
         rule_first_string.push(string_group_count.len() as u32);
 
-        // Split by case sensitivity, which is the one property the automaton
-        // has to know about at build time.
+        // Split by case sensitivity, which is the one property a search has to
+        // know about at build time: the atom set compares bytes and does not
+        // fold, so which side an atom belongs on decides what it is given.
         let mut sensitive_patterns: Vec<Vec<u8>> = Vec::new();
         let mut sensitive_atom: Vec<u32> = Vec::new();
         let mut insensitive_patterns: Vec<Vec<u8>> = Vec::new();
@@ -446,6 +504,28 @@ impl Prefilter {
             }
         }
 
+        let case_sensitive = build_atom_set(&sensitive_patterns, false);
+        let case_insensitive = build_atom_set(&insensitive_patterns, true);
+
+        // The premise the matcher is chosen on, checked where it is cheap to
+        // check rather than assumed. Every atom `crate::atoms` produces is
+        // three or four bytes, so the atom set's gated path covers all of them
+        // and the linear path for shorter atoms is never entered. A rule set
+        // that ever produced a one- or two-byte atom would still be *correct*
+        // here — the matcher handles them — but it would be quietly slower, and
+        // this is where that would be noticed instead of inferred from a
+        // benchmark that had drifted.
+        debug_assert!(
+            case_sensitive
+                .iter()
+                .chain(case_insensitive.iter())
+                .all(|set| set.short_atom_count() == 0),
+            "an atom shorter than {} bytes reached the prefilter, which no code path in \
+             `crate::atoms` should produce; the matcher would fall back to a linear scan \
+             for it",
+            crate::atoms::MIN_ATOM_LEN
+        );
+
         let stats = PrefilterStats {
             rules: rules.len(),
             atoms: atoms.len(),
@@ -456,8 +536,8 @@ impl Prefilter {
         };
 
         Self {
-            case_sensitive: build_automaton(&sensitive_patterns, false),
-            case_insensitive: build_automaton(&insensitive_patterns, true),
+            case_sensitive,
+            case_insensitive,
             sensitive_atom,
             insensitive_atom,
             atoms,
@@ -497,11 +577,42 @@ impl Prefilter {
             scratch.report(*rule, out);
         }
 
-        if let Some(ac) = &self.case_sensitive {
-            self.select(ac, &self.sensitive_atom, data, scratch, out);
+        if let Some(set) = &self.case_sensitive {
+            self.select(set, &self.sensitive_atom, data, data, scratch, out);
         }
-        if let Some(ac) = &self.case_insensitive {
-            self.select(ac, &self.insensitive_atom, data, scratch, out);
+        if let Some(set) = &self.case_insensitive {
+            // The folded copy lives in the scratch so that a scan allocates
+            // nothing, and it is taken out of the scratch for the duration of
+            // the search rather than borrowed from it. Borrowing it would mean
+            // holding a `&` into `scratch` while passing `&mut scratch` to the
+            // search, and the two are not actually in conflict — the buffer and
+            // the state it is borrowed from are different things — so taking it
+            // out is how that is said rather than how it is worked around.
+            let mut folded = std::mem::take(&mut scratch.folded);
+            fold_ascii_into(&mut folded, data);
+            // `data` and not `folded` for the trailer check: an atom's trailer
+            // is compared case-insensitively against the file's own bytes, so
+            // the folded copy would answer a different question. The offsets
+            // are the same in both, which is the only reason one may be
+            // searched and the other read.
+            self.select(set, &self.insensitive_atom, &folded, data, scratch, out);
+            // Given back only while it is still a buffer worth keeping. This one
+            // grows to the largest file the thread has scanned and a `Vec` never
+            // returns memory on its own, so a scan that met a single large file
+            // leaves that thread holding that file's size for the rest of the
+            // run — on every thread that met one, because each has its own
+            // scratch. Ten workers and a few large files is gigabytes held for
+            // no reason, and it is memory the scan budget was never told about:
+            // the budget is charged `COPIES_PER_FILE` for the files in flight
+            // and nothing for what the threads keep afterwards. A small buffer
+            // is worth keeping, because a small file is the common case and
+            // reallocating per file is the cost this scratch exists to avoid. A
+            // large one is not, and is released here to be re-taken per file,
+            // where the budget can see it.
+            if folded.capacity() > RETAINED_FOLD_LIMIT {
+                folded.shrink_to(RETAINED_FOLD_LIMIT);
+            }
+            scratch.folded = folded;
         }
 
         out.sort_unstable();
@@ -524,12 +635,7 @@ impl Prefilter {
     /// strings has a weak atom still has six other strings, and the atoms
     /// already proved five of them absent. Matching those five is pure waste,
     /// and on a clean file the prefilter's selection is mostly this case.
-    pub fn string_state(
-        &self,
-        scratch: &PrefilterScratch,
-        rule: u32,
-        slot: u32,
-    ) -> StringState {
+    pub fn string_state(&self, scratch: &PrefilterScratch, rule: u32, slot: u32) -> StringState {
         debug_assert_eq!(
             scratch.owner,
             self.address(),
@@ -579,7 +685,7 @@ impl Prefilter {
     /// `shell32.dll` does 19,977 full-buffer searches over eight megabytes,
     /// which is 160 GB of memory traffic and eighteen seconds.
     ///
-    /// The atom the automaton matched is a byte sequence the string must
+    /// The atom the search matched is a byte sequence the string must
     /// contain. Every occurrence of it is somewhere a match of the string must
     /// reach, so every occurrence is a candidate: if the atom's bytes sit at
     /// index `k` of the pattern, a match containing the occurrence at `w` must
@@ -669,15 +775,15 @@ impl Prefilter {
     }
 
     /// How many occurrences of one atom are remembered for the witness search.
-///
-/// This is the point where locating a string stops being worth it and searching
-/// for it starts. `n` remembered offsets means the matcher verifies `n`
-/// candidate positions, each a comparison of the pattern's length — so the
-/// work is `n × len` instead of the length of the buffer. At sixteen, a
-/// hundred-byte pattern costs 1,600 byte comparisons against eight million for
-/// a pass over `shell32.dll`.
-///
-/// How many string slots a rule has.
+    ///
+    /// This is the point where locating a string stops being worth it and searching
+    /// for it starts. `n` remembered offsets means the matcher verifies `n`
+    /// candidate positions, each a comparison of the pattern's length — so the
+    /// work is `n × len` instead of the length of the buffer. At sixteen, a
+    /// hundred-byte pattern costs 1,600 byte comparisons against eight million for
+    /// a pass over `shell32.dll`.
+    ///
+    /// How many string slots a rule has.
     pub fn string_count(&self, rule: u32) -> u32 {
         self.rule_range(rule).map_or(0, |r| r.end - r.start)
     }
@@ -688,42 +794,54 @@ impl Prefilter {
         self as *const Prefilter as usize
     }
 
-    /// Run one automaton and turn its matches into satisfied groups.
+    /// Run one search and turn its matches into satisfied groups.
+    ///
+    /// `haystack` is what is searched and `data` is what the trailers are
+    /// checked against. They are the same buffer for the case-sensitive half
+    /// and the buffer and its folded copy for the case-insensitive one, which
+    /// is why they are two arguments rather than one: the offsets are
+    /// identical, so either may be read at an offset the other produced, and
+    /// conflating them would fold the trailers too.
     fn select(
         &self,
-        ac: &AhoCorasick,
+        set: &AtomSet,
         atom_of_pattern: &[u32],
+        haystack: &[u8],
         data: &[u8],
         scratch: &mut PrefilterScratch,
         out: &mut Vec<u32>,
     ) {
-        // `find_overlapping_iter`, not `find_iter`. Atoms from different rules
-        // routinely overlap — `bcde` and `abcd` both occur in `abcde` — and
-        // `find_iter` would report the first and skip the second, dropping the
-        // rule that depends on it. That is a false negative, the one failure
-        // this module exists to prevent, and it was this way until the test
-        // below caught it. It requires `MatchKind::Standard`, which is what the
-        // automatons are built with.
-        for found in ac.find_overlapping_iter(data) {
-            let atom = atom_of_pattern[found.pattern().as_usize()] as usize;
+        // Overlapping occurrences, which is what `for_each_match` reports and
+        // what a general matcher's `find_iter` would not: atoms from different
+        // rules routinely overlap — `bcde` and `abcd` both occur in `abcde` —
+        // and reporting the first while skipping the second drops the rule that
+        // depends on it. That is a false negative, the one failure this module
+        // exists to prevent, and it was this way until the test below caught it.
+        set.for_each_match(haystack, |pattern, offset| {
+            // Every id the matcher reports is an index into the list this set
+            // was built from, so it is in range; a `None` here would be a
+            // matcher bug and skipping is the safe direction for one.
+            let Some(&atom) = atom_of_pattern.get(pattern as usize) else {
+                return;
+            };
+            let atom = atom as usize;
 
-            // The automaton found the atom's own bytes; the bytes that must
-            // follow them are checked here, because four is all the automaton
-            // can carry. A hit that fails this is not an occurrence of the atom
-            // at all, so it is skipped exactly as if the automaton had never
+            // The search found the atom's own bytes; the bytes that must
+            // follow them are checked here, because four is all the atom
+            // carries. A hit that fails this is not an occurrence of the atom
+            // at all, so it is skipped exactly as if the search had never
             // reported it — which is what turns a four-byte match into a
             // twelve-byte one and keeps the scanner from searching for strings
             // that are not in the file.
             let Some(the) = self.atoms.get(atom) else {
-                continue;
+                return;
             };
-            if !the.is_present_at(data, found.start()) {
-                continue;
+            if !the.is_present_at(data, offset as usize) {
+                return;
             }
 
-            let offset = u32::try_from(found.start()).unwrap_or(u32::MAX);
             if !scratch.visit_atom(atom as u32, offset) {
-                continue;
+                return;
             }
             for group in &self.atom_groups[atom] {
                 if !scratch.satisfy_group(*group, &self.group_string, &self.string_group_count) {
@@ -748,7 +866,70 @@ impl Prefilter {
                 // that is not selected on "any string". It says nothing about
                 // whether the rule can match.
             }
-        }
+        });
+    }
+}
+
+/// Build one atom set, or nothing if there is nothing to put in it.
+///
+/// An empty set is not a degenerate case worth supporting: it would be a scan
+/// over every buffer that can never match, and `None` says the same thing
+/// without the work.
+///
+/// `ascii_case_insensitive` folds the patterns rather than configuring the
+/// matcher, because [`AtomSet`] has no such setting — it compares the bytes it
+/// is given. The caller then owes it a folded haystack, which
+/// [`Prefilter::candidates`] supplies. Folding here rather than in the scan is
+/// the point: it is once per rule database instead of once per case-insensitive
+/// atom, and it is what keeps a four-byte atom from becoming the sixteen
+/// patterns a case-insensitive automaton would store it as.
+fn build_atom_set(patterns: &[Vec<u8>], ascii_case_insensitive: bool) -> Option<AtomSet> {
+    if patterns.is_empty() {
+        return None;
+    }
+    if !ascii_case_insensitive {
+        return Some(AtomSet::new(patterns));
+    }
+    let folded: Vec<Vec<u8>> = patterns.iter().map(|bytes| fold_ascii(bytes)).collect();
+    Some(AtomSet::new(&folded))
+}
+
+/// ASCII upper case folded to lower, as a copy.
+fn fold_ascii(bytes: &[u8]) -> Vec<u8> {
+    bytes.iter().map(u8::to_ascii_lowercase).collect()
+}
+
+/// The same, in place into a caller's buffer, so that a scan reuses one
+/// allocation rather than making one per file.
+///
+/// A table and not a branch or an arithmetic trick: one lookup per byte, and
+/// obviously right for all 256 values. It has to be right, because it is the
+/// pass that decides whether a case-insensitive atom is found at all — and it
+/// is the counterpart of `AhoCorasickBuilder::ascii_case_insensitive`, which
+/// does the same fold inside its transition function. Anything that folded a
+/// different set of bytes than that would find a different set of atoms, and
+/// the difference would be a missed rule.
+/// The largest folded buffer a scanning thread keeps between files.
+///
+/// One mebibyte, because that is the size above which keeping the buffer stops
+/// being an optimisation and starts being a leak. Below it, a file costs one
+/// `reserve` that finds the capacity already there, which is what the scratch is
+/// for; above it, the buffer is released after the file rather than held for
+/// ever, and the next large file pays one allocation that the budget can count.
+///
+/// The number is a compromise between two costs and not a measurement of
+/// either, which is worth saying: the cost of keeping is `threads ×
+/// largest_file` resident for the whole run, and the cost of releasing is one
+/// `malloc` per large file. At ten workers, a 1 MiB limit bounds what the
+/// scratch holds to ten mebibytes, and a folder of large executables pays about
+/// one allocation each.
+const RETAINED_FOLD_LIMIT: usize = 1 << 20;
+
+fn fold_ascii_into(out: &mut Vec<u8>, data: &[u8]) {
+    out.clear();
+    out.reserve(data.len());
+    for byte in data {
+        out.push(byte.to_ascii_lowercase());
     }
 }
 
@@ -757,7 +938,15 @@ impl Prefilter {
 /// An empty automaton is not a degenerate case worth supporting: it would be a
 /// scan over every buffer that can never match, and `None` says the same thing
 /// without the work.
-fn build_automaton(patterns: &[Vec<u8>], ascii_case_insensitive: bool) -> Option<AhoCorasick> {
+///
+/// Shared with [`crate::sweep`], which needs the same automaton over literal
+/// forms rather than atoms. The two must be built the same way for the same
+/// reason the prefilter gives for `MatchKind::Standard`: an overlapping match
+/// this automaton failed to report is an occurrence a string never learns about.
+pub(crate) fn build_automaton(
+    patterns: &[Vec<u8>],
+    ascii_case_insensitive: bool,
+) -> Option<AhoCorasick> {
     if patterns.is_empty() {
         return None;
     }
@@ -849,6 +1038,21 @@ pub struct PrefilterScratch {
     /// rather than written by a loop.
     required_left: Vec<u32>,
     required_epoch: Vec<u32>,
+    /// The folded copy of the buffer the case-insensitive atoms are searched in.
+    ///
+    /// Held here and reused rather than made per file so that a scan still
+    /// allocates nothing, and left out of `begin`'s growth check because its
+    /// size follows the file rather than the rule set — the fold reserves what
+    /// it needs on the buffer it is folding. It saves a second pass over the
+    /// atom set's own tables to expand case variants instead. Empty when the
+    /// rule set has no case-insensitive atoms, which is when nothing ever
+    /// writes to it.
+    ///
+    /// What it holds is bounded by [`RETAINED_FOLD_LIMIT`]: a buffer above that
+    /// size is released after the file it was folded for rather than kept, so
+    /// that one large file does not leave every scanning thread holding a copy
+    /// of it for the rest of the run.
+    folded: Vec<u8>,
 }
 
 impl PrefilterScratch {
@@ -867,6 +1071,7 @@ impl PrefilterScratch {
             rule_seen: vec![0; prefilter.stats.rules],
             required_left: vec![0; prefilter.stats.rules],
             required_epoch: vec![0; prefilter.stats.rules],
+            folded: Vec::new(),
         }
     }
 
@@ -997,7 +1202,10 @@ impl PrefilterScratch {
     /// because a tally that starts at zero would have this function report a
     /// rule before any of its strings had been seen.
     fn satisfy_required(&mut self, rule: u32, needed: u32) -> bool {
-        debug_assert!(needed > 0, "a rule with no refutable required strings is unfiltered");
+        debug_assert!(
+            needed > 0,
+            "a rule with no refutable required strings is unfiltered"
+        );
         if self.required_epoch[rule as usize] != self.epoch {
             self.required_epoch[rule as usize] = self.epoch;
             self.required_left[rule as usize] = needed;
@@ -1025,7 +1233,7 @@ mod tests {
 
     /// Rules with no conjunctive information.
     ///
-    /// Most of the tests below are about what the automaton and the per-string
+    /// Most of the tests below are about what the search and the per-string
     /// state machine do, which is the disjunctive path. The conjunctive path
     /// has its own tests, which build their rules directly.
     fn filters(rules: &[RuleStrings]) -> Vec<RuleFilter> {
@@ -1035,14 +1243,18 @@ mod tests {
     /// A string that requires `bytes`.
     fn one(bytes: &[u8]) -> StringAtoms {
         StringAtoms {
-            groups: vec![vec![best_atom(bytes, false).expect("test atom must be long enough")]],
+            groups: vec![vec![
+                best_atom(bytes, false).expect("test atom must be long enough")
+            ]],
         }
     }
 
     /// A string that requires `bytes` case-insensitively.
     fn one_nocase(bytes: &[u8]) -> StringAtoms {
         StringAtoms {
-            groups: vec![vec![best_atom(bytes, true).expect("test atom must be long enough")]],
+            groups: vec![vec![
+                best_atom(bytes, true).expect("test atom must be long enough")
+            ]],
         }
     }
 
@@ -1128,7 +1340,11 @@ mod tests {
         let rules: Vec<RuleStrings> = needles.iter().map(|n| vec![one(n)]).collect();
         let p = Prefilter::build(&filters(&rules));
         assert_eq!(p.stats().atoms, 8, "eight strings, eight atoms");
-        assert_eq!(scan(&p, b"marker03"), vec![3], "and only one of them selected");
+        assert_eq!(
+            scan(&p, b"marker03"),
+            vec![3],
+            "and only one of them selected"
+        );
         for (index, needle) in needles.iter().enumerate() {
             let mut file = b"padding ".to_vec();
             file.extend_from_slice(needle);
@@ -1149,7 +1365,10 @@ mod tests {
             groups: vec![vec![Atom::with_trailer(b"ABCD", false, b"EFGH").unwrap()]],
         };
         let p = Prefilter::build(&filters(&[vec![atoms]]));
-        assert!(scan(&p, b"ABCD").is_empty(), "the four bytes alone are not the atom");
+        assert!(
+            scan(&p, b"ABCD").is_empty(),
+            "the four bytes alone are not the atom"
+        );
         assert!(
             scan(&p, b"ABCD EFGH").is_empty(),
             "nor are they when the rest is somewhere else in the file"
@@ -1331,9 +1550,9 @@ mod tests {
     // -- building ----------------------------------------------------------
 
     #[test]
-    fn the_same_atom_in_two_rules_is_one_automaton_entry() {
-        // `kernel32.dll` is in hundreds of rules; compiling it hundreds of
-        // times would multiply the automaton for nothing.
+    fn the_same_atom_in_two_rules_is_one_search_entry() {
+        // `kernel32.dll` is in hundreds of rules; carrying it hundreds of times
+        // would multiply the search's tables for nothing.
         let p = Prefilter::build(&filters(&[
             vec![one(b"kernel32.dll")],
             vec![one(b"kernel32.dll")],
@@ -1392,8 +1611,9 @@ mod tests {
     /// `$a and $b`: selected only when both atoms are in the buffer.
     #[test]
     fn a_conjunctive_rule_needs_every_string_it_requires() {
-        let p = Prefilter::build(&[RuleFilter::of(vec![one(b"alpha"), one(b"bravo")])
-            .requiring(vec![0, 1])]);
+        let p = Prefilter::build(&[
+            RuleFilter::of(vec![one(b"alpha"), one(b"bravo")]).requiring(vec![0, 1])
+        ]);
         assert_eq!(scan(&p, b"alpha and bravo"), vec![0]);
         assert_eq!(
             scan(&p, b"alpha on its own"),
@@ -1436,8 +1656,10 @@ mod tests {
     /// and the rule would never fire at all.
     #[test]
     fn a_required_string_with_no_atoms_does_not_block_its_rule() {
-        let p = Prefilter::build(&[RuleFilter::of(vec![one(b"alpha"), opaque()])
-            .requiring(vec![0, 1])]);
+        let p =
+            Prefilter::build(
+                &[RuleFilter::of(vec![one(b"alpha"), opaque()]).requiring(vec![0, 1])],
+            );
         assert_eq!(
             scan(&p, b"alpha"),
             vec![0],
@@ -1474,8 +1696,9 @@ mod tests {
         // `$a and $a`, hand-built. The tally counts strings that can decrement
         // it, so a duplicate cannot leave it one short of zero — which would be
         // a rule that never fires.
-        let p = Prefilter::build(&[RuleFilter::of(vec![one(b"alpha"), one(b"bravo")])
-            .requiring(vec![0, 0])]);
+        let p = Prefilter::build(&[
+            RuleFilter::of(vec![one(b"alpha"), one(b"bravo")]).requiring(vec![0, 0])
+        ]);
         assert_eq!(scan(&p, b"alpha"), vec![0]);
         assert_eq!(scan(&p, b"nothing"), Vec::<u32>::new());
     }
@@ -1495,8 +1718,9 @@ mod tests {
     /// A conjunctive rule must be reported once, not once per string.
     #[test]
     fn a_conjunctive_rule_is_reported_exactly_once() {
-        let p = Prefilter::build(&[RuleFilter::of(vec![one(b"alpha"), one(b"bravo")])
-            .requiring(vec![0, 1])]);
+        let p = Prefilter::build(&[
+            RuleFilter::of(vec![one(b"alpha"), one(b"bravo")]).requiring(vec![0, 1])
+        ]);
         assert_eq!(scan(&p, b"alpha bravo alpha bravo"), vec![0]);
     }
 
@@ -1507,8 +1731,9 @@ mod tests {
     /// on the first of its strings.
     #[test]
     fn a_second_scan_does_not_inherit_the_first_ones_tally() {
-        let p = Prefilter::build(&[RuleFilter::of(vec![one(b"alpha"), one(b"bravo")])
-            .requiring(vec![0, 1])]);
+        let p = Prefilter::build(&[
+            RuleFilter::of(vec![one(b"alpha"), one(b"bravo")]).requiring(vec![0, 1])
+        ]);
         assert_eq!(scan(&p, b"alpha bravo"), vec![0]);
         assert_eq!(
             scan(&p, b"alpha"),
@@ -1742,7 +1967,7 @@ mod tests {
 
     #[test]
     fn a_witness_is_reported_for_a_string_whose_atom_occurs_once() {
-        // The case the scanner's shortcut is for: the automaton saw the atom
+        // The case the scanner's shortcut is for: the search saw the atom
         // exactly once, so every match of the string must contain that one
         // occurrence and the search is a few byte comparisons instead of a pass
         // over the buffer.
@@ -1750,7 +1975,10 @@ mod tests {
         let data = b"xxatomxx";
         let mut scratch = p.scratch();
         assert_eq!(scan_keeping_scratch(&p, data, &mut scratch), vec![0]);
-        assert_eq!(witnesses_of(&p, &scratch), Some(every_offset(b"atom", data)));
+        assert_eq!(
+            witnesses_of(&p, &scratch),
+            Some(every_offset(b"atom", data))
+        );
     }
 
     #[test]
@@ -1768,7 +1996,7 @@ mod tests {
         assert_eq!(
             witnesses_of(&p, &scratch),
             Some(every_offset(b"atom", data)),
-            "all three, in the order the automaton met them"
+            "all three, in the order the search met them"
         );
     }
 

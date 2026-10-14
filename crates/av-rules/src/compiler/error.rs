@@ -24,6 +24,17 @@ pub struct CompileError {
     /// Drawn from a closed set of literals so that a histogram over many rules
     /// counts kinds of gap rather than kinds of wording.
     pub feature: &'static str,
+    /// The particular thing that was refused, in the same closed vocabulary.
+    ///
+    /// `feature` says *what kind* of gap this is; this says *which one*. For a
+    /// module field it is the path — `pe.number_of_signatures` — so that a
+    /// histogram can rank the fields rather than the categories. That ranking
+    /// is what decides which of `pe`'s two hundred members to implement, and
+    /// guessing it would waste the work.
+    ///
+    /// Not free-form: a caller must be able to group on it, so it is the
+    /// construct's own name and nothing else.
+    pub detail: String,
     /// Where the problem is.
     ///
     /// The span of the whole condition, because [`crate::ast::Expr`] does not
@@ -40,6 +51,7 @@ impl CompileError {
         Self {
             message: format!("{feature} is not compiled yet: {what}"),
             feature,
+            detail: what.to_string(),
             span,
         }
     }
@@ -51,8 +63,12 @@ impl CompileError {
     /// and if it does, the set-expansion code is wrong.
     pub fn undefined_string(name: &str, span: Span) -> Self {
         Self {
-            message: format!("`${}` is used in the condition but never defined", strip(name)),
+            message: format!(
+                "`${}` is used in the condition but never defined",
+                strip(name)
+            ),
             feature: "undefined string",
+            detail: strip(name).to_string(),
             span,
         }
     }
@@ -67,6 +83,7 @@ impl CompileError {
         Self {
             message: format!("`{set}` names no strings defined by this rule"),
             feature: "empty string set",
+            detail: set.to_string(),
             span,
         }
     }
@@ -79,6 +96,26 @@ impl CompileError {
         Self {
             message: format!("rule defines {count} strings, more than the engine can index"),
             feature: "too many strings",
+            detail: count.to_string(),
+            span,
+        }
+    }
+
+    /// A rule that cannot be used because of another rule in the set.
+    ///
+    /// The three shapes are a reference to a rule that did not compile, a
+    /// reference to a name the set defines twice, and a cycle. All three are
+    /// properties of the *set* rather than of the condition, which is why they
+    /// get their own tag: they are counted separately from missing language
+    /// features, because implementing a feature never fixes one of them.
+    ///
+    /// `detail` is the name of the rule being refused and not the one at fault,
+    /// so a histogram ranks the rules that were lost. The message names both.
+    pub fn dependency(rule: String, span: Span, message: String) -> Self {
+        Self {
+            message,
+            feature: "rule dependency",
+            detail: rule,
             span,
         }
     }
@@ -88,6 +125,7 @@ impl CompileError {
         Self {
             message: format!("internal compiler error: {message}"),
             feature: "internal",
+            detail: message.to_string(),
             span,
         }
     }

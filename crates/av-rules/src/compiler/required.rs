@@ -230,7 +230,10 @@ mod tests {
     fn a_negated_disjunction_does_not_leak_its_operands() {
         // The `or` rule intersects its operands. Wrapped in a `not`, that
         // intersection is a requirement for the *opposite* of what is wanted.
-        assert_eq!(required("not (($a and $b) or ($a and $c))"), Vec::<u32>::new());
+        assert_eq!(
+            required("not (($a and $b) or ($a and $c))"),
+            Vec::<u32>::new()
+        );
     }
 
     #[test]

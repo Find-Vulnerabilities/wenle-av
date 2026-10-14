@@ -1,0 +1,137 @@
+# This crate is its own workspace on purpose. It is *not* a member of the
+# workspace two directories up, and the reason is in that workspace's `members`
+# comment: building it needs the WDK, a nightly toolchain and `-Z build-std`,
+# and a repository where `cargo build` at the root tried to do all three would
+# be a repository nobody could clone and build.
+#
+# So: `cd crates/av-driver && cargo build`. The toolchain comes from this
+# directory's `rust-toolchain.toml` and the flags from `.cargo/config.toml`.
+[package]
+name = "av-driver"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Wenle Antivirus Contributors"]
+description = "Minifilter that refuses execution until the service answers"
+publish = false
+
+[workspace]
+
+[lib]
+# `cdylib`, not `staticlib`. The WDK's linker arguments that `wdk-build` emits
+# -- `/SUBSYSTEM:NATIVE /KERNEL /ENTRY:DriverEntry` -- are `rustc-cdylib-link-arg`,
+# so they are only applied to a `cdylib` target. With `staticlib` the crate
+# compiles to an archive and the driver's entry point is never linked in, which
+# fails at load rather than at build.
+crate-type = ["cdylib"]
+
+# What `wdk-build` reads to decide which linker arguments and which libraries a
+# driver needs. Without this section `Config::from_env_auto` refuses to build at
+# all, by design: a driver whose model is guessed is a driver linked against the
+# wrong framework.
+#
+# # WDM, and not KMDF
+#
+# This said `driver-type = "KMDF"` until 2026-09-26. In KMDF mode `wdk-build`
+# links `WdfLdr.lib` and `WdfDriverEntry.lib`, and names the framework's entry
+# point `/ENTRY:FxDriverEntry`; in WDM mode it links `ntoskrnl.lib`, `hal.lib`,
+# `BufferOverflowFastFailK.lib` and `wmilib.lib`, names `/ENTRY:DriverEntry`,
+# and links no framework library at all. Both were measured on the built image
+# rather than taken from the documentation: the KMDF build imports
+# `WdfVersionBind` and names `WDFLDR` in its import table, and the WDM build
+# does neither.
+#
+# That matters because `FxDriverEntry` is not a pass-through. It binds the
+# driver to `WDFLDR.SYS` with `WdfVersionBind` *before* it calls the
+# `DriverEntry` in `src/lib.rs`, and it expects that routine to create a
+# framework driver object with `WdfDriverCreate` -- which installs the
+# framework's own unload routine and is what later calls the matching
+# `WdfVersionUnbind`. This driver never called `WdfDriverCreate`: every call it
+# makes is a filter-manager call or a `Ps*` call, and the crate does not depend
+# on the `wdk` safe layer, which is the only thing here that would have made the
+# call for it. So the load path was the framework's -- a bind, performed by
+# `FxDriverEntry`, that no routine in this crate could pair -- while registering
+# and starting the filter, which is all this driver actually does, was done by
+# `FltRegisterFilter` and `FltStartFiltering` and never needed the framework.
+#
+# The cost was observed in the test VM on 2026-09-26: `fltmc unload
+# WenleAvFilter` followed by `fltmc load WenleAvFilter` bugchecked the machine,
+# and a fresh boot with the same image loaded at boot was fine. That is the
+# signature of a fault in the unload path or in state it leaves behind, which is
+# where the framework's unpaired binding lives. The mechanism is *not* proven --
+# no dump has been read, so the fault is unattributed -- and this line is a
+# defect being removed on its own merits, not a diagnosis. What would settle it
+# is the bugcheck's faulting module: `WDFLDR.SYS` would confirm this note, and
+# `WenleAvFilter.sys` would mean the fault is in a callback of ours instead.
+#
+# A minifilter that uses no WDF API has no reason to be bound to the framework.
+# Neither does one that ships: every filesystem minifilter Windows ships is
+# WDM. Read on 2026-09-26, `FileInfo.sys`, `luafv.sys`, `bindflt.sys`,
+# `Wof.sys`, `FileCrypt.sys`, `storqosflt.sys`, `wcifs.sys`, `npsvctrig.sys`
+# and Defender's own `WdFilter.sys` all contain no reference to `WDFLDR` at all.
+[workspace.metadata.wdk.driver-model]
+driver-type = "WDM"
+
+[dependencies]
+# The protocol, the decision table and the path work. No WDK, no `unsafe`, and
+# every one of its tests runs on stable Rust on the build machine -- which is
+# the entire reason it is a separate crate. See its `src/lib.rs`.
+av-driver-proto = { path = "../av-driver-proto" }
+
+# The WDK binding family, pinned to the versions that were current when this was
+# written. `wdk-sys` 0.5.1 is the bindgen output; `wdk-macros` supplies the
+# macros; `wdk-panic` is the panic handler.
+wdk-sys = "0.5.1"
+wdk-macros = "0.5.1"
+
+# Two members of the family are deliberately absent, and cargo warns about them
+# if they are added back:
+#
+# `wdk` 0.4.1, the safe layer, is not used because every call this driver makes
+# to the WDK is a filter-manager call, and `wdk` has no filter-manager binding
+# at all -- `src/flt.rs` has the check that establishes that. The three
+# `wdk-sys` items this crate does use (`PsSetCreateProcessNotifyRoutineEx` and
+# two types) are called directly.
+#
+# `wdk-alloc` 0.4.1 is not used because nothing in this driver allocates. Every
+# buffer is a stack array or a `static`, which is a property worth keeping: an
+# allocation on the path that decides whether a program may execute is an
+# allocation that can fail at a moment when the only safe answer is "allow", and
+# the fewer of those there are the better.
+
+# Not optional and not `cfg(test)`-only: a kernel-mode crate with no panic
+# handler does not link. It is `extern crate`-ed in `lib.rs` so that the handler
+# is reachable from the final link.
+wdk-panic = "0.4.1"
+
+[build-dependencies]
+wdk-build = "0.5.1"
+
+# A panic in a driver at `DISPATCH_LEVEL` cannot unwind -- there is nothing to
+# unwind into, and the failure mode of trying is a bugcheck inside the unwinder.
+# `abort` is set here rather than in `.cargo/config.toml` because `rustflags`
+# would apply it to the build scripts and proc macros as well, which are
+# ordinary user-mode programs that need a normal panic strategy.
+#
+# `opt-level = 1` rather than the dev default of 0, and this is not a
+# convenience: at `opt-level = 0` the driver does not link at all. LLVM's global
+# DCE does not run, so `compiler_builtins`' libm emits its unreferenced `hypot`
+# and `cbrt`, whose `<f64 as Float>::fma` lowers to a libcall named `fma` -- a
+# symbol `compiler_builtins` deliberately does not define on Windows and which
+# `/NODEFAULTLIB` leaves with no CRT to supply it. `build.rs` has the full chain
+# with the evidence for each step. A filesystem filter is also the last place
+# where unoptimised code is defensible.
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+
+[lints.rust]
+# An `unsafe fn` that does unsafe things without an `unsafe` block is a function
+# whose safety contract is invisible. Every `unsafe` block in this crate is
+# preceded by a comment naming the invariant that makes it sound; this lint is
+# what stops one being added without that comment.
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"

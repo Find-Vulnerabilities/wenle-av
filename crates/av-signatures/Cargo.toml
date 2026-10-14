@@ -1,0 +1,20 @@
+[package]
+name = "av-signatures"
+description = "Authenticode: DER, X.509 and PKCS#7 parsing for the certificate fields rules read"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+av-pe.workspace = true
+
+serde.workspace = true
+thiserror.workspace = true
+log.workspace = true
+sha1.workspace = true
+sha2.workspace = true

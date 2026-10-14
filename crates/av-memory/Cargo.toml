@@ -1,0 +1,73 @@
+[package]
+name = "av-memory"
+description = "Memory monitoring: the regions a running process is holding, scanned with the same engine that scans files"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+av-core.workspace = true
+av-scan.workspace = true
+# Only for `path::device_to_dos_path` and `path::eq_ignore_ascii_case`, which
+# turn the `\Device\HarddiskVolume3\...` an address is reported under into a DOS
+# path. The alternative is a second translation written here, and two
+# translations of the same namespace are two translations that disagree about
+# `\??\C:` or about a trailing separator. This crate has no dependencies at all,
+# so nothing about a kernel driver comes with it.
+av-driver-proto.workspace = true
+
+log.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+# The tests build a real rule set in source form and scan a region with it. The
+# alternative — driving the scanner's recording logic with a report built by
+# hand — cannot check that a rule actually fires on bytes that came out of a
+# process, which is the one end-to-end claim this crate makes.
+[dev-dependencies]
+av-rules.workspace = true
+# The test that maps a file into its own process so that the address-provenance
+# answer can be checked against a file whose path the test chose. A temporary
+# directory rather than a path built from the PID: the test maps a file and the
+# mapping outlives nothing, so the cleanup has to happen even when an assertion
+# fires.
+tempfile.workspace = true
+
+# The Win32 surface this crate needs, and nothing wider. Each feature is a
+# module of the generated bindings, and the list is kept to the modules whose
+# functions are actually called here:
+#
+# * `Win32_Foundation` — `HANDLE`, `CloseHandle`, and the `ERROR_*` codes that
+#   tell a refused handle from a process that no longer exists.
+# * `Win32_System_Threading` — `OpenProcess`, `GetCurrentProcessId`,
+#   `QueryFullProcessImageNameW` and the `PROCESS_*` access rights.
+# * `Win32_System_ProcessStatus` — `EnumProcesses`, the only way to list PIDs
+#   that does not need a handle we may not be able to open, and
+#   `GetMappedFileNameW`, which is how an address is attributed to a file.
+# * `Win32_System_Memory` — `VirtualQueryEx` and `MEMORY_BASIC_INFORMATION`,
+#   which is the whole of the region walk.
+# * `Win32_System_Diagnostics_Debug` — `ReadProcessMemory`.
+# * `Win32_System_Diagnostics_ToolHelp` — the loader's module list, which is
+#   the fallback answer for an address the kernel will not name a file for.
+# * `Win32_Storage_FileSystem` — `QueryDosDeviceW`, which is how a drive
+#   letter's volume device name is learned. The same module also carries
+#   `CreateFileW`, which is used by the test that maps a file.
+#
+# Deliberately absent: `Win32_Security`. Nothing here reads a token, and taking
+# that module would put the impersonation and privilege APIs in the build for
+# no reason.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Memory",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_Storage_FileSystem",
+] }

@@ -1,0 +1,84 @@
+[package]
+name = "av-integration"
+description = "Windows Shell integration: Explorer's right-click \"Scan with Wenle Antivirus\" verbs, and the typed registry wrapper they are built on"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+av-core.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+# The integration test writes two values this crate's own API cannot write on
+# purpose — a `REG_DWORD` and a `REG_SZ` holding an unpaired surrogate — because
+# the only way to test that a value somebody else stored is refused with the right
+# typed error is to store one. A dev-dependency and not a feature: it is compiled
+# for `cargo test` and is not in the graph of anything that links this crate.
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+] }
+
+# The registry and the token that says whether this process may write to the
+# machine's half of it. `windows` directly and not `winreg`, for the reason the
+# rest of the workspace uses it: this is a handful of calls whose behaviour is
+# the operating system's, and a wrapper crate would be a second set of
+# signatures to keep in step with the ones already in `Cargo.lock`.
+#
+# The feature list is exactly the four modules called, and no more:
+#
+# * `Win32_Foundation` — every registry call returns a `WIN32_ERROR` rather than
+#   a `windows::core::Result`, so the success and "not there" codes are compared
+#   by name; `CloseHandle` and `HANDLE` come from here too.
+# * `Win32_System_Registry` — `RegCreateKeyExW`, `RegOpenKeyExW`,
+#   `RegSetValueExW`, `RegQueryValueExW`, `RegQueryInfoKeyW`, `RegEnumKeyExW`,
+#   `RegDeleteValueW`, `RegDeleteTreeW`, `RegCloseKey`, and the `HKEY_*`
+#   predefined roots.
+# * `Win32_Security` — `GetTokenInformation` with `TokenElevation`, which is how
+#   the default scope is decided.
+# * `Win32_System_Threading` — `GetCurrentProcess` and `OpenProcessToken`, which
+#   are what `GetTokenInformation` is asked about.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+    "Win32_System_Environment",
+    "Win32_Security",
+    "Win32_System_Threading",
+] }
+
+# The AMSI provider's CLSID, its key names and the check on where its DLL may
+# live. Windows-only, because `av-amsi` is `#![cfg(windows)]` and has no symbols
+# elsewhere — and a dependency here is the right trade rather than a second copy
+# of an identifier: `av-amsi` builds an `rlib` beside the `cdylib` Windows loads,
+# so naming it costs one archive member the linker drops when nothing references
+# it, while a duplicated CLSID costs a registration that installs cleanly and is
+# never enumerated by anything.
+av-amsi.workspace = true
+
+# The driver's installed identity — its service name, its file name under
+# `System32\drivers`, its altitude and its load order group — which the installer
+# writes into the registry and the tamper check later looks for. Both of those
+# are in different crates, and a second spelling of `WenleAvFilter.sys` is a
+# second thing to rename; see `av-driver-proto`'s `src/install.rs`. The crate has
+# no dependencies and is `no_std`, so this costs nothing.
+av-driver-proto.workspace = true
+
+# The driver image is checked before it is installed: what the SCM registers has
+# to be a PE that the kernel will actually accept, and the failure it prevents —
+# a service created successfully that starts and stops immediately — names
+# neither the file nor the reason. `av-pe` is the one PE parser in this workspace
+# and it is already built for the scanner, so this is a reuse and not a second
+# implementation.
+av-pe.workspace = true
+
+[lints]
+workspace = true

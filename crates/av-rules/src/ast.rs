@@ -76,13 +76,43 @@ pub struct RuleMeta {
     pub platform: Option<Platform>,
     pub family: Option<String>,
     pub variant: Option<String>,
-    /// Explicit score override. When absent the compiler derives a score from
-    /// the severity.
+    /// This product's own point value, used as written.
+    ///
+    /// On this engine's ladder already: whoever writes `weight = 150` means a
+    /// hundred and fifty points, and nothing recalibrates it. When absent the
+    /// compiler derives a score from the severity.
     pub weight: Option<u16>,
-    /// Mark the detection as needing no corroboration.
+    /// The confidence rating a third-party rule set carries, **in that set's own
+    /// units**.
+    ///
+    /// Not interchangeable with [`RuleMeta::weight`], and the two were one field
+    /// until the difference was measured. The corpus this product ships rates
+    /// 86% of its 10,764 rules at 75 on a 50–100 scale whose mode means "an
+    /// ordinary rule of this set"; read as 75 points on a ladder that convicts
+    /// at 100, any two of those rules crossed the line together. See
+    /// [`crate::calibrate::weight_for`] for the distribution and the mapping.
+    pub score: Option<u16>,
+    /// Mark the detection as needing no corroboration, and as beyond argument.
+    ///
+    /// Both, and that is the point of writing it by hand: an author who marks a
+    /// rule `decisive` is making the same kind of claim as a third-party set
+    /// that rates a rule 90 out of 100, so the detection convicts alone *and*
+    /// no evidence about who published a file is an answer to it. The other
+    /// routes to a conviction — a rule whose name identifies a family and one
+    /// of its instances, and a rule whose condition demands a string nothing
+    /// ordinary contains — are decisive without being beyond argument — see
+    /// [`av_core::Detection::incontestable`], and
+    /// [`crate::database::RuleMetadata::incontestable`] for how the two are
+    /// told apart once this field has been calibrated.
     pub decisive: bool,
     /// External quality rating, as carried by third-party rule sets.
     pub quality: Option<u8>,
+    /// Tags from the `tags` metadata key, lowercased and split on commas.
+    ///
+    /// Distinct from [`Rule::tags`], which is the list after the colon on the
+    /// `rule` line. Both are the author labelling the rule, and both are read
+    /// the same way; see [`crate::calibrate`].
+    pub tags: Vec<String>,
     /// Free-form keys we do not model.
     pub extra: BTreeMap<String, MetaValue>,
 }
@@ -137,6 +167,33 @@ pub enum StringValue {
         /// Flag letters as written, e.g. `i` in `/re/i`.
         flags: String,
     },
+    /// The value is gone, and only the identifier is left.
+    ///
+    /// # Why this exists rather than an empty value
+    ///
+    /// A loaded database holds every definition twice: once here, as the
+    /// author wrote it, and once inside the compiled matcher, which is what a
+    /// scan actually reads. The copy here has one job left after loading — a
+    /// report names the string that matched, and that needs the identifier and
+    /// nothing else — and it is a large copy: on the shipping corpus the hex
+    /// token trees alone are 45 MB, which every running process pays for twice.
+    /// `RuleDatabase::shed_definitions` empties it, which is most of what a
+    /// loaded database costs.
+    ///
+    /// The alternative was to clear each value in place: empty the text, empty
+    /// the token vector. That leaves `StringValue::Text(vec![])`, which is a
+    /// claim that the rule declared an empty string — a lie that a reader of
+    /// the code cannot distinguish from the truth, and one that would make a
+    /// shed database quietly wrong rather than obviously incomplete. This says
+    /// what happened instead, and makes every place that reads a value say what
+    /// it will do about it.
+    ///
+    /// Serialisation is the one thing that cannot survive it, and
+    /// [`RuleDatabase::to_bytes`](crate::database::RuleDatabase::to_bytes)
+    /// refuses rather than writing a file whose strings are all gone. Nothing
+    /// in the product serialises a loaded database: the writer is `wenle build`,
+    /// which serialises one it has just compiled.
+    Shed,
 }
 
 /// A parsed hex pattern.
@@ -227,10 +284,7 @@ pub enum HexToken {
     ///
     /// `??` is kept as `Nibble { high: None, low: None }` rather than a
     /// separate variant so the matcher has one case to handle.
-    Nibble {
-        high: Option<u8>,
-        low: Option<u8>,
-    },
+    Nibble { high: Option<u8>, low: Option<u8> },
     /// A gap: `[4]` exactly four bytes, `[2-6]` between two and six,
     /// `[4-]` four or more.
     Jump { min: u32, max: Option<u32> },
@@ -263,7 +317,11 @@ impl HexToken {
                     lo = lo.min(a_lo);
                     hi = hi.max(a_hi);
                 }
-                if lo == usize::MAX { (0, 0) } else { (lo, hi) }
+                if lo == usize::MAX {
+                    (0, 0)
+                } else {
+                    (lo, hi)
+                }
             }
             HexToken::Not(alts) => {
                 let mut hi = 0usize;
@@ -325,7 +383,9 @@ impl XorRange {
 
     /// Number of distinct keys in the range, inclusive of both ends.
     pub fn len(self) -> usize {
-        (self.max as usize).saturating_sub(self.min as usize).saturating_add(1)
+        (self.max as usize)
+            .saturating_sub(self.min as usize)
+            .saturating_add(1)
     }
 
     /// Always false: a range is empty only if `max < min`, and the parser
@@ -372,7 +432,16 @@ pub enum Expr {
     Int(i64),
     Float(f64),
     /// A quoted string literal, as used with `contains` and friends.
-    Str(String),
+    ///
+    /// Bytes, not `String`, because a literal is written with `\xHH` escapes
+    /// precisely when it is not text: `pe.sections[1].name == "\x2e\xff\x00"`
+    /// is a rule about bytes, and the lexer already produces them as bytes. A
+    /// `String` in between would have to go through `from_utf8_lossy`, which
+    /// replaces every byte above `0x7f` that does not begin a valid UTF-8
+    /// sequence with `U+FFFD` — three bytes where the rule wrote one, compared
+    /// against a file field that holds the original. The rule would compile, be
+    /// carried into the database, and never match.
+    Str(Vec<u8>),
     /// A `/regex/` literal. Only meaningful as the right-hand side of
     /// `matches`; the compiler rejects it anywhere else.
     Regex {
@@ -485,7 +554,9 @@ pub enum Expr {
         args: Vec<Expr>,
     },
     /// A module field: `pe.number_of_sections`, `pe.rich_signature.clear_data`.
-    Field { path: MemberPath },
+    Field {
+        path: MemberPath,
+    },
     /// Indexing into a module array or a call result: `pe.sections[i].name`.
     Index {
         base: Box<Expr>,
@@ -616,7 +687,10 @@ mod tests {
 
     #[test]
     fn exact_hex_pattern_becomes_a_literal() {
-        assert_eq!(hex(&[0x4D, 0x5A, 0x90]).as_exact_bytes(), Some(vec![0x4D, 0x5A, 0x90]));
+        assert_eq!(
+            hex(&[0x4D, 0x5A, 0x90]).as_exact_bytes(),
+            Some(vec![0x4D, 0x5A, 0x90])
+        );
     }
 
     #[test]
@@ -625,7 +699,10 @@ mod tests {
             tokens: vec![
                 HexToken::Byte(0x4D),
                 HexToken::Byte(0x5A),
-                HexToken::Nibble { high: None, low: None },
+                HexToken::Nibble {
+                    high: None,
+                    low: None,
+                },
             ],
         };
         assert_eq!(p.as_exact_bytes(), None);
@@ -651,7 +728,10 @@ mod tests {
             tokens: vec![
                 HexToken::Byte(0x4D),
                 HexToken::Byte(0x5A),
-                HexToken::Nibble { high: None, low: None },
+                HexToken::Nibble {
+                    high: None,
+                    low: None,
+                },
                 HexToken::Byte(0x90),
             ],
         };
@@ -667,7 +747,10 @@ mod tests {
                 HexToken::Byte(0x4D),
                 HexToken::Alternative(vec![vec![
                     HexToken::Byte(0x5A),
-                    HexToken::Nibble { high: None, low: None },
+                    HexToken::Nibble {
+                        high: None,
+                        low: None,
+                    },
                 ]]),
                 HexToken::Byte(0x90),
             ],
@@ -693,7 +776,10 @@ mod tests {
         let p = HexPattern {
             tokens: vec![
                 HexToken::Byte(0x41),
-                HexToken::Jump { min: 2, max: Some(6) },
+                HexToken::Jump {
+                    min: 2,
+                    max: Some(6),
+                },
                 HexToken::Byte(0x42),
             ],
         };
@@ -726,7 +812,6 @@ mod tests {
         assert!(!m.wide);
         assert!(m.matches_bytes());
     }
-
 
     #[test]
     fn member_path_renders_dimensions() {

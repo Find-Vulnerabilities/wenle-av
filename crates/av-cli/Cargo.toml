@@ -1,0 +1,80 @@
+[package]
+name = "av-cli"
+description = "The Wenle Antivirus command-line front end: scan, build rule databases, inspect them."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "wenle"
+path = "src/main.rs"
+
+[dependencies]
+av-core.workspace = true
+av-rules.workspace = true
+av-pe.workspace = true
+av-scan.workspace = true
+av-memory.workspace = true
+av-signatures.workspace = true
+av-quarantine.workspace = true
+# `av-ipc` is the protocol and `av-service` is the other end of it: the pipe
+# client this tool speaks through lives there, beside the listener it talks to,
+# so that the two halves of the conversation cannot drift. See
+# `crates/av-cli/src/commands/service.rs` for what that buys and what it costs.
+av-ipc.workspace = true
+av-service.workspace = true
+# The product's protection of itself: the directory permissions, the service's
+# recovery policy, and the tamper check over the product's own files. A
+# dependency rather than code here for the same reason `av-service` is one: what
+# a DACL should say is a fact about Windows, and it belongs beside the tests that
+# check it without a command line in the way. This is also the one place the
+# service's *name* is turned into an argument — `av-guard` deliberately has no
+# constant for it, so that the single copy in `av-service` stays single.
+av-guard.workspace = true
+# Registering Explorer's right-click verbs. A dependency rather than code here,
+# because what a registry key must contain is a fact about Windows and about the
+# two executables this product ships, and it belongs with the tests that can
+# check it without a rule database or a vault in the way. See
+# `crates/av-integration/src/shell.rs`.
+av-integration.workspace = true
+# The driver's installed name, for the two `fltmc` lines `integrate driver`
+# prints and the service name its report is headed with. Both of those name the
+# service the installer registered, and a second spelling of it here would print
+# a command that fails with "the specified service does not exist as an
+# installed service" — which reads as a broken install rather than as a typo in
+# a help string. The crate has no dependencies and is `no_std`, so this costs
+# this binary nothing; see its `src/install.rs`.
+av-driver-proto.workspace = true
+# Reading a file the account is refused. `std::fs::File::open` cannot read a
+# file whose DACL excludes this user, which is most of the interesting ones:
+# another user's profile, `System Volume Information`, every quarantined
+# sample. See `crates/av-fs/src/lib.rs` for what the backup privilege does and
+# does not buy.
+av-fs.workspace = true
+
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# `wenle config` prints the configuration in force in the file's own format, so
+# that what a user reads is what `save` writes and can be pasted back. The
+# document type is `av-core`'s; only the rendering is here.
+toml.workspace = true
+clap.workspace = true
+console.workspace = true
+log.workspace = true
+env_logger.workspace = true
+chrono.workspace = true
+walkdir.workspace = true
+rayon.workspace = true
+parking_lot.workspace = true
+num_cpus.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

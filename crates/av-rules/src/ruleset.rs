@@ -36,13 +36,13 @@ pub struct Split<'a> {
     pub chunks: Vec<Chunk<'a>>,
     /// `rule` header lines seen.
     ///
-    /// The splitter's contract has a sharp edge: it needs the rule's closing
-    /// brace alone on a line. A rule written on one line — `rule a { condition:
-    /// true }` — yields no chunk *and* no malformed count, so without this
-    /// number it would vanish silently. A caller compares `headers` against
-    /// `chunks.len() + malformed` and treats any remainder as rules the
-    /// splitter dropped, which is the difference between a heuristic that is
-    /// documented and one that lies.
+    /// A caller compares `headers` against `chunks.len() + malformed` and treats
+    /// any remainder as rules the splitter dropped, which is the difference
+    /// between a heuristic that is documented and one that lies. It should
+    /// always come to zero: the two shapes the line-based split cannot see —
+    /// a one-line rule, and a brace sharing a line with the last byte of a hex
+    /// body — are both handled, and everything else that fails is counted
+    /// malformed.
     pub headers: usize,
     /// Blocks that looked like a rule but were not a complete one.
     ///
@@ -91,6 +91,26 @@ pub fn split_rule_chunks(source: &str) -> Split<'_> {
         if start.is_none() {
             if is_rule_header(line.trim_start()) {
                 out.headers += 1;
+                // A rule written on one line — `rule a { condition: true }` —
+                // opens and closes on the line that announces it, so the
+                // closing brace this splitter waits for never arrives alone and
+                // the rule would be dropped at end of input. Emitting it here is
+                // what keeps it. The brace count tells the two shapes apart: a
+                // header that opens a block and does not close it is the
+                // ordinary multi-line rule, and a header with no brace at all is
+                // one whose `{` is on the following line, which is how a rule
+                // set with tags is written.
+                if line.contains('{') && brace_delta(line) <= 0 {
+                    if is_complete_rule(line) {
+                        out.chunks.push(Chunk {
+                            line: line_no,
+                            text: line,
+                        });
+                    } else {
+                        out.malformed += 1;
+                    }
+                    continue;
+                }
                 start = Some((line_no, line_offset));
             }
             continue;
@@ -175,10 +195,21 @@ fn hex_open_depth(line: &str) -> Option<i32> {
 }
 
 /// True when the text is a whole rule rather than a fragment of one.
+///
+/// The last test is what catches a truncated rule, and it differs by shape: a
+/// multi-line chunk is truncated exactly when its `condition:` section went
+/// missing, so the section header has to be the first thing on its line. A rule
+/// written on one line cannot be truncated — the whole rule is the line its
+/// closing brace is on — so a looser test is enough, and the strict one would
+/// reject every one-line rule there is.
 fn is_complete_rule(text: &str) -> bool {
-    text.trim_start().contains("rule ")
-        && text.trim_end().ends_with('}')
-        && has_condition(text)
+    if !text.trim_start().contains("rule ") || !text.trim_end().ends_with('}') {
+        return false;
+    }
+    match text.lines().count() <= 1 {
+        true => mentions_condition(text),
+        false => has_condition(text),
+    }
 }
 
 /// True when some line of the rule opens a `condition:` section.
@@ -188,6 +219,28 @@ fn has_condition(text: &str) -> bool {
         t.strip_prefix("condition")
             .is_some_and(|rest| rest.trim_start().starts_with(':'))
     })
+}
+
+/// True when the text names a `condition:` section anywhere in it.
+///
+/// For a one-line rule, where the section header is preceded by the header and
+/// the other sections on the same line. The keyword has to stand alone and be
+/// followed by a colon, which is what keeps `$a = "condition"` and a string
+/// literal that happens to contain the word from answering for a section that
+/// is not there.
+fn mentions_condition(text: &str) -> bool {
+    const KEYWORD: &str = "condition";
+    let mut rest = text;
+    while let Some(at) = rest.find(KEYWORD) {
+        let before = rest[..at].chars().next_back();
+        let after = &rest[at + KEYWORD.len()..];
+        let stands_alone = !before.is_some_and(|c| c.is_alphanumeric() || c == '_');
+        if stands_alone && after.trim_start().starts_with(':') {
+            return true;
+        }
+        rest = after;
+    }
+    false
 }
 
 /// True for `rule name : tags` and its `private`/`global` prefixes.
@@ -230,38 +283,66 @@ mod tests {
     }
 
     #[test]
-    fn a_one_line_rule_is_counted_as_malformed_rather_than_dropped() {
-        // The splitter needs the closing brace on its own line, so this rule
-        // yields no chunk. What must not happen is that it disappears without a
-        // trace: the rule is still open when the input ends, which the
-        // end-of-input check counts. `unaccounted()` is the backstop for any
-        // path that check does not cover.
+    fn a_one_line_rule_is_a_rule() {
+        // The splitter waits for the closing brace alone on a line. A rule
+        // written on one line never produces one, so it has to be recognised
+        // where it starts: the rule opens and closes on the header line itself.
         let source = "rule a { condition: true }\n";
         let split = split_rule_chunks(source);
-        assert!(split.chunks.is_empty());
+        assert_eq!(split.chunks.len(), 1);
         assert_eq!(split.headers, 1);
+        assert_eq!(split.malformed, 0);
+        assert_eq!(split.unaccounted(), 0);
+        assert_eq!(split.chunks[0].text, "rule a { condition: true }");
+    }
+
+    #[test]
+    fn a_one_line_rule_does_not_swallow_the_rule_after_it() {
+        // Both shapes in one file, which is what a converter's output looks like
+        // beside a hand-written rule. Each is its own chunk, and the counts add
+        // up rather than the second rule being absorbed into the first.
+        let source = "rule a { condition: true }\nrule b {\n condition: true\n}\n";
+        let split = split_rule_chunks(source);
+        assert_eq!(split.headers, 2);
+        assert_eq!(split.chunks.len(), 2);
+        assert_eq!(split.malformed, 0);
+        assert_eq!(split.unaccounted(), 0);
+        assert_eq!(split.chunks[0].text, "rule a { condition: true }");
+        assert!(
+            split.chunks[1].text.starts_with("rule b"),
+            "{}",
+            split.chunks[1].text
+        );
+    }
+
+    #[test]
+    fn a_one_line_rule_with_no_condition_is_malformed() {
+        // The check that catches a truncated rule has to keep working for the
+        // one-line shape: a rule with no `condition:` at all is not a rule the
+        // parser can do anything with, and offering it would turn a splitter
+        // failure into a parse failure with a worse message.
+        let split = split_rule_chunks("rule a { strings: $a = \"x\" }\n");
+        assert!(split.chunks.is_empty());
         assert_eq!(split.malformed, 1);
         assert_eq!(split.unaccounted(), 0);
     }
 
     #[test]
-    fn a_one_line_rule_followed_by_a_normal_one_is_absorbed_into_its_chunk() {
-        // `rule a { ... }` on one line leaves the splitter waiting, so the next
-        // rule's body becomes the end of the same chunk. Both rules reach the
-        // parser — `parse_file` returns every rule it finds — so nothing is
-        // lost, but it is worth pinning down that the count still adds up.
-        //
-        // `headers` stays at one because it counts rule *starts*, and a header
-        // reached while already inside a rule is not one. That is also why
-        // `unaccounted()` is zero here rather than a false alarm: the second
-        // rule is accounted for by the chunk that carries it.
-        let source = "rule a { condition: true }\nrule b {\n condition: true\n}\n";
-        let split = split_rule_chunks(source);
-        assert_eq!(split.headers, 1);
-        assert_eq!(split.chunks.len(), 1);
-        assert_eq!(split.unaccounted(), 0);
-        assert!(split.chunks[0].text.starts_with("rule a"), "{}", split.chunks[0].text);
-        assert!(split.chunks[0].text.contains("rule b"), "{}", split.chunks[0].text);
+    fn the_word_condition_inside_a_string_does_not_answer_for_the_section() {
+        assert!(!mentions_condition(
+            "rule a { strings: $a = \"condition\" }"
+        ));
+        assert!(!mentions_condition(
+            "rule a { strings: $a = \"a condition\" }"
+        ));
+        assert!(!mentions_condition(
+            "rule a { strings: $a = \"precondition\" }"
+        ));
+        assert!(mentions_condition("rule a { condition: true }"));
+        assert!(mentions_condition(
+            "rule a { strings: $a = \"x\" condition: $a }"
+        ));
+        assert!(mentions_condition("rule a { condition:condition }"));
     }
 
     #[test]
@@ -282,8 +363,16 @@ rule a {
         assert_eq!(split.chunks.len(), 1, "{split:?}");
         assert_eq!(split.malformed, 0);
         assert_eq!(split.unaccounted(), 0);
-        assert!(split.chunks[0].text.contains("condition:"), "{}", split.chunks[0].text);
-        assert!(split.chunks[0].text.contains("41 42"), "{}", split.chunks[0].text);
+        assert!(
+            split.chunks[0].text.contains("condition:"),
+            "{}",
+            split.chunks[0].text
+        );
+        assert!(
+            split.chunks[0].text.contains("41 42"),
+            "{}",
+            split.chunks[0].text
+        );
     }
 
     #[test]
@@ -292,7 +381,11 @@ rule a {
         let source = "rule a {\n strings:\n  $h = {\n   4D 5A\n  }\n condition:\n  $h\n}\n";
         let split = split_rule_chunks(source);
         assert_eq!(split.chunks.len(), 1);
-        assert!(split.chunks[0].text.contains("4D 5A"), "{}", split.chunks[0].text);
+        assert!(
+            split.chunks[0].text.contains("4D 5A"),
+            "{}",
+            split.chunks[0].text
+        );
     }
 
     #[test]
@@ -346,7 +439,12 @@ rule a {
 
     #[test]
     fn private_and_global_rules_start_a_chunk() {
-        for header in ["rule r", "private rule r", "global rule r", "private global rule r"] {
+        for header in [
+            "rule r",
+            "private rule r",
+            "global rule r",
+            "private global rule r",
+        ] {
             let source = format!("{header} {{\n condition: true\n}}\n");
             let split = split_rule_chunks(&source);
             assert_eq!(split.chunks.len(), 1, "{header}: {split:?}");

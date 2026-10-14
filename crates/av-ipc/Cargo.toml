@@ -1,0 +1,39 @@
+[package]
+name = "av-ipc"
+description = "The control protocol between the Wenle AV service and its clients: framing, versioning, message vocabulary and the session state machine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# No `windows` dependency, and that is the whole point of this crate rather than
+# an accident of scope: everything here is a pure function over bytes, so
+# `cargo test` runs all of it on this machine, including the two hostile inputs
+# a length-prefixed protocol has to survive. See the crate documentation.
+#
+# The two internal dependencies are data crates. `av-core` supplies
+# `ScanOptions`, `AvConfig`, the verdict vocabulary and `FileScanReport`;
+# `av-quarantine` supplies `EntrySource`, `QuarantineId` and `QuarantineEntry`.
+# Both are depended on rather than mirrored on purpose: a second `EntrySource`
+# in this crate would be a second answer to "which component acted", and the
+# notification wording is built from that answer.
+[dependencies]
+av-core.workspace = true
+av-quarantine.workspace = true
+
+serde.workspace = true
+bincode.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+# The phase's wire form is a readable string rather than a boolean, and a test
+# asserts the spelling is the one `Phase::as_str` returns. That is a claim about
+# serde output, so something has to produce serde output.
+serde_json.workspace = true
+
+[lints]
+workspace = true

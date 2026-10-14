@@ -1,0 +1,24 @@
+[package]
+name = "av-sandbox"
+description = "Behavioural rules for a sandboxed run: what a sample's structure implies it would do, judged without ever executing it"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+av-core.workspace = true
+av-pe.workspace = true
+
+# The search in `src/text.rs` is built on `memchr`, and the measurement that
+# made it load-bearing — not a preference, and not removable without a
+# several-hundred-fold slowdown in the dev profile — is in that module's docs.
+memchr.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

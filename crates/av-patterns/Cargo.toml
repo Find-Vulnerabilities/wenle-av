@@ -1,0 +1,42 @@
+[package]
+name = "av-patterns"
+description = "Fixed-length atom matching: a two-level byte gate over candidate offsets, for the rule prefilter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Empty, and that is a choice rather than an accident of scope.
+#
+# What this replaces is a general Aho-Corasick automaton, and the whole reason it
+# is faster is that it knows something Aho-Corasick does not: every pattern it
+# is given is the same short length, so the automaton's transition tables —
+# the thing that spills out of cache and costs a miss per input byte — are not
+# needed at all. A dependency that brought a general matcher back in would be
+# the same tables under a different name.
+#
+# The dependency on the rule engine that this crate used to carry is gone as
+# well, and it had to be. It existed so that `examples/pattern_bench.rs` could
+# load the real atom set out of a compiled rule database, and once `av-rules`
+# started depending on this crate the two formed a cycle that Cargo refuses at
+# resolution time — before anything is compiled. An optional dependency is
+# still a dependency: `optional = true` decides whether a feature can turn it
+# on, not whether it is resolved. So the benchmark moved to `av-rules`, which is
+# where the data it measures comes from and which is allowed to depend on this
+# crate; the layering is one way, `av-rules -> av-patterns`, and this crate
+# knows nothing about rules.
+
+[dev-dependencies]
+# For the oracle in `tests/differential.rs`, which scans for every atom at every
+# offset by brute force. A window can only equal an atom if its first byte does,
+# so the oracle searches for that byte instead of building the windows that
+# cannot match: the same answer computed at a subset of the same offsets, and
+# without it the test was seven minutes of `cargo test` and would have been the
+# reason the suite stopped being run.
+memchr.workspace = true

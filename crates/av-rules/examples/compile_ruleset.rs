@@ -36,7 +36,7 @@ use std::fs;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use av_rules::compiler::{compile_rule, CompileError};
+use av_rules::compiler::{compile_corpus, CompileError};
 use av_rules::prefilter::{Prefilter, RuleFilter, RuleStrings};
 use av_rules::ruleset;
 
@@ -80,10 +80,13 @@ fn run() -> ExitCode {
         );
     }
 
-    let mut rules_seen = 0usize;
     let mut compiled = 0usize;
     let mut parse_failures = 0usize;
     let mut refusals: BTreeMap<&'static str, (usize, String)> = BTreeMap::new();
+    // The same refusals again, keyed by the construct rather than the kind of
+    // gap. `1,712 module field` does not say what to build; `1,600 of them are
+    // pe.number_of_signatures` does.
+    let mut details: BTreeMap<(&'static str, String), usize> = BTreeMap::new();
     let mut descriptors = 0usize;
     let mut instructions = 0usize;
     let mut constants = 0usize;
@@ -102,81 +105,166 @@ fn run() -> ExitCode {
         .unwrap_or(0);
     let mut shown = 0usize;
 
+    // Every rule of every chunk, held together, because the compile is a
+    // corpus-wide affair: a rule may be written in terms of another rule, and
+    // the reference may point forward into a chunk that has not been reached.
+    // Parsing first and compiling second is the only order that can resolve
+    // those, and it is the same order `RuleDatabase::compile` uses.
+    let mut files: Vec<(usize, av_rules::parser::ParsedFile)> = Vec::new();
     for chunk in &split.chunks {
-        let file = match av_rules::parser::parse_file(chunk.text) {
-            Ok(f) => f,
+        match av_rules::parser::parse_file(chunk.text) {
+            Ok(f) => files.push((chunk.line, f)),
             Err(_) => {
                 // Counted but not bucketed: this tool is about compilation, and
                 // the parser's own tool already histograms syntax errors.
                 parse_failures += 1;
+            }
+        }
+    }
+    let mut all_rules: Vec<&av_rules::ast::Rule> = Vec::new();
+    let mut lines: Vec<usize> = Vec::new();
+    for (line, file) in &files {
+        for rule in &file.rules {
+            all_rules.push(rule);
+            lines.push(*line);
+        }
+    }
+    let rules_seen = all_rules.len();
+
+    let corpus = compile_corpus(all_rules.iter().copied());
+    // A rule the corpus refused for a dependency is in `rules` as an error and
+    // is absent from `order`; a rule that compiled is in `order`. Walking the
+    // corpus in source order and asking `order` which of them are usable keeps
+    // the report in source order, which is what an operator reads.
+    let evaluable: Vec<bool> = {
+        let mut flags = vec![false; all_rules.len()];
+        for &index in corpus.order() {
+            flags[index as usize] = true;
+        }
+        flags
+    };
+    let mut references = 0usize;
+    let mut referrers = 0usize;
+
+    for (index, outcome) in corpus.into_rules().into_iter().enumerate() {
+        let rule = all_rules[index];
+        let line = lines[index];
+        let program = match outcome {
+            Ok(program) => program,
+            Err(e) => {
+                let entry = refusals
+                    .entry(e.feature)
+                    .or_insert_with(|| (0, String::new()));
+                entry.0 += 1;
+                if entry.1.is_empty() {
+                    entry.1 = describe(rule, &e, line);
+                }
+                // The detail is only bucketed for the features where it is a
+                // name — a field path, a function, a rule. For the rest it is a
+                // sentence, and grouping on sentences finds nothing.
+                if matches!(
+                    e.feature,
+                    "module field" | "function call" | "rule dependency"
+                ) {
+                    *details.entry((e.feature, e.detail.clone())).or_insert(0) += 1;
+                }
                 continue;
             }
         };
-
-        for rule in &file.rules {
-            rules_seen += 1;
-            match compile_rule(rule) {
-                Ok(program) => {
-                    compiled += 1;
-                    descriptors += program.string_count as usize;
-                    instructions += program.code.len();
-                    constants += program.constants.len();
-
-                    // The strings are compiled here as the scanner will compile
-                    // them once and keep. A string the matcher refuses
-                    // contributes no atoms, so its rule ends up unfiltered
-                    // rather than wrongly filtered — the safe direction.
-                    let rule_atoms: RuleStrings = rule
-                        .strings
-                        .iter()
-                        .enumerate()
-                        .map(|(slot, def)| match av_rules::matcher::compile(def, slot as u32) {
-                            Ok(compiled) => compiled.atoms(),
-                            Err(e) => {
-                                let entry = string_refusals
-                                    .entry(e.feature.unwrap_or("invalid string"))
-                                    .or_insert_with(|| (0, String::new()));
-                                entry.0 += 1;
-                                if entry.1.is_empty() {
-                                    entry.1 = format!("{}: {}", rule.name, e.message);
-                                }
-                                av_rules::atoms::StringAtoms::none()
-                            }
-                        })
-                        .collect();
-                    if rule_atoms.iter().all(|atoms| atoms.is_empty()) {
-                        rules_without_atoms += 1;
-                    }
-                    filters.push(RuleFilter {
-                        strings: rule_atoms,
-                        required: program.required_strings.clone(),
-                    });
-
-                    if shown < show {
-                        shown += 1;
-                        println!(
-                            "\n--- {} (line {}) — {} strings, {} instructions, \
-                             depth {} steps, stack {}",
-                            rule.name,
-                            chunk.line,
-                            program.string_count,
-                            program.code.len(),
-                            program.max_steps,
-                            program.max_stack
-                        );
-                        print!("{}", program.disassemble());
-                    }
-                }
-                Err(e) => {
-                    let entry = refusals
-                        .entry(e.feature)
-                        .or_insert_with(|| (0, String::new()));
-                    entry.0 += 1;
-                    if entry.1.is_empty() {
-                        entry.1 = describe(rule, &e, chunk.line);
-                    }
-                }
+        if !evaluable[index] {
+            // Compiled, but it reads a rule that did not. Counted with the
+            // dependency refusals rather than as a compilation gap, because the
+            // gap is elsewhere and this rule needs no work of its own.
+            let entry = refusals
+                .entry("rule dependency")
+                .or_insert_with(|| (0, String::new()));
+            entry.0 += 1;
+            if entry.1.is_empty() {
+                entry.1 = format!(
+                    "{} (line {line}): reads a rule that did not compile",
+                    rule.name
+                );
             }
+            continue;
+        }
+
+        let refs = program.rule_refs();
+        if !refs.is_empty() {
+            referrers += 1;
+            references += refs.len();
+        }
+
+        // The strings are compiled here as the scanner will compile them once
+        // and keep, and a string the matcher refuses is a refusal of the whole
+        // rule — the same policy `RuleDatabase::compile` applies.
+        //
+        // It has to be the whole rule. The alternative is a rule whose condition
+        // reads a slot that never matches, which is wrong in both directions:
+        // `$a and $b` with `$b` refused is a detection that never fires, and
+        // `not $b` with `$b` refused is a condition that is true on every file.
+        // Counting the rule as compiled and merely noting the string is how a
+        // rule set looks complete while matching the wrong things.
+        let mut refused_string = None;
+        let rule_atoms: RuleStrings = rule
+            .strings
+            .iter()
+            .enumerate()
+            .map(
+                |(slot, def)| match av_rules::matcher::compile(def, slot as u32) {
+                    Ok(compiled) => compiled.atoms(),
+                    Err(e) => {
+                        let entry = string_refusals
+                            .entry(e.feature.unwrap_or("invalid string"))
+                            .or_insert_with(|| (0, String::new()));
+                        entry.0 += 1;
+                        if entry.1.is_empty() {
+                            entry.1 = format!("{}: {}", rule.name, e.message);
+                        }
+                        refused_string.get_or_insert(e);
+                        av_rules::atoms::StringAtoms::none()
+                    }
+                },
+            )
+            .collect();
+
+        if let Some(e) = refused_string {
+            let entry = refusals
+                .entry(e.feature.unwrap_or("invalid string"))
+                .or_insert_with(|| (0, String::new()));
+            entry.0 += 1;
+            if entry.1.is_empty() {
+                entry.1 = format!(
+                    "{} (line {line}): a string cannot be searched: {}",
+                    rule.name, e.message
+                );
+            }
+            continue;
+        }
+
+        compiled += 1;
+        descriptors += program.string_count as usize;
+        instructions += program.code.len();
+        constants += program.constants.len();
+        if rule_atoms.iter().all(|atoms| atoms.is_empty()) {
+            rules_without_atoms += 1;
+        }
+        filters.push(RuleFilter {
+            strings: rule_atoms,
+            required: program.required_strings.clone(),
+        });
+
+        if shown < show {
+            shown += 1;
+            println!(
+                "\n--- {} (line {line}) — {} strings, {} instructions, \
+                 depth {} steps, stack {}",
+                rule.name,
+                program.string_count,
+                program.code.len(),
+                program.max_steps,
+                program.max_stack
+            );
+            print!("{}", program.disassemble());
         }
     }
 
@@ -205,6 +293,7 @@ fn run() -> ExitCode {
         constants as f64 / per_rule,
         descriptors as f64 / per_rule
     );
+    println!("{referrers:>7} rules read another rule ({references} references between them)");
     println!("compiled in {elapsed:?}");
 
     if !refusals.is_empty() {
@@ -216,9 +305,36 @@ fn run() -> ExitCode {
         let mut rows: Vec<_> = refusals.into_iter().collect();
         rows.sort_by_key(|(_, (count, _))| Reverse(*count));
         for (feature, (count, example)) in &rows {
-            println!("\n{count:>6}  ({:.2}%)  {feature}\n        {example}", percent(*count));
+            println!(
+                "\n{count:>6}  ({:.2}%)  {feature}\n        {example}",
+                percent(*count)
+            );
         }
         println!("\n{} distinct features to implement", rows.len());
+    }
+
+    if !details.is_empty() {
+        // Rules, not occurrences: one rule naming `pe.sections` four times is
+        // still one rule that would start compiling. Counting occurrences would
+        // rank the fields by how chatty their rules are instead of by how much
+        // work each unlocks.
+        let mut rows: Vec<_> = details.into_iter().collect();
+        rows.sort_by_key(|((feature, detail), count)| (Reverse(*count), *feature, detail.clone()));
+        println!("\n=== refusals by construct (occurrences, most first) ===");
+        for ((feature, detail), count) in rows.iter().take(30) {
+            println!("{count:>6}  {feature:<14} {detail}");
+        }
+        let total: usize = rows.iter().map(|(_, n)| n).sum();
+        if rows.len() > 30 {
+            println!(
+                "        ... and {} more distinct constructs",
+                rows.len() - 30
+            );
+        }
+        println!(
+            "{total:>6}  total occurrences across {} constructs",
+            rows.len()
+        );
     }
 
     if !string_refusals.is_empty() {
