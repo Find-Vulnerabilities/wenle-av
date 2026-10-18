@@ -180,6 +180,7 @@ const IMPORTS: &[Import] = &[
     Import { name: "FltGetVolumeName", prototype: None, source: "src/flt.rs", header: "fltKernel.h" },
     Import { name: "KeGetCurrentIrql", prototype: None, source: "src/flt.rs", header: "wdm.h" },
     Import { name: "IoVolumeDeviceToDosName", prototype: None, source: "src/flt.rs", header: "ntddk.h" },
+    Import { name: "PsGetCurrentProcessId", prototype: None, source: "src/flt.rs", header: "ntddk.h" },
     Import { name: "ObDereferenceObject", prototype: Some("ObfDereferenceObject"), source: "src/flt.rs", header: "wdm.h" },
     Import { name: "ExAllocatePool2", prototype: None, source: "src/flt.rs", header: "wdm.h" },
     Import { name: "ExFreePoolWithTag", prototype: None, source: "src/flt.rs", header: "wdm.h" },

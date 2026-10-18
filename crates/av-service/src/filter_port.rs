@@ -428,11 +428,18 @@ pub enum Action {
     Reply(DecisionReplyMessage),
     /// Answer the driver, and tell the service what the answer was about.
     ///
-    /// A block is the one message that is both at once. The driver is waiting
-    /// inside its own timeout, so the answer cannot be deferred until the
-    /// service has finished with the file; but the file has to be reported,
-    /// because a refusal nobody is ever told about is indistinguishable, from
-    /// the user's side, from a program that would not start.
+    /// The driver is waiting inside its own timeout, so the answer cannot be
+    /// deferred until the service has finished with the file; but the file has
+    /// to be reported, because a conviction nobody is ever told about is
+    /// indistinguishable, from the user's side, from one that did not happen.
+    ///
+    /// **Two answers travel this way, and they are not the same news.** A
+    /// [`Decision::Block`] is a refusal: the program did not run. A
+    /// [`Decision::Allow`] carrying a detection is a gate that reports and does
+    /// not refuse — the program did run, and the file is still worth taking.
+    /// The [`Detection`] carries which one it was, through
+    /// [`Detection::claims_a_block`], and the loop at the bottom of this module
+    /// replies before it reports for the first of those reasons only.
     ///
     /// The detection is built on this side rather than by the service because
     /// the [`FileScanReport`] it is taken from does not outlive this call: its
@@ -495,19 +502,27 @@ pub const fn verdict_to_decision(verdict: Verdict) -> Decision {
 ///
 /// The driver sends no field that names its callback. What it does send is
 /// [`DecisionRequestMessage::subject`], and the two callers of its `decide` —
-/// the only two places a decision request is built — pass a different kind:
-/// `IRP_MJ_CREATE`'s pre-operation passes `SubjectKind::Process` (the operation
-/// is the process's, before the image exists), and the acquire-for-section
-/// pre-operation passes `SubjectKind::Image`. So the field is a gate name by
-/// construction, and the construction is in the driver's source rather than in
-/// anything on the wire. That is worth stating in a log rather than relying on:
-/// "which gate refused this" is the first question a refusal raises, and the
-/// answer decides whether a program was about to run or something was reading
-/// the file.
+/// the only two places a decision request is built — have passed a different
+/// kind: `IRP_MJ_CREATE`'s pre-operation passed `SubjectKind::Process` (the
+/// operation is the process's, before the image exists), and the
+/// acquire-for-section pre-operation passes `SubjectKind::Image`. So the field
+/// is a gate name by construction, and the construction is in the driver's
+/// source rather than in anything on the wire. That is worth stating in a log
+/// rather than relying on: "which gate refused this" is the first question a
+/// refusal raises, and the answer decides whether a program was about to run or
+/// something was reading the file.
 ///
-/// Anything else — a subject this build does not define, or one of the two
-/// kinds no decision request carries — is reported as itself rather than
-/// guessed at.
+/// **No longer a live pair as of 2026-10-15.** `av-driver`'s create
+/// pre-operation stopped asking, because [`refusing_gate`] made its answer a
+/// constant the driver could not act on, so `SubjectKind::Process` no longer
+/// arrives from this build. The arm stays for two reasons: a driver that does
+/// send it — an older install, or a future one that asks again — must be
+/// answered and logged correctly rather than reported as "an undefined
+/// subject"; and the name is the only thing that would let a reader tell the
+/// two apart in a log.
+///
+/// Anything else — a subject this build does not define, or one of the kinds no
+/// decision request carries — is reported as itself rather than guessed at.
 fn asking_gate(subject: u32) -> &'static str {
     match SubjectKind::from_wire(subject) {
         Some(SubjectKind::Process) => "create gate, an open asking FILE_EXECUTE",
@@ -529,16 +544,32 @@ fn asking_gate(subject: u32) -> &'static str {
 /// and not an image, and there the refusal was logged while the mapping
 /// succeeded: the fixture printed the view's address
 /// (`pid 1384 maps C:\Samples\plant2.bin executable and writable at 0x259a02f0000`).
-/// The WDK allows a minifilter to fail this operation with
-/// `STATUS_INSUFFICIENT_RESOURCES` only — and not at all when the sync type is
-/// `SyncTypeOther` — while `av-driver`'s `refuse()` answers
-/// `STATUS_ACCESS_DENIED`, which is not on that list. So a refusal from this
-/// gate is *believed* to stop an image section (the 2026-10-02 `block-test.exe`
-/// run logged the refusal; nothing on record measures that the process then
-/// failed to start) and is **measured** not to stop a data section mapped
-/// executable. What stops that shape is the process walk and the termination
-/// behind it, and no surface may claim more — see the info line below, which
-/// says which of the two happened.
+/// So a refusal from this gate is *believed* to stop an image section (the
+/// 2026-10-02 `block-test.exe` run logged the refusal; nothing on record
+/// measures that the process then failed to start) and is **measured** not to
+/// stop a data section mapped executable. What stops that shape is the process
+/// walk and the termination behind it, and no surface may claim more — see the
+/// info line below, which says which of the two happened.
+///
+/// **The status, after three readings and two measurements.** The reference
+/// page for this operation's `FLT_PARAMETERS` names exactly one failure a
+/// minifilter may return for a created section: `STATUS_INSUFFICIENT_RESOURCES`.
+/// That was this product's reading on 2026-10-13, was queried on 2026-10-16 —
+/// the pattern the community prescribes for blocking module loading through
+/// this callback is `Data->IoStatus.Status = STATUS_ACCESS_DENIED` plus
+/// `FLT_PREOP_COMPLETE`, which is what Don Burn answers with on OSR — and is
+/// the reading this product acts on again from 2026-10-18.
+///
+/// What settles it is not the argument but the two runs that went the other
+/// way. On 2026-10-13 a data file mapped `PAGE_EXECUTE_READWRITE` was mapped
+/// after the refusal was logged, and on 2026-10-17 two convicted WannaCry
+/// binaries started while both refusal lines were being written. Either the
+/// filter manager ignored `STATUS_ACCESS_DENIED` — the document's reading — or
+/// the acquire that was refused was not the one about to run. The driver now
+/// uses the documented status **and** reports the asking pid, so the next run
+/// separates the two: a refusal that names the shell and a program that still
+/// starts means the ask was the wrong one; a refusal that names the missing
+/// program's own creator and no start means the status was the problem.
 ///
 /// The create pre-operation asks about an open carrying
 /// `FILE_EXECUTE`, and that mask is not what it looks like — measured in the
@@ -556,11 +587,21 @@ fn asking_gate(subject: u32) -> &'static str {
 ///
 /// So the create gate's question is a good hint and a poor accusation, and the
 /// cost of acting on it is real: the same log shows a sample's mere *copy*
-/// convicted, refused twice, and quarantined before anything ran it. Reporting
-/// costs a log line. Refusing from this gate is therefore given up, and the
-/// section gate — which fires only when a file is genuinely about to become an
-/// executable image — carries every refusal. A conviction from the create gate
-/// still says so at info level, so nothing is lost but the false positives.
+/// convicted, refused twice, and quarantined before anything ran it. Refusing
+/// from this gate is therefore given up, and the section gate — which fires
+/// only when a file is genuinely about to become an executable image — carries
+/// every refusal.
+///
+/// **What a create-gate conviction does now, since 2026-10-15.** It is
+/// reported: the driver is answered `Allow`, and a [`Detection`] goes to the
+/// service so the file is taken. Before that it was a log line and nothing
+/// else. In the 2026-10-14 WannaCry run this gate produced about sixty of those
+/// lines, every one of them a file the engine had convicted, and not one of
+/// them did anything at all — which is the half of that failure that is fixed
+/// on this side. The other half is fixed in the driver: it stopped asking here
+/// entirely, because an answer that can only ever be `Allow` is not worth the
+/// port thread's time, and occupying that thread is what let a WannaCry
+/// process run.
 ///
 /// When the create gate stops over-firing this can be reconsidered; the mask
 /// test that makes it noisy is the first thing to fix.
@@ -1075,19 +1116,23 @@ impl Dispatcher {
     /// The answer to one decision request, and what to report about it.
     ///
     /// Every way out of this function ends in [`Decision::Allow`] except a scan
-    /// that confirms a detection. See this module's documentation for why the
-    /// asymmetry with blocking is deliberate rather than an oversight.
+    /// that confirms a detection from a gate that may refuse. See this module's
+    /// documentation for why the asymmetry with blocking is deliberate rather
+    /// than an oversight.
     ///
-    /// The detection is `Some` exactly when the answer is [`Decision::Block`],
-    /// and that is the invariant worth stating: a file this driver refuses is a
-    /// file the product has to account for, and a detection with no refusal
-    /// would be a notification about a program that ran anyway.
+    /// **The detection is `Some` for two different reasons, and the caller must
+    /// not conflate them.** One is a refusal, where the driver is told to stop
+    /// the operation. The other is a conviction from a gate that only reports,
+    /// where the driver is told to let it continue and the file is worth taking
+    /// anyway. Both are `Some` since 2026-10-15; the second used to be `None`,
+    /// which is what made about sixty convictions in the 2026-10-14 WannaCry
+    /// log into nothing but log lines.
     ///
-    /// `blocked` is `true` and not a parameter. The caller of this function is
-    /// the driver's own create and section callbacks, so a `Block` here is a
-    /// refusal that has already happened by the time the detection is built —
-    /// see [`EntrySource::is_pre_execution`], which is what stops the
-    /// notification claiming more than that.
+    /// `blocked` is `decision == Decision::Block` rather than a constant, for
+    /// exactly that reason. [`EntrySource::is_pre_execution`] and
+    /// `av_ipc::Phase::describe` read it, and a finding claiming a file was
+    /// stopped when the driver was told `Allow` is precisely the kind of
+    /// surface this product keeps catching itself lying on.
     fn decide(&self, request: &DecisionRequestMessage) -> (Decision, Option<Detection>) {
         let units = request.path();
         if units.is_empty() {
@@ -1178,6 +1223,18 @@ impl Dispatcher {
         // and a separate line would double the volume of a path every program
         // launch goes through.
         let gate = asking_gate(request.subject);
+        // Which process issued the operation. **Not the program that is about
+        // to run**: the image section of a process being created is created on
+        // the thread that called `CreateProcess`, so this names the shell or
+        // launcher. Nothing acts on it — the pid is here because it settles a
+        // question the driver could not answer before 2026-10-18 (was a
+        // refusal the complainant's own acquire, or a bystander's?) and because
+        // a crash report that says "this file" is worth more with "opened by
+        // this process" beside it. Terminating it would kill the wrong program.
+        let asker = match request.process_id {
+            0 => "an unidentified process".to_string(),
+            pid => format!("process {pid}"),
+        };
         let decision = if convicted && refusing_gate(request.subject) {
             Decision::Block
         } else {
@@ -1190,20 +1247,30 @@ impl Dispatcher {
             // `refusing_gate` is what puts a verdict on this branch, so this line
             // is always the acquire-for-section gate answering a section.
             //
-            // The clause after the gate is not decoration. The claim is about
-            // what this product *did* — it answered the driver's question with a
-            // refusal — and not about what the kernel then did with it: for an
-            // image section the refusal is what stops the program, and for a
-            // data file mapped executable it was measured on 2026-10-13 to be
-            // mapped anyway, with the process walk stopping the process. A line
-            // that says "was refused" and stops there reads as a block that did
-            // not happen, which is the kind of surface this product keeps
-            // catching itself lying on.
+            // The claim is about what this product *did* — it answered the
+            // driver's question with a refusal — and, since 2026-10-18, about
+            // what the filter manager does with that answer.
+            //
+            // **The status is the whole history of this feature.** Until
+            // 2026-10-18 the driver completed the section with
+            // `STATUS_ACCESS_DENIED`, which the filter manager does not honour
+            // for a created section — the only failure it accepts there is
+            // `STATUS_INSUFFICIENT_RESOURCES`. So this line printed, the
+            // conviction was real, and the program ran anyway: measured on
+            // 2026-10-13 (a data file mapped executable was mapped, and the
+            // process walk stopped the process 1–2 s later) and again on
+            // 2026-10-17, when two convicted WannaCry binaries started while
+            // both lines were being written.
+            //
+            // What is *not* claimed here is that the program was stopped: this
+            // thread does not see the caller's result. A refusal that fails
+            // section creation makes `CreateProcess` fail, which is the
+            // mechanism; confirming it is the next run's job, and the criterion
+            // is that no process starts, not that this line appears.
             log::info!(
-                "{} was refused: the engine scored it {} (asked by the {gate}; the driver \
-                 answered the section with STATUS_ACCESS_DENIED — that stops an image section, \
-                 and a data file mapped executable was measured to be mapped anyway, where the \
-                 process walk is what stops it)",
+                "{} was refused: the engine scored it {} (asked by the {gate}, {asker}; the \
+                 section was failed with STATUS_INSUFFICIENT_RESOURCES, which is the only \
+                 refusal the filter manager honours for a created section)",
                 path.display(),
                 report.verdict().as_str()
             );
@@ -1221,25 +1288,38 @@ impl Dispatcher {
                 DetectionAction::Reported,
             ))
         } else if convicted {
-            // A conviction from a gate that cannot refuse. Rare -- it is a
-            // file the engine is sure about and that the create gate was asked
-            // about -- so it is worth the info level: it is the evidence that
-            // the create gate is doing its job as a reporter, and it is the
-            // line to look for when a file the product convicted did not
-            // disappear.
+            // A conviction from a gate that cannot refuse. It is reported and
+            // not answered with a block, and **until 2026-10-15 the reporting
+            // was a log line and nothing else**: this arm returned `None`, so
+            // no detection was built, nothing reached the vault, and the file
+            // stayed where it was. The 2026-10-14 WannaCry log carries about
+            // sixty of these lines, every one of them a file the engine had
+            // convicted, and not one of them did anything.
+            //
+            // `blocked = false` and not `true`, whatever `EntrySource::Driver`
+            // means elsewhere: this gate's `Allow` is what the driver was told,
+            // so `av_ipc::Phase::describe` must not read "was stopped" out of
+            // it. What the detection does carry is the verdict, the score and
+            // the rule identifiers, which is everything `crate::host`'s
+            // `should_take` needs to take the file.
             log::info!(
                 "{} was convicted and allowed: the engine scored it {} (asked by the {gate}, \
-                 which reports and does not refuse)",
+                 which reports and does not refuse; reporting it so the file is taken)",
                 path.display(),
                 report.verdict().as_str()
             );
-            None
+            Some(Detection::from_report(
+                &report,
+                EntrySource::Driver,
+                false,
+                DetectionAction::Reported,
+            ))
         } else {
             // Debug, not info: this is every program that starts on the
             // machine, which is a volume a log has no business carrying at its
             // default level.
             log::debug!(
-                "{} was allowed: the engine scored it {} (asked by the {gate})",
+                "{} was allowed: the engine scored it {} (asked by the {gate}, {asker})",
                 path.display(),
                 report.verdict().as_str()
             );
@@ -1871,17 +1951,25 @@ fn serve(port: &windows::Win32::Foundation::HANDLE, dispatcher: &mut Dispatcher,
             Action::ReplyAndReport(reply, detection) => {
                 // The order matters, and it is not the obvious one. The driver
                 // is sitting inside its own timeout, so the earlier the answer
-                // goes back the less of that timeout is spent — and the file is
-                // held open by the kernel for exactly as long as this reply is
-                // outstanding. Reporting first would put a vault write between
-                // the scan and the refusal, on a path every program launch
-                // passes through.
+                // goes back the less of that timeout is spent — and, when the
+                // answer is a refusal, the file is held open by the kernel for
+                // exactly as long as this reply is outstanding. Reporting first
+                // would put a vault write between the scan and the answer, on a
+                // path every program launch passes through.
+                //
+                // The answer goes back first whether or not it is a refusal.
+                // The allow-and-report case below has no file held open, but the
+                // driver is still waiting, and a reply that arrives while the
+                // service is writing a vault record is a reply that arrives
+                // late.
                 let request_id = reply.request_id;
                 let path_tag = reply.path_tag;
+                let stopped = detection.claims_a_block();
                 reply_to_driver(*port, reply);
                 log::info!(
-                    "the driver's block on request {request_id} (path tag {path_tag}) is being \
-                     reported to the service"
+                    "the driver's {} on request {request_id} (path tag {path_tag}) is being \
+                     reported to the service",
+                    if stopped { "block" } else { "conviction" }
                 );
                 publish(events, Event::Detection(*detection));
             }
@@ -2310,6 +2398,14 @@ mod tests {
         // not about to run. Refusing on that evidence quarantines a file for
         // having been *copied* (measured 2026-10-01), which is why it no longer
         // does. See [`refusing_gate`].
+        //
+        // **Our driver stopped sending this subject entirely on 2026-10-15**,
+        // because an answer it can never act on is not worth the port thread's
+        // time. The dispatcher still has to answer it correctly: a driver that
+        // does send it must get a `Decision` it can use *and* a detection that
+        // reaches the vault. That is the whole of the 2026-10-15 fix — before
+        // it, this arm returned `None`, so about sixty convictions in the
+        // 2026-10-14 WannaCry log were log lines and nothing else.
         let dir = tempfile::tempdir().expect("a temporary directory");
         let bad = dir.path().join("bad.bin");
         std::fs::write(&bad, b"MALWARE_MARKER_FOR_THE_TEST").expect("the fixture is written");
@@ -2319,15 +2415,27 @@ mod tests {
             bad.to_str().expect("the fixture path is UTF-8"),
         ))));
         match answered {
-            // `Reply`, not `ReplyAndReport`: the file still exists, nothing was
-            // stopped, and a detection here would raise a toast claiming a block
-            // that did not happen.
-            Action::Reply(reply) => assert_eq!(
-                reply.decision,
-                Decision::Allow.as_wire(),
-                "a conviction from the create gate must not stop the open"
-            ),
-            other => panic!("a conviction from the create gate was acted on: {other:?}"),
+            // `ReplyAndReport` since 2026-10-15, and the two halves pull in
+            // opposite directions on purpose: `Allow` because this gate cannot
+            // refuse, and a detection because the file is a conviction and has
+            // to be taken. The assertions below are the ones that keep those
+            // two from being confused for each other on the way out.
+            Action::ReplyAndReport(reply, detection) => {
+                assert_eq!(
+                    reply.decision,
+                    Decision::Allow.as_wire(),
+                    "a conviction from the create gate must not stop the open"
+                );
+                assert_eq!(detection.path, bad);
+                assert_eq!(detection.source, EntrySource::Driver);
+                assert_eq!(detection.action, DetectionAction::Reported);
+                assert!(
+                    !detection.claims_a_block(),
+                    "the driver was told `Allow`, so a finding claiming a block would put a \
+                     \"was stopped\" sentence on a program that was not stopped"
+                );
+            }
+            other => panic!("a conviction from the create gate was not reported: {other:?}"),
         }
     }
 

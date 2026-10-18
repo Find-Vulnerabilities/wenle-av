@@ -40,6 +40,22 @@
 //! periodic whole-machine walk is what would cover the rest, and it is not
 //! implemented.
 //!
+//! # The third moment: a conviction that arrives late
+//!
+//! Both walks are on a schedule, and the fact that decides a stop — the engine's
+//! answer about the image a process was started from — is not: it arrives when
+//! the port has finished scanning, which is bounded by the port's decision
+//! deadline rather than by [`SETTLEMENT`]. **Measured in the guest on
+//! 2026-10-18**: one run in six of the same sample finished both walks before the
+//! answer was in [`Convictions`], and nothing looked again, so the sample ran to
+//! completion and left its dropped files behind.
+//!
+//! So a process that was walked, found clean, and not stopped is kept for
+//! [`CONVICTION_GRACE`], and every change to [`Convictions`] re-runs
+//! [`stop_if_justified`] over those processes with no findings at all — the
+//! image branch alone, no memory read. That list is the fourth bound: it is
+//! capped at [`MAX_LIVE_STARTS`] and entries age out.
+//!
 //! # Why this is not on the control thread
 //!
 //! [`crate::host::Host`] is a single-threaded control plane: it serves a client,
@@ -96,6 +112,7 @@ use std::time::{Duration, Instant};
 
 use av_core::paths::AvPaths;
 use av_core::scan::ScanOptions;
+use av_core::Verdict;
 use av_ipc::MemoryCoverage;
 use av_memory::{MemoryFinding, MemoryScanConfig, ProcessRef, ProcessScan};
 use av_scan::ScanEngine;
@@ -140,8 +157,163 @@ pub const SETTLEMENT: Duration = Duration::from_secs(2);
 /// rather than queued, for the reason [`MAX_PENDING_STARTS`] gives.
 pub const MAX_PENDING_SETTLEMENTS: usize = 64;
 
+/// How long a process stays eligible for a stop when its image is convicted
+/// late.
+///
+/// Longer than [`SETTLEMENT`] by a wide margin, because the thing being waited
+/// for is not the process's own startup but the engine's answer about its image,
+/// and that answer is bounded by the port's decision deadline rather than by
+/// anything here. Measured on 2026-10-18: two seconds was not always enough, so
+/// the walk schedule is no longer what decides; this is only how long an old
+/// entry is kept, and one minute covers a scan queued behind other work.
+pub const CONVICTION_GRACE: Duration = Duration::from_secs(60);
+
+/// How many running processes the worker keeps for that re-check.
+///
+/// The same order as [`MAX_PENDING_STARTS`] rather than tighter: a stop that
+/// arrives late for a process started in a burst is exactly the case this
+/// exists for, and a path per entry is small.
+const MAX_LIVE_STARTS: usize = 256;
+
 /// How long the worker waits for a start before it looks at the stop flag.
 const POLL: Duration = Duration::from_millis(100);
+
+/// How many convicted images this run remembers.
+///
+/// The set exists so that a process can be stopped for the file it was started
+/// from, and the files that matter are the ones a process is started from right
+/// after the engine convicted them — a handful per incident. The bound is here
+/// because a sample that drops one copy of itself per directory would otherwise
+/// grow this list with the disk. Past the bound the oldest entry goes, and the
+/// only thing lost is the ability to stop a process on evidence this run has
+/// aged out.
+const MAX_CONVICTIONS: usize = 256;
+
+/// The image files the engine has convicted since this service started.
+///
+/// # Why this exists at all
+///
+/// There are two independent things this product does about a malicious program,
+/// and until 2026-10-18 neither could see the other's evidence:
+///
+/// * the driver asks about the image section a program is being created from,
+///   `crate::filter_port` has the engine scan it, and a malicious verdict
+///   produces a detection the control thread quarantines the *file* from;
+/// * [`stop_if_justified`] decides whether to kill the *process*, and its only
+///   input was the memory findings from a walk of that process.
+///
+/// A sample that never injects produces no memory finding — it just encrypts
+/// files — so the first mechanism convicted the file, the second found nothing
+/// to act on, and the program ran. **Measured in the guest on 2026-10-18**:
+/// `C:\Samples\wannacry.exe` was scored malicious at 09:58:07 and quarantined at
+/// 09:58:17, and its process was never stopped, because the walk in between
+/// reported `412 regions, 1 interesting, 1 read, 0 finding(s)`.
+///
+/// So the control thread records every image it convicts here, and the worker
+/// consults it for the image a process was started from. The evidence is not
+/// weaker than the memory path's — it is the same file, judged by the same
+/// engine against the same thresholds, and the product has already acted on it
+/// by taking the file — and in the WannaCry case it is the only evidence there
+/// is.
+///
+/// # Why the comparison is not `Path == Path`
+///
+/// The two paths come from different places — the driver's own file name against
+/// `PS_CREATE_NOTIFY_INFO`'s image name — and Windows paths are case-insensitive.
+/// The match is [`av_driver_proto::exclusions::matches_prefix`], which is the
+/// same comparison the allow list and the driver's own exclusion table make, so
+/// there is one answer in this crate to "is this the same path" rather than two
+/// that agree most of the time.
+#[derive(Debug, Clone, Default)]
+pub struct Convictions {
+    /// In insertion order, oldest first. A `Vec` rather than a map because the
+    /// lookup is a case-insensitive comparison that a hash key could only
+    /// reproduce by inventing a second notion of path equality.
+    entries: Arc<parking_lot::Mutex<Vec<(Vec<u16>, Verdict)>>>,
+    /// Bumped every time an entry is added.
+    ///
+    /// The second walk at [`SETTLEMENT`] is a *schedule*, and a schedule is a
+    /// guess about when the engine will have finished. Measured in the guest on
+    /// 2026-10-18: six manual runs of the same sample, and one of them ran to
+    /// completion — the scan of the image took longer than the two seconds the
+    /// second walk waits, so the walk that decides looked at the set before the
+    /// conviction was in it, and nothing ever looked again.
+    ///
+    /// So the set also reports that it *changed*, and the worker re-checks the
+    /// processes it has seen whenever it has — which turns "the conviction
+    /// arrived in time" from a race into a fact.
+    generation: Arc<AtomicU64>,
+}
+
+impl Convictions {
+    /// An empty set.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that `path` was convicted with `verdict`.
+    ///
+    /// Only a verdict that clears the bar to be taken is recorded: a suspicious
+    /// file is reported and never acted on, and a process must not be killed on
+    /// an answer this product itself would not quarantine on.
+    ///
+    /// Recording is idempotent for paths that are already present, which is what
+    /// keeps the driver's two questions about one execution (create, then
+    /// acquire-for-section) from filling the list with the same file twice.
+    pub fn record(&self, path: &Path, verdict: Verdict) {
+        if !verdict.blocks() {
+            return;
+        }
+        let units = units_of(path);
+        let mut entries = self.entries.lock();
+        if entries
+            .iter()
+            .any(|(seen, _)| av_driver_proto::exclusions::matches_prefix(&units, seen))
+        {
+            return;
+        }
+        if entries.len() == MAX_CONVICTIONS {
+            entries.remove(0);
+        }
+        entries.push((units, verdict));
+        self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A number that changes whenever a new conviction is recorded.
+    ///
+    /// Compared against the value the worker last acted on, so that a
+    /// conviction recorded at any time — before a walk, during one, or long
+    /// after the second walk has come and gone — is acted on within one turn of
+    /// the worker's loop rather than at a moment chosen in advance.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// The verdict this run recorded for `path`, if any.
+    pub fn verdict_for(&self, path: &Path) -> Option<Verdict> {
+        let units = units_of(path);
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .find(|(seen, _)| av_driver_proto::exclusions::matches_prefix(&units, seen))
+            .map(|(_, verdict)| *verdict)
+    }
+
+    /// How many images are remembered.
+    pub fn len(&self) -> usize {
+        self.entries.lock().len()
+    }
+
+    /// Whether nothing has been convicted this run.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// A path in the form every comparison in this workspace uses.
+fn units_of(path: &Path) -> Vec<u16> {
+    path.to_string_lossy().encode_utf16().collect()
+}
 
 /// Which walk over one process this is.
 ///
@@ -212,6 +384,15 @@ pub struct Watched {
     pub findings: Vec<Judged>,
     /// What happened about stopping it, including nothing.
     pub stopped: Stopped,
+    /// The image the process was started from, when the driver named one.
+    ///
+    /// Carried so that the host can finish what stopping the process makes
+    /// possible: a quarantine of a *running* image cannot delete the file —
+    /// Windows will not remove an executable that is mapped — so the vault
+    /// queues the deletion, and the queue is swept by nothing in this service.
+    /// The stop arriving here is the moment the deletion can work, and the path
+    /// is what it is about.
+    pub image: Option<PathBuf>,
 }
 
 impl Watched {
@@ -238,6 +419,33 @@ impl Watched {
             stopped: Stopped::NotAttempted {
                 why: "the process was not examined, so nothing was decided about it".to_string(),
             },
+            image: None,
+        }
+    }
+
+    /// A process stopped without a walk, because the image it was started from
+    /// was convicted after the walks of it were over.
+    ///
+    /// `findings` is empty and `walk_complete` is false, which together would
+    /// read as a walk that could not finish — so this is only ever sent for a
+    /// process that is *gone*, and [`crate::host`] reads the stop before it
+    /// reads the walk.
+    fn stopped_from_image(start: &Start, token: ProcessToken, stopped: Stopped) -> Self {
+        Self {
+            pid: start.pid,
+            process: start
+                .path
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| format!("process {} (image unnamed)", start.pid)),
+            token,
+            coverage: MemoryCoverage::default(),
+            walk_complete: false,
+            deadline_reached: false,
+            refused: None,
+            findings: Vec::new(),
+            stopped,
+            image: start.path.clone(),
         }
     }
 }
@@ -428,6 +636,17 @@ struct Context {
     /// changed while the worker runs, and a worker holding the value it started
     /// with would go on killing processes after the user turned that off.
     terminating: Arc<AtomicBool>,
+    /// The images the control thread has convicted this run. Written by
+    /// [`crate::host::Host`] as it takes each file the driver reported, read
+    /// here by [`stop_if_justified`] for the image a process was started from.
+    ///
+    /// Shared rather than passed in a start message because the two facts arrive
+    /// on different channels — the conviction is drained from the driver, the
+    /// start from the driver's process-notify worker — and a message would have
+    /// to guess which would arrive first. A set either has the answer by the
+    /// time the process is walked or it does not, and the second walk at
+    /// [`SETTLEMENT`] is what makes "does not" recoverable.
+    convictions: Convictions,
     scanner: Arc<dyn ProcessScanner>,
 }
 
@@ -466,6 +685,7 @@ impl ProcessWatch {
         allow: AllowList,
         options: ScanOptions,
         terminating: bool,
+        convictions: Convictions,
     ) -> Result<Self, ProcessWatchError> {
         let scanner = Arc::new(RealScanner {
             engine: Arc::clone(&engine),
@@ -478,6 +698,7 @@ impl ProcessWatch {
             settlement: SETTLEMENT,
             own_pid: std::process::id(),
             terminating: Arc::new(AtomicBool::new(terminating)),
+            convictions,
             scanner,
         })
     }
@@ -507,6 +728,7 @@ impl ProcessWatch {
         allow: AllowList,
         options: ScanOptions,
         terminating: bool,
+        convictions: Convictions,
         scanner: Arc<dyn ProcessScanner>,
     ) -> Result<Self, ProcessWatchError> {
         Self::run_over(Context {
@@ -517,6 +739,7 @@ impl ProcessWatch {
             settlement: SETTLEMENT,
             own_pid: std::process::id(),
             terminating: Arc::new(AtomicBool::new(terminating)),
+            convictions,
             scanner,
         })
     }
@@ -644,7 +867,44 @@ fn run(
     // the queue is always the next one to walk.
     let mut settling: VecDeque<(Instant, Start)> = VecDeque::new();
 
+    // The processes this worker has examined, not stopped, and not yet old
+    // enough to forget, with the token that names each one.
+    //
+    // Kept because the decision to stop a process can become true *after* every
+    // walk of it has been made: the engine's answer about an image arrives when
+    // it arrives, and a schedule that assumed it would arrive inside
+    // [`SETTLEMENT`] was measured wrong — one run in six, 2026-10-18. This list
+    // is what makes a late answer still act on the process it is about.
+    let mut live: VecDeque<(Instant, Start, ProcessToken)> = VecDeque::new();
+    let mut acted_on = context.convictions.generation();
+
     while !stop.load(Ordering::SeqCst) {
+        // A conviction recorded since the last turn can name a process that is
+        // already running. One with an empty finding list is a re-check of the
+        // image alone — no walk, no memory read — which is what keeps this
+        // cheap enough to run on every change.
+        let generation = context.convictions.generation();
+        if generation != acted_on {
+            acted_on = generation;
+            let now = Instant::now();
+            let mut index = 0;
+            while index < live.len() {
+                if now.saturating_duration_since(live[index].0) >= CONVICTION_GRACE {
+                    live.remove(index);
+                    continue;
+                }
+                let (start, token) = (live[index].1.clone(), live[index].2.clone());
+                let stopped = stop_if_justified(context, &start, &token, &[]);
+                if stopped.happened() {
+                    counters.stopped.fetch_add(1, Ordering::Relaxed);
+                    let _ = out.send(Watched::stopped_from_image(&start, token, stopped));
+                    live.remove(index);
+                    continue;
+                }
+                index += 1;
+            }
+        }
+
         // Never sleep past a second walk that is due, and never longer than the
         // poll: the stop flag is the other reason this thread wants to wake.
         let wait = settling
@@ -663,10 +923,31 @@ fn run(
                 // acted on, so walking it again could only produce the same
                 // finding twice.
                 let again = watched.refused.is_none() && watched.findings.is_empty();
+                // Offered to the late-conviction re-check only if it is still
+                // running and has a name to match a conviction against. A
+                // process this walk already stopped is not: the stop has
+                // happened, and asking again would only log the same reason
+                // twice.
+                let keep = !watched.terminated() && watched.image.is_some();
+                let token = watched.token.clone();
+                let image = watched.image.clone();
                 // A closed receiver means the host has gone and there is nobody
                 // to tell. The loop keeps draining rather than ending, because
                 // the queue must not fill behind a host that is coming back.
                 let _ = out.send(watched);
+                if keep {
+                    if live.len() == MAX_LIVE_STARTS {
+                        live.pop_front();
+                    }
+                    // The image is the one this walk resolved, which is the
+                    // driver's answer or the process's own — not necessarily
+                    // what the start arrived with.
+                    let entry = Start {
+                        pid: start.pid,
+                        path: image,
+                    };
+                    live.push_back((Instant::now(), entry, token));
+                }
                 if again {
                     if settling.len() < MAX_PENDING_SETTLEMENTS {
                         settling.push_back((Instant::now() + context.settlement, start));
@@ -777,6 +1058,13 @@ fn examine(context: &Context, start: &Start, counters: &Counters, pass: Pass) ->
     let process = av_memory::identify(start.pid);
     let described = process.describe();
 
+    // What the driver said at creation, or — when it had no name for the
+    // process — what the process says about itself now. The second answer is
+    // asked for because a start that cannot be named is a start that no
+    // conviction can match, and a driver that could not translate a device path
+    // must not be the reason a malicious program runs.
+    let image = start.path.clone().or_else(|| process.image.clone());
+
     let outcome = match context.scanner.examine(&process, SCAN_DEADLINE) {
         ProcessScan::Refused { reason, .. } => {
             // A second walk is only ever asked for a process the first one read,
@@ -825,7 +1113,15 @@ fn examine(context: &Context, start: &Start, counters: &Counters, pass: Pass) ->
         .findings
         .fetch_add(findings.len() as u64, Ordering::Relaxed);
 
-    let stopped = stop_if_justified(context, start, &token, &findings);
+    let stopped = stop_if_justified(
+        context,
+        &Start {
+            pid: start.pid,
+            path: image.clone(),
+        },
+        &token,
+        &findings,
+    );
     if stopped.happened() {
         counters.stopped.fetch_add(1, Ordering::Relaxed);
     }
@@ -840,6 +1136,7 @@ fn examine(context: &Context, start: &Start, counters: &Counters, pass: Pass) ->
         refused: None,
         findings,
         stopped,
+        image,
     }
 }
 
@@ -854,6 +1151,20 @@ fn examine(context: &Context, start: &Start, counters: &Counters, pass: Pass) ->
 /// vault. That is the condition under which this product has already decided a
 /// file is malicious, and it is the only condition under which it will kill the
 /// program running it.
+///
+/// # The second bar, and why it is the same bar
+///
+/// There is a second way to clear it: the image the process was *started from*
+/// may itself have been convicted by the engine, in which case the control thread
+/// has already taken the file and recorded it in [`Convictions`]. Same engine,
+/// same thresholds, same consequence — a file this product decided was malicious
+/// and acted on. The two are one bar, reached from two directions.
+///
+/// Until 2026-10-18 only the memory direction existed, and a sample that never
+/// injects could not be stopped at all: the section gate convicted
+/// `C:\Samples\wannacry.exe` and quarantined it while the process kept running,
+/// because the memory walk that decides this returned `0 finding(s)`. A reader
+/// who wants the measurement should look at [`Convictions`]'s documentation.
 ///
 /// A finding in a region no file backs is *not* such a condition, and that is the
 /// hard half of this decision: [`memory::Left::NoFile`] is a real detection — the
@@ -912,33 +1223,61 @@ fn stop_if_justified(
             memory::Action::Leave { .. } => None,
         })
         .collect();
+    if let Some(file) = taken.iter().copied().find(|file| !context.allow.allows(file)) {
+        log::warn!(
+            "the process {} (pid {}) holds code from {} and is being stopped",
+            start
+                .path
+                .as_deref()
+                .map(Path::display)
+                .map(|path| path.to_string())
+                .unwrap_or_else(|| "whose image could not be named".to_string()),
+            start.pid,
+            file.display()
+        );
+        return terminate::stop(token);
+    }
+
+    // The second justification, and the one a sample that never injects needs.
+    //
+    // The image the process was created from has already been examined by the
+    // engine — the driver asked about the section being created, and the control
+    // thread took the file on the answer. That is the same bar the block above
+    // applies to a finding's file: convicted in its own right, by the same
+    // engine and thresholds, and already acted on by this product. The difference
+    // is only where the evidence came from, and for a program that does nothing
+    // but write files there is no other evidence to have.
+    //
+    // This is a second branch rather than an alternative first one because it
+    // says a different thing: the block above stops a process for code it *holds*,
+    // this one for the program it *is*.
+    if let Some(image) = start.path.as_deref() {
+        if let Some(verdict) = context.convictions.verdict_for(image) {
+            log::warn!(
+                "the process {} (pid {}) was started from an image the engine scored {} and is \
+                 being stopped",
+                image.display(),
+                start.pid,
+                verdict.as_str()
+            );
+            return terminate::stop(token);
+        }
+    }
+
     if taken.is_empty() {
         return Stopped::NotAttempted {
-            why: "no finding's own file was malicious enough to act on".to_string(),
+            why: "no finding's own file was malicious enough to act on, and the image it was \
+                  started from has not been convicted this run"
+                .to_string(),
         };
     }
-    let Some(file) = taken.iter().copied().find(|file| !context.allow.allows(file)) else {
-        return Stopped::NotAttempted {
-            why: format!(
-                "{} is allowed by the user's own decision, and it is the only file any finding \
-                 points at",
-                taken[0].display()
-            ),
-        };
-    };
-
-    log::warn!(
-        "the process {} (pid {}) holds code from {} and is being stopped",
-        start
-            .path
-            .as_deref()
-            .map(Path::display)
-            .map(|path| path.to_string())
-            .unwrap_or_else(|| "whose image could not be named".to_string()),
-        start.pid,
-        file.display()
-    );
-    terminate::stop(token)
+    Stopped::NotAttempted {
+        why: format!(
+            "{} is allowed by the user's own decision, and it is the only file any finding \
+             points at",
+            taken[0].display()
+        ),
+    }
 }
 
 /// A scanner a test states the answer for.
@@ -1111,6 +1450,7 @@ mod tests {
             // accident. The skip itself is asserted with `own_pid` directly.
             own_pid: 0xFFFF_FFF0,
             terminating: Arc::new(AtomicBool::new(terminating)),
+            convictions: Convictions::new(),
             scanner,
         })
         .expect("the watcher's thread starts")
@@ -1138,6 +1478,37 @@ mod tests {
         let path = dir.path().join(name);
         std::fs::write(&path, format!("prefix {MARKER} suffix")).expect("the file is writable");
         path
+    }
+
+    /// A watcher over a chosen set of convictions, with a walk that finds
+    /// nothing.
+    ///
+    /// The empty walk is the point rather than a convenience: the process whose
+    /// image was convicted is the one that never injects, so the tests here have
+    /// to reproduce a process with no memory finding at all.
+    fn watching_convictions(
+        dir: &tempfile::TempDir,
+        allow: AllowList,
+        terminating: bool,
+        convictions: Convictions,
+    ) -> ProcessWatch {
+        let scanner: Arc<dyn ProcessScanner> =
+            Arc::new(testing::FixedScanner::new(|process, _deadline| {
+                let pid = process.pid;
+                outcome(pid, Vec::new())
+            }));
+        ProcessWatch::start_with(Context {
+            engine: engine(),
+            paths: layout(dir),
+            allow,
+            options: options(),
+            settlement: HOUR,
+            own_pid: 0xFFFF_FFF0,
+            terminating: Arc::new(AtomicBool::new(terminating)),
+            convictions,
+            scanner,
+        })
+        .expect("the watcher's thread starts")
     }
 
     #[test]
@@ -1444,6 +1815,7 @@ mod tests {
             settlement: HOUR,
             own_pid: 7,
             terminating: Arc::new(AtomicBool::new(true)),
+            convictions: Convictions::new(),
             scanner: Arc::new(testing::FixedScanner::new(move |process, _deadline| {
                     seen.examined.lock().expect("the lock").push(process.pid);
                     ProcessScan::Refused {
@@ -1484,6 +1856,7 @@ mod tests {
             settlement: HOUR,
             own_pid: 0xFFFF_FFF0,
             terminating: Arc::new(AtomicBool::new(false)),
+            convictions: Convictions::new(),
             scanner: Arc::new(testing::FixedScanner::new(move |process, _deadline| {
                     // Slow enough that the queue behind it fills while the
                     // worker is inside one call. Real walks take seconds; this
@@ -1566,6 +1939,7 @@ mod tests {
             settlement: HOUR,
             own_pid: 0xFFFF_FFF0,
             terminating: Arc::new(AtomicBool::new(false)),
+            convictions: Convictions::new(),
             scanner: Arc::new(testing::FixedScanner::new(move |process, deadline| {
                     seen.deadlines.lock().expect("the lock").push(deadline);
                     let mut outcome = ProcessOutcome::new(process.clone());
@@ -1827,6 +2201,287 @@ mod tests {
             "a file that is not malicious must not cost the user a running program"
         );
         assert!(watch.stop());
+    }
+
+    #[test]
+    fn a_real_process_started_from_a_convicted_image_really_ends() {
+        // The WannaCry shape, and the case that was measured missing on
+        // 2026-10-18: the walk finds *nothing* — the program never injects —
+        // and the only evidence is the image it was started from, which the
+        // control thread convicted and took while the process was already
+        // running. Before `Convictions` existed this process lived, which is
+        // exactly what happened in the guest.
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let image = PathBuf::from(r"C:\somewhere\subject.exe");
+        let convictions = Convictions::new();
+        convictions.record(&image, Verdict::Malicious);
+        let mut child = crate::terminate::doomed::ChildGuard::new();
+
+        let watch = watching_convictions(
+            &dir,
+            AllowList::from_paths(&[]),
+            true,
+            convictions,
+        );
+        let watched = watch_one(
+            &watch,
+            Start {
+                pid: child.pid(),
+                path: Some(image.clone()),
+            },
+        );
+
+        assert!(
+            watched.findings.is_empty(),
+            "the premise of this test is a process with no memory finding: {:?}",
+            watched.findings
+        );
+        assert_eq!(
+            watched.stopped,
+            Stopped::Terminated,
+            "the process was not stopped: {}",
+            watched.stopped.describe()
+        );
+        assert_eq!(watch.stats().stopped, 1);
+        assert!(
+            child.wait_for_exit(),
+            "the process was reported as terminated and is still running"
+        );
+        assert!(watch.stop());
+    }
+
+    #[test]
+    fn a_process_started_from_an_ordinary_image_is_left_alone() {
+        // The control for the test above, and the one that matters more: the
+        // same empty walk and the same real process, with nothing convicted.
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let mut child = crate::terminate::doomed::ChildGuard::new();
+
+        let watch = watching_convictions(
+            &dir,
+            AllowList::from_paths(&[]),
+            true,
+            Convictions::new(),
+        );
+        let watched = watch_one(
+            &watch,
+            Start {
+                pid: child.pid(),
+                path: Some(PathBuf::from(r"C:\somewhere\subject.exe")),
+            },
+        );
+
+        assert!(matches!(watched.stopped, Stopped::NotAttempted { .. }));
+        assert_eq!(watch.stats().stopped, 0);
+        assert!(
+            child.is_running(),
+            "an image nobody convicted must not cost the user a running program"
+        );
+        assert!(watch.stop());
+    }
+
+    #[test]
+    fn an_image_the_user_allowed_is_not_stopped_even_when_it_was_convicted() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let image = PathBuf::from(r"C:\somewhere\subject.exe");
+        let convictions = Convictions::new();
+        convictions.record(&image, Verdict::Malicious);
+        let mut child = crate::terminate::doomed::ChildGuard::new();
+
+        let watch = watching_convictions(
+            &dir,
+            AllowList::from_paths(&[PathBuf::from(r"C:\somewhere")]),
+            true,
+            convictions,
+        );
+        let watched = watch_one(
+            &watch,
+            Start {
+                pid: child.pid(),
+                path: Some(image),
+            },
+        );
+
+        assert!(matches!(watched.stopped, Stopped::NotAttempted { .. }));
+        assert!(
+            child.is_running(),
+            "the user said this program is wanted, and killing it would be the opposite"
+        );
+        assert!(watch.stop());
+    }
+
+    #[test]
+    fn a_conviction_that_arrives_after_the_second_walk_still_stops_the_process() {
+        // 2026-10-18, in the guest: the same sample run by hand six times, and
+        // one of them ran to completion. The image had not been scanned before,
+        // the scan took longer than the two seconds the second walk waits, and
+        // the walk that decides looked at the set before the answer was in it.
+        // Nothing ever looked again, so the process lived.
+        //
+        // This is that shape with the waiting taken out: a process walked while
+        // nothing is convicted, and the conviction arriving afterwards.
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let image = PathBuf::from(r"C:\somewhere\late.exe");
+        let convictions = Convictions::new();
+        let mut child = crate::terminate::doomed::ChildGuard::new();
+
+        let watch = watching_convictions(
+            &dir,
+            AllowList::from_paths(&[]),
+            true,
+            convictions.clone(),
+        );
+        let first = watch_one(
+            &watch,
+            Start {
+                pid: child.pid(),
+                path: Some(image.clone()),
+            },
+        );
+        assert!(
+            !first.terminated(),
+            "the premise is a process nothing had convicted yet: {:?}",
+            first.stopped
+        );
+        assert!(child.is_running());
+
+        convictions.record(&image, Verdict::Malicious);
+
+        let late = watch
+            .outcomes()
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the worker acts on a conviction that arrived after its walks");
+        assert_eq!(late.pid, child.pid());
+        assert_eq!(
+            late.stopped,
+            Stopped::Terminated,
+            "the late conviction did not stop the process: {}",
+            late.stopped.describe()
+        );
+        assert_eq!(
+            late.image.as_deref(),
+            Some(image.as_path()),
+            "the answer has to name the image, or the host cannot finish its deletion"
+        );
+        assert_eq!(watch.stats().stopped, 1);
+        assert!(
+            child.wait_for_exit(),
+            "the process was reported as terminated and is still running"
+        );
+        assert!(watch.stop());
+    }
+
+    #[test]
+    fn a_late_conviction_that_names_a_different_image_stops_nothing() {
+        // The control for the test above: the same arrival, the same process,
+        // and a verdict about somebody else's file.
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let convictions = Convictions::new();
+        let mut child = crate::terminate::doomed::ChildGuard::new();
+
+        let watch = watching_convictions(
+            &dir,
+            AllowList::from_paths(&[]),
+            true,
+            convictions.clone(),
+        );
+        let first = watch_one(
+            &watch,
+            Start {
+                pid: child.pid(),
+                path: Some(PathBuf::from(r"C:\somewhere\subject.exe")),
+            },
+        );
+        assert!(!first.terminated());
+
+        convictions.record(Path::new(r"C:\somewhere\other.exe"), Verdict::Malicious);
+
+        assert!(
+            watch
+                .outcomes()
+                .recv_timeout(Duration::from_millis(500))
+                .is_err(),
+            "a conviction about another file produced an answer about this process"
+        );
+        assert!(
+            child.is_running(),
+            "a verdict about somebody else's file killed this process"
+        );
+        assert_eq!(watch.stats().stopped, 0);
+        assert!(watch.stop());
+    }
+
+    #[test]
+    fn a_late_conviction_does_not_stop_a_process_the_user_allowed() {
+        // The late path goes through `stop_if_justified` like every other one,
+        // and this is the assertion that it is the same function rather than a
+        // second decision that forgot the allow list.
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let image = PathBuf::from(r"C:\somewhere\subject.exe");
+        let convictions = Convictions::new();
+        let mut child = crate::terminate::doomed::ChildGuard::new();
+
+        let watch = watching_convictions(
+            &dir,
+            AllowList::from_paths(&[PathBuf::from(r"C:\somewhere")]),
+            true,
+            convictions.clone(),
+        );
+        let first = watch_one(
+            &watch,
+            Start {
+                pid: child.pid(),
+                path: Some(image.clone()),
+            },
+        );
+        assert!(!first.terminated());
+
+        convictions.record(&image, Verdict::Malicious);
+
+        assert!(
+            watch
+                .outcomes()
+                .recv_timeout(Duration::from_millis(500))
+                .is_err(),
+            "an allowed program produced an answer"
+        );
+        assert!(child.is_running(), "an allowed program was killed");
+        assert!(watch.stop());
+    }
+
+    #[test]
+    fn only_a_verdict_the_product_would_take_is_a_reason_to_stop_a_process() {
+        let convictions = Convictions::new();
+        convictions.record(Path::new(r"C:\x\maybe.exe"), Verdict::Suspicious);
+        assert!(convictions.is_empty());
+        assert_eq!(convictions.verdict_for(Path::new(r"C:\x\maybe.exe")), None);
+
+        convictions.record(Path::new(r"C:\x\evil.exe"), Verdict::Malicious);
+        assert_eq!(convictions.len(), 1);
+        assert_eq!(
+            convictions.verdict_for(Path::new(r"C:\x\evil.exe")),
+            Some(Verdict::Malicious)
+        );
+    }
+
+    #[test]
+    fn the_same_image_written_differently_is_the_same_image() {
+        // The two paths come from different places in the kernel and one of them
+        // is the file name as the filesystem spells it, so a comparison that is
+        // not case-insensitive would miss. This is the same matcher the allow
+        // list uses, which is the point: one answer to "is this the same path".
+        let convictions = Convictions::new();
+        convictions.record(Path::new(r"C:\Samples\WannaCry.EXE"), Verdict::Malicious);
+
+        assert_eq!(
+            convictions.verdict_for(Path::new(r"c:\samples\wannacry.exe")),
+            Some(Verdict::Malicious)
+        );
+        assert_eq!(
+            convictions.verdict_for(Path::new(r"C:\Samples\wannacry.exe.bak")),
+            None,
+            "a shared prefix is not the same file"
+        );
     }
 
     #[test]

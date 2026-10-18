@@ -390,7 +390,14 @@ pub struct DecisionRequestMessage {
     /// Meaningful length of [`DecisionRequestMessage::path`], in UTF-16 code
     /// units. **Not** an allocation size — see the module documentation.
     pub path_units: u32,
-    /// The process that tried to run the file.
+    /// The process that asked, when the driver can name one.
+    ///
+    /// **Not necessarily the program that is about to run.** A section created
+    /// during process creation is created on the thread that called
+    /// `CreateProcess`, so this names the launcher — the shell, `cmd`, a
+    /// service host — and not the new process. A DLL loaded into a running
+    /// process is asked about by that process itself. Zero when nothing filled
+    /// it, which is every message this driver sent before 2026-10-18.
     pub process_id: u32,
     /// The thread that tried to run it.
     pub thread_id: u32,
@@ -562,6 +569,45 @@ pub struct DecisionReplyMessage {
 impl DecisionReplyMessage {
     /// 16 + 8 + 4 + 4 + 4 + 4 + 8 = 48, a multiple of 8.
     pub const SIZE: usize = 48;
+
+    /// The bytes of this structure that cross the port back to the driver.
+    ///
+    /// **The filter manager consumes [`PortReplyHeader`] itself.** Its
+    /// `status` becomes `FltSendMessage`'s return value and its `message_id` is
+    /// what pairs the reply with the waiting message; what lands in the
+    /// driver's reply buffer is everything after them, and the `ReplyLength`
+    /// the driver passes *in* is a capacity for those bytes and not for the
+    /// whole structure. The header's 16 bytes are added back when that capacity
+    /// is advertised to user mode, which is what
+    /// [`PortMessageHeader::reply_length`]'s "including the FILTER_REPLY_HEADER"
+    /// means.
+    ///
+    /// Measured rather than assumed — `FLTMGR.SYS` 10.0.26100,
+    /// `FltSendMessage` at `0x180017CD0` (image base `0x180000000`): the
+    /// caller's `ReplyLength` is read at `0x180017D6A`/`0x180018317`, kept in a
+    /// local, and written into the outgoing [`PortMessageHeader::reply_length`]
+    /// as `lea eax,[rdi+10h]` / `mov [rcx],eax` (`0x180018106`); the sender
+    /// buffer length is given the same `+ 0x10` at `0x180017E15`, and that
+    /// value is what the receive side compares against the user's buffer at
+    /// `0x180017EFE`.
+    ///
+    /// A driver that hands over the whole structure and then requires the whole
+    /// structure's size back receives 32 bytes for a 48-byte expectation and
+    /// discards every answer — which reads from service side exactly like a
+    /// service that never convicts anything.
+    pub const PAYLOAD_OFFSET: usize = PortReplyHeader::SIZE;
+
+    /// `SIZE - PAYLOAD_OFFSET`: 32 bytes, the reply capacity to give
+    /// `FltSendMessage`.
+    pub const PAYLOAD_SIZE: usize = Self::SIZE - Self::PAYLOAD_OFFSET;
+
+    /// The first payload byte — the address `FltSendMessage`'s reply buffer
+    /// must point at, and the address of [`Self::request_id`].
+    pub fn payload_ptr(&mut self) -> *mut u8 {
+        (self as *mut Self)
+            .cast::<u8>()
+            .wrapping_add(Self::PAYLOAD_OFFSET)
+    }
 
     /// A reply carrying `decision` for `request_id`.
     ///
@@ -883,7 +929,16 @@ impl fmt::Debug for DriverStatus {
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub struct DriverStats {
-    /// Executions refused.
+    /// Executions refused at the create gate.
+    ///
+    /// **Always zero since 2026-10-15, and that is not a fault.** No create
+    /// was ever refused: the service's `refusing_gate` answers `false` for
+    /// every subject that gate sends, so the driver's `Block` arm was
+    /// unreachable and the answer it waited up to five seconds for was
+    /// discarded. The field stays because it is part of a `repr(C)` structure
+    /// whose layout is the protocol's, and because a build that resumed
+    /// refusing creates would have somewhere to say so. Refusals that happen
+    /// are in [`DriverStats::images_blocked`].
     pub blocked_executions: u64,
     /// Writes refused. Meaningful only in
     /// [`crate::event::EnforcementMode::Blocking`]; a service that sees this
@@ -1825,6 +1880,33 @@ mod tests {
         assert_eq!(event.prefix.header.reply_length, 0);
         let status = StatusMessage::new(DriverStatus::default());
         assert_eq!(status.prefix.header.reply_length, 0);
+    }
+
+    /// The reply that reaches the driver is the payload, not the structure:
+    /// the filter manager owns the header and strips it before the copy, so
+    /// `FltSendMessage`'s reply buffer must begin at [`DecisionReplyMessage::payload_ptr`]
+    /// and its capacity is [`DecisionReplyMessage::PAYLOAD_SIZE`].
+    #[test]
+    fn the_reply_payload_begins_after_the_filter_managers_header() {
+        let mut reply = DecisionReplyMessage::new(7, crate::decision::Decision::Block);
+        let base = core::ptr::addr_of!(reply) as usize;
+        let payload = reply.payload_ptr() as usize;
+
+        // The two ways of saying where the payload starts have to agree: the
+        // constant is the header's size, and the field the driver reads first
+        // is `request_id`.
+        assert_eq!(payload - base, PortReplyHeader::SIZE);
+        assert_eq!(
+            offset_of!(DecisionReplyMessage, request_id),
+            DecisionReplyMessage::PAYLOAD_OFFSET
+        );
+
+        // 8 + 4 + 4 + 4 + 4 + 8, and the two halves account for the whole.
+        assert_eq!(DecisionReplyMessage::PAYLOAD_SIZE, 32);
+        assert_eq!(
+            DecisionReplyMessage::PAYLOAD_OFFSET + DecisionReplyMessage::PAYLOAD_SIZE,
+            DecisionReplyMessage::SIZE
+        );
     }
 
     /// `ExclusionBuffer::entry` must refuse an index the sender did not fill

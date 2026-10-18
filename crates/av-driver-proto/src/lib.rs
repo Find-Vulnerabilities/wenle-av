@@ -27,6 +27,7 @@
 //! | [`port`] | The name of the filter communication port, in the one place both sides read it | tests |
 //! | [`install`] | What the driver is called on a machine: service, file, altitude, group | tests |
 //! | [`protect`] | Which access rights the kernel strips from handles to this product, which of its files a write may not open, and what a configuration message does to that gate | tests |
+//! | [`refusal`] | The section gate's last few refusals, which the process-creation callback repeats through `CreationStatus` | tests |
 //!
 //! # No dependencies, and `no_std`
 //!
@@ -113,6 +114,7 @@ pub mod ioctl;
 pub mod path;
 pub mod port;
 pub mod protect;
+pub mod refusal;
 pub mod wire;
 
 pub use decision::{

@@ -79,7 +79,7 @@ use crate::engine::{self, Engine};
 use crate::error::ServiceError;
 use crate::filter_port;
 use crate::memory;
-use crate::process_watch::{ProcessWatch, Start, Watched};
+use crate::process_watch::{Convictions, ProcessWatch, Start, Watched};
 use crate::scan::{self, Running, ScanCounts, ScanJob, ScanMessage};
 use crate::selfprotect::{self, SelfProtection};
 use crate::tamper::Tamper;
@@ -219,6 +219,19 @@ pub struct Host {
     /// [`Host::quarantine`] for the two shapes that takes, and why the second
     /// of them is the one that used to leave two entries for one file.
     taken: HashMap<PathBuf, Taken>,
+    /// The image files this run's engine has convicted, shared with the process
+    /// worker.
+    ///
+    /// The worker needs it because the two halves of acting on a malicious
+    /// program are split across two threads: this one takes the *file*, and the
+    /// worker stops the *process* — and until 2026-10-18 the worker could only
+    /// see memory findings, so a file convicted here was quarantined while the
+    /// program it came from kept running. See
+    /// [`crate::process_watch::Convictions`] for the measurement.
+    ///
+    /// Written in one place, [`Host::drain_driver`], from the detection the
+    /// filter port built for a file it refused.
+    convictions: Convictions,
     /// The watcher, when it is running.
     realtime: Option<RealtimeService>,
     /// The process watcher, when it is running.
@@ -421,6 +434,7 @@ impl Host {
             allow,
             vault,
             taken: HashMap::new(),
+            convictions: Convictions::new(),
             realtime: None,
             process_watch: None,
             realtime_state: RealtimeState::off(NO_WATCHER_YET),
@@ -1098,6 +1112,7 @@ impl Host {
             self.allow.clone(),
             options,
             terminating,
+            self.convictions.clone(),
         ) {
             Ok(watch) => {
                 log::info!(
@@ -1535,6 +1550,30 @@ impl Host {
                     // message no window shows; the fact it carries is reported
                     // by `Host::status`, which is where a user looks.
                     continue;
+                } else if reported.action == DriverEventAction::ExecutionBlocked {
+                    // The driver failed the creation itself, before the program
+                    // got to run. This is the one event in the product that
+                    // means a process did **not** start, and until 2026-10-18
+                    // the driver never sent it.
+                    //
+                    // Logged here rather than routed to the watcher, because
+                    // there is no process to watch: the pid in the event was
+                    // refused and never existed. The line is the measurement —
+                    // it is how the next run tells "the section refusal was
+                    // honoured" from "it was not, and the veto caught it" from
+                    // "neither worked".
+                    match &reported.path {
+                        Some(path) => log::warn!(
+                            "{} (pid {}) was refused before it ran: the engine had just refused that image at the section gate",
+                            path.display(),
+                            reported.process_id
+                        ),
+                        None => log::warn!(
+                            "a process (pid {}) was refused before it ran: the engine had just refused its image at the section gate",
+                            reported.process_id
+                        ),
+                    }
+                    continue;
                 } else if reported.action == DriverEventAction::ProcessStarted {
                     // Routed rather than published, and the same reason applies
                     // as above: a bare driver event is a message no front end
@@ -1555,6 +1594,14 @@ impl Host {
                     if detection.source == EntrySource::Driver
                         && should_take(detection.verdict) =>
                 {
+                    // Recorded *before* the quarantine and whether or not it
+                    // succeeds, because the two answers differ: the vault can
+                    // refuse to hold a file — it is gone, it is open, the disk
+                    // is full — and none of that makes the process running it
+                    // less malicious. What the worker consults is the engine's
+                    // verdict, not the take.
+                    self.convictions
+                        .record(&detection.path, detection.verdict);
                     detection.action = self.quarantine(
                         &detection.path,
                         context_for_detection(&detection),
@@ -1646,6 +1693,20 @@ impl Host {
             log::debug!("{} was not examined: {why}", watched.process);
             return;
         }
+
+        // Before the early return for a clean process, because the stop this
+        // reads is about the *image* and a process stopped for its image has no
+        // findings at all. The quarantine of a running executable cannot delete
+        // it — Windows keeps an image that is mapped — so the vault queues the
+        // deletion, and stopping the process is the moment the queue can be
+        // finished. Without this the file stayed on disk, runnable, until
+        // somebody ran `wenle quarantine maintain`.
+        if watched.terminated() {
+            if let Some(image) = watched.image.as_deref() {
+                self.finish_removal(image);
+            }
+        }
+
         if watched.findings.is_empty() {
             log::trace!(
                 "{} was examined and held nothing that matched; stopped: {}",
@@ -2011,6 +2072,54 @@ impl Host {
     /// Whether the vault still owes a deletion of `path`.
     fn removal_is_pending(&self, path: &Path) -> bool {
         self.vault.pending_removals().iter().any(|p| p.path == path)
+    }
+
+    /// Finish the deletion of an image whose process has just been stopped.
+    ///
+    /// This is the one case [`Host::win_the_removal_race`] cannot cover: it
+    /// waits 750 ms for a handle to be released, and the handle in question
+    /// belongs to a process that is *running*, so it is released when that
+    /// process ends and not before. Measured in the guest on 2026-10-18: a
+    /// sample convicted at its section and quarantined had its bytes in the
+    /// vault while the executable stayed where it was, which is why the same
+    /// file could be started six times by hand.
+    ///
+    /// One sweep, no waiting: by the time this runs `TerminateProcess` has
+    /// returned and the mapping is going away. A sweep that still fails is left
+    /// queued for the next attempt rather than retried here — the caller this
+    /// would block is the control loop.
+    fn finish_removal(&mut self, image: &Path) {
+        if !self.removal_is_pending(image) {
+            return;
+        }
+        match self.vault.retry_pending_removals() {
+            Ok(sweep) => {
+                if !image.is_file() {
+                    log::info!(
+                        "{} was deleted now that the process running it has been stopped",
+                        image.display()
+                    );
+                } else if sweep.abandoned > 0 {
+                    log::warn!(
+                        "{} is still on disk and its deletion has been given up on after too \
+                         many attempts; what is left is the vault's copy and a file that can \
+                         still be started",
+                        image.display()
+                    );
+                } else {
+                    log::warn!(
+                        "{} is still on disk after its process was stopped; the deletion stays \
+                         queued",
+                        image.display()
+                    );
+                }
+            }
+            Err(error) => log::warn!(
+                "the deletion of {} could not be retried now that its process has been \
+                 stopped: {error}",
+                image.display()
+            ),
+        }
     }
 
     /// Scan one process's memory, act on what its findings point at, and say
@@ -2862,22 +2971,34 @@ pub fn context_for_finding(finding: &av_realtime::Finding) -> QuarantineContext 
 /// which is what [`QuarantineContext::from_report`] takes as well; the whole
 /// list is in the detection and stays there.
 ///
-/// The note is the record of how the file was taken, and here it is the
-/// strongest of the three sources: the driver refused the open, so the program
-/// never began to run. The vault write happens after that, and on a file no
-/// process has a handle to.
+/// The note is the record of how the file was taken, and **it is two sentences
+/// rather than one since 2026-10-15**, because a driver detection now arrives
+/// from two gates that took the file in opposite ways.
+///
+/// A refusal is the strongest of the three sources: the driver stopped the
+/// open, so the program never began to run, and the vault write lands on a file
+/// no process has a handle to. A conviction from the gate that only reports is
+/// the **weakest** source in the product — nothing was stopped and the program
+/// did run; all that made the file takeable is that the engine convicted it
+/// while the kernel was asking. Writing the stronger sentence for both would
+/// put "no process was allowed to execute it" on a vault record for a file that
+/// executed, and the quarantine list is the only place that difference is
+/// recorded for a user reading it a week later.
 pub fn context_for_detection(detection: &Detection) -> QuarantineContext {
+    let note = if detection.claims_a_block() {
+        "the kernel driver refused this file before it ran and the service took it afterwards; \
+         no process was allowed to execute it"
+    } else {
+        "the kernel driver convicted this file while it was being opened and the service took it \
+         afterwards; the open was allowed, so a process may have run it"
+    };
     QuarantineContext {
         threat: detection.threat.clone(),
         detection: detection.rules.first().cloned(),
         severity: detection.severity,
         verdict: detection.verdict,
         source: EntrySource::Driver,
-        note: Some(
-            "the kernel driver refused this file before it ran and the service took it \
-             afterwards; no process was allowed to execute it"
-                .to_string(),
-        ),
+        note: Some(note.to_string()),
         remove_original: true,
     }
 }
@@ -4221,10 +4342,13 @@ mod tests {
     /// Built here rather than through [`Detection::from_report`] because there
     /// is no [`FileScanReport`] in this story: the report belonged to the filter
     /// port's thread and was dropped when it replied to the driver. The fields
-    /// are the ones that crossed the channel, and `phase` is
-    /// [`Phase::observed`] of the driver with `true` — a block, which is the
-    /// whole reason this detection exists.
-    fn driver_detection(path: PathBuf, verdict: Verdict) -> Detection {
+    /// are the ones that crossed the channel.
+    ///
+    /// `blocked` is a parameter rather than `true`, because the port has built
+    /// two kinds of driver detection since 2026-10-15: one from the section
+    /// gate, which refuses, and one from the create gate, which cannot and
+    /// reports instead. [`driver_detection`] is the first of those.
+    fn driver_detection_with(path: PathBuf, verdict: Verdict, blocked: bool) -> Detection {
         Detection {
             file_name: file_name_of(&path),
             path,
@@ -4239,8 +4363,14 @@ mod tests {
             at: Utc::now(),
             in_process: None,
             terminated: false,
-            phase: Phase::observed(EntrySource::Driver, true),
+            phase: Phase::observed(EntrySource::Driver, blocked),
         }
+    }
+
+    /// The driver's refusal, which is what nearly every caller of the helper
+    /// above means.
+    fn driver_detection(path: PathBuf, verdict: Verdict) -> Detection {
+        driver_detection_with(path, verdict, true)
     }
 
     /// A host whose driver channel this test feeds by hand.
@@ -4271,6 +4401,44 @@ mod tests {
             note.contains("refused") && note.contains("before it ran"),
             "the note has to record that the program never started: {note}"
         );
+    }
+
+    #[test]
+    fn the_context_for_a_create_gate_conviction_says_the_program_may_have_run() {
+        // The other driver detection, and the one that arrived on 2026-10-15:
+        // the create gate cannot refuse, so it reports a conviction while the
+        // file is allowed to open. The vault note is the only thing that
+        // separates this from a refusal a week later, and the two sentences
+        // have to be *opposite* rather than merely different — "no process was
+        // allowed to execute it" is a claim this case cannot make.
+        let refused = context_for_detection(&driver_detection_with(
+            PathBuf::from("C:\\Samples\\payload.exe"),
+            Verdict::Malicious,
+            true,
+        ));
+        let reported = context_for_detection(&driver_detection_with(
+            PathBuf::from("C:\\Samples\\payload.exe"),
+            Verdict::Malicious,
+            false,
+        ));
+        let refused = refused.note.expect("a note");
+        let reported = reported.note.expect("a note");
+        assert_ne!(
+            refused, reported,
+            "the two driver sources took the file in opposite ways, so one sentence cannot \
+             describe both"
+        );
+        assert!(
+            reported.contains("allowed"),
+            "the note has to say the open was not refused: {reported}"
+        );
+        assert!(
+            !reported.contains("no process was allowed"),
+            "the program was allowed to run; this cannot be claimed of it: {reported}"
+        );
+        // The note is a record of *how* the file was taken, so it has to name
+        // the mechanism rather than only deny the stronger claim.
+        assert!(reported.contains("convicted"), "{reported}");
     }
 
     #[test]
@@ -4370,6 +4538,67 @@ mod tests {
         assert!(
             !target.is_file(),
             "the original is gone, which is what the second refusal found"
+        );
+    }
+
+    #[test]
+    fn a_file_the_driver_refused_is_remembered_as_a_reason_to_stop_its_process() {
+        // The wiring, and the one that was missing until 2026-10-18: taking the
+        // file and stopping the program are done by different threads, and this
+        // is where the first tells the second. Without it the file is in the
+        // vault and the process runs — measured in the guest on 2026-10-18, with
+        // WannaCry.
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (mut host, sender) = host_with_driver_channel(&dir);
+        host.loaded.config.quarantine.auto_quarantine = true;
+
+        let target = dir.path().join("payload.exe");
+        std::fs::write(&target, b"convicted by the driver's gate").expect("written");
+        sender
+            .send(Event::Detection(driver_detection(
+                target.clone(),
+                Verdict::Malicious,
+            )))
+            .expect("queued");
+        host.drain();
+
+        assert_eq!(
+            host.convictions.verdict_for(&target),
+            Some(Verdict::Malicious),
+            "the process worker has no way to learn what the driver's gate convicted"
+        );
+    }
+
+    #[test]
+    fn a_conviction_is_remembered_even_when_the_vault_declines_to_take_the_file() {
+        // The distinction this pins: what the worker acts on is
+        // the *engine's verdict*, not the vault's success. A machine whose
+        // vault is full or whose file is locked still has a malicious program
+        // running, and `auto_quarantine = false` is the user saying "report it,
+        // do not take it" — not "let it run".
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (mut host, sender) = host_with_driver_channel(&dir);
+        host.loaded.config.quarantine.auto_quarantine = false;
+
+        let target = dir.path().join("payload.exe");
+        std::fs::write(&target, b"convicted by the driver's gate").expect("written");
+        sender
+            .send(Event::Detection(driver_detection(
+                target.clone(),
+                Verdict::Malicious,
+            )))
+            .expect("queued");
+        host.drain();
+
+        assert_eq!(
+            host.convictions.verdict_for(&target),
+            Some(Verdict::Malicious),
+            "the verdict is the reason to stop the process, and the vault's answer is a \
+             different question"
+        );
+        assert!(
+            target.is_file(),
+            "the file was reported and not taken, which is what the setting asked for"
         );
     }
 
@@ -4833,6 +5062,68 @@ mod tests {
     }
 
     #[test]
+    fn the_original_is_deleted_once_the_process_that_was_holding_it_is_stopped() {
+        // Measured in the guest on 2026-10-18: the sample was convicted at its
+        // section, the vault took its bytes — and the executable stayed exactly
+        // where it was, which is why it could be started six times by hand.
+        // Deleting a *running* image cannot work, and the only sweep of the
+        // queue the vault keeps is `wenle quarantine maintain`. Stopping the
+        // process is the moment the deletion becomes possible, and this is that
+        // moment being used.
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (mut host, sender) = host_with_driver_channel(&dir);
+        host.loaded.config.quarantine.auto_quarantine = true;
+
+        let target = dir.path().join("payload.exe");
+        std::fs::write(&target, b"the process is running this").expect("written");
+        // The handle a running image holds: read access, no share-delete.
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x0000_0001)
+            .open(&target)
+            .expect("the test's handle");
+
+        sender
+            .send(Event::Detection(driver_detection(
+                target.clone(),
+                Verdict::Malicious,
+            )))
+            .expect("queued");
+        let events = host.drain();
+        assert!(
+            matches!(
+                events.as_slice(),
+                [Event::Detection(d)] if matches!(d.action, DetectionAction::Quarantined { .. })
+            ),
+            "the premise is a file the vault took: {events:?}"
+        );
+        assert!(
+            target.is_file(),
+            "the premise is a deletion that could not happen yet, so this test needs the handle"
+        );
+        assert_eq!(host.vault.pending_removals().len(), 1);
+
+        // The process ends — which is what the worker's stop does — and the
+        // report of it arrives at the control thread.
+        drop(handle);
+        let mut report = watched(std::process::id(), Vec::new(), Stopped::Terminated);
+        report.image = Some(target.clone());
+        let mut out = Vec::new();
+        host.absorb_memory(report, &mut out);
+
+        assert!(
+            !target.is_file(),
+            "the deletion stayed queued after the process holding the file was stopped"
+        );
+        assert!(
+            host.vault.pending_removals().is_empty(),
+            "a successful retry has to clear the queue it was queued into"
+        );
+    }
+
+    #[test]
     fn a_block_is_only_reported_when_the_configuration_says_not_to_act() {
         // `auto_quarantine` off has to mean that *nothing* is taken — including a
         // file the kernel stopped, which is the one case where a product might be
@@ -5254,6 +5545,7 @@ mod tests {
                 .map(|(finding, ruling)| Judged { finding, ruling })
                 .collect(),
             stopped,
+            image: None,
         }
     }
 
@@ -5557,6 +5849,7 @@ mod tests {
             host.allow.clone(),
             engine::options_from(&host.loaded.config.scanning),
             true,
+            host.convictions.clone(),
             scanner,
         )
         .expect("the watcher's thread starts");

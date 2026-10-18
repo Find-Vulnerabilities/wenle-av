@@ -220,15 +220,19 @@ impl EventAction {
     /// which is not something a security product should be doing to a machine
     /// it is supposed to be protecting.
     ///
-    /// [`EventAction::ProcessStarted`] is the one that *could* be and is
-    /// deliberately not: the kernel lets a create-notification write
-    /// `CreationStatus` and abort the creation outright. This product does not
-    /// do that, and the reason is what a false positive would cost — an error
-    /// code returned from this callback delays the process that asked for the
-    /// creation, by however long the decision takes, so a wrong answer there
-    /// breaks an unrelated program's start-up instead of being reported about a
-    /// process that already exists. The drivers that make the other choice are
-    /// the reason the API exists; this one reports and acts afterwards.
+    /// [`EventAction::ProcessStarted`] is the one that *could* be and is still
+    /// not **this** action: the kernel lets a create-notification write
+    /// `CreationStatus` and abort the creation outright. The driver reports a
+    /// creation it let through as `ProcessStarted`, and a creation it failed as
+    /// [`EventAction::ExecutionBlocked`] — a different action, because the two
+    /// outcomes are different, and because no consumer should have to infer
+    /// "it ran" or "it did not" from a field that means neither.
+    ///
+    /// The refusal is never this driver's own verdict. Since 2026-10-18 it
+    /// repeats a `Block` the section gate has already been given for the same
+    /// path within the last minute (`av-driver`'s `RefusalMemo` says why that
+    /// repeat was needed), so the answer was made by the engine under its own
+    /// thresholds, and the create path neither waits nor decides anything new.
     pub const fn is_blockable(self) -> bool {
         matches!(
             self,

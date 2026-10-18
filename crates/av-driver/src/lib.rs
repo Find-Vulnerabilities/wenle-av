@@ -244,7 +244,10 @@
 //! which `dumpwho` now reads (see `find_exception_records`).
 //!
 //! **This driver does not import `IoGetRequestorProcess` or any requested-process
-//! API** -- six ntoskrnl imports, all listed under "WDM, not KMDF" below -- so the
+//! API** -- six ntoskrnl imports at the time of that diagnosis, all listed under
+//! "WDM, not KMDF" below; a seventh, `PsGetCurrentProcessId`, was added on
+//! 2026-10-18, which reads the calling thread's own process and takes no
+//! pointer, so it is not the family this paragraph is about -- so the
 //! call came from fltMgr or from another filter. Within fltMgr the candidates are
 //! narrowed by what the fault rules out: the `FltSendMessage` call site at
 //! `+0x295` dereferences the same IRP at `+0x17EEB` and `+0x17EFE` before it
@@ -564,6 +567,13 @@ static HANDLES_PROTECTED: AtomicBool = AtomicBool::new(false);
 // The counters, one index each. `DriverStats`'s field order is this order,
 // which is what makes `stats()` a straight read rather than a mapping that
 // could drift away from the protocol.
+//
+// `C_BLOCKED_EXECUTIONS` has no `bump` since 2026-10-15, and that is the whole
+// of what changed about it: the create gate was the only thing that could have
+// moved it, the create gate was never answered with a refusal, and it no longer
+// asks. Kept rather than deleted because the index is the protocol's and
+// because removing it would shift every counter below by one -- which is the
+// silent misread the assertion at the bottom of this file exists to prevent.
 const C_BLOCKED_EXECUTIONS: usize = 0;
 const C_BLOCKED_WRITES: usize = 1;
 const C_IMAGES_BLOCKED: usize = 2;
@@ -1165,6 +1175,19 @@ extern "system" fn filter_unload(_flags: u32) -> NtStatus {
     STATUS_SUCCESS
 }
 
+// ---------------------------------------------------------------------------
+// The creation veto
+// ---------------------------------------------------------------------------
+
+/// The section gate's last few refusals, which [`process_notify`] repeats.
+///
+/// The type and its tests live in `av_driver_proto::refusal`, because a seqlock
+/// whose reader runs in a process-creation callback is the kind of code that
+/// must be exercised somewhere it can fail loudly. What stays here is the one
+/// instance and the two calls into it.
+static REFUSALS: av_driver_proto::refusal::RefusalMemo =
+    av_driver_proto::refusal::RefusalMemo::new();
+
 /// A process was created, or deleted.
 ///
 /// # Why the callback was empty until 2026-10-09, and why it is not now
@@ -1199,13 +1222,31 @@ extern "system" fn filter_unload(_flags: u32) -> NtStatus {
 /// matches paths nobody named. A dropped process start is a missed scan; a
 /// wrong path is a scan of the wrong program reported under the right one.
 ///
-/// # What is *not* done here
+/// # The one decision this callback makes, and why it is not a wait
 ///
-/// No decision. `CreationStatus` is a real lever — writing an error into it
-/// refuses the process — and this product deliberately does not pull it: the
-/// user's choice was to let a program start and stop it, and a callback that
-/// waits for a user-mode answer delays the *parent* by however long the answer
-/// takes. This callback reports and returns.
+/// It does not ask the service anything, and it never waits for an answer. What
+/// it does is **repeat a refusal the section gate has already made**, a moment
+/// earlier, for the same path: `CreationStatus` is `_Inout_` in the header
+/// (`ntddk.h` 11211), so writing `STATUS_ACCESS_DENIED` into it fails the
+/// creation, and the parent's `CreateProcess` returns `ERROR_ACCESS_DENIED`
+/// instead of running the program.
+///
+/// **Why this exists at all**, measured in the test VM on 2026-10-18:
+/// `C:\Samples\wannacry.exe` was refused at the section gate at 12:32:53 —
+/// `STATUS_INSUFFICIENT_RESOURCES`, the only status the filter manager honours
+/// for a created section — and the process running it was walked at 12:32:54.
+/// In the same second, through the same gate, the refusal of
+/// `C:\Samples\taskdl.exe` was followed by no process at all. So the section
+/// refusal is not universally ignored: it is sometimes effective, and the
+/// product cannot tell which case it got. This callback is the one place that
+/// can, because it runs after the decision and can still act on it.
+///
+/// The lever is narrow on purpose, and everything that makes it narrow is in
+/// `av_driver_proto::refusal::RefusalMemo`: it fires only for a path this driver
+/// refused less than a minute ago, on an exact case-insensitive match, and the
+/// gate's next allow of that same path clears the record. Nothing here
+/// interprets a file; there is no verdict in this callback and no way for it to
+/// invent one.
 ///
 /// # Safety
 ///
@@ -1255,6 +1296,51 @@ unsafe extern "C" fn process_notify(
         return;
     }
 
+    // The DOS form is needed **here** and not on the worker, and that is the
+    // 2026-10-18 change to this callback: the veto below is a write into
+    // `CreationStatus`, which is only possible during this call, and the memo it
+    // consults is keyed by the DOS path. The conversion is a lookup in
+    // [`VOLUMES`] plus two copies — the volume table is primed when the service
+    // connects and answers from memory — so it does no I/O on the creating
+    // thread, which is the property the old arrangement was protecting.
+    //
+    // SAFETY: `buffer` and `length` are the counted string the kernel handed
+    // over, and its length field is the guarantee that `buffer` is valid for
+    // `units` code units for the duration of this call.
+    let device = unsafe { core::slice::from_raw_parts(buffer, units) };
+    let mut dos = [0u16; MAX_PATH_UNITS];
+    let Ok(path) = device_to_dos_path(device, &VOLUMES, &mut dos) else {
+        // The reasons are `device_to_dos_path`'s own — a volume with no DOS
+        // letter, an embedded NUL, a parent component, a name too long — and
+        // every one means this is not a path the service could match a rule
+        // against. Dropped rather than truncated, as before and for the same
+        // reason: a truncated path names a different file.
+        return;
+    };
+
+    // The veto, and it comes before the queue-cap check below on purpose: a
+    // refusal that could not be reported is still a refusal, and the event is
+    // the measurement of what happened rather than the thing that makes it
+    // happen.
+    //
+    // The exclusion table is consulted here as well as in [`named`], and the
+    // two are not redundant: `named` decides what may be *asked about*, and this
+    // decides what may be *refused*. The section gate never stores an excluded
+    // path, but a user can add an exclusion in the second between the refusal
+    // and the creation — and a user's exclusion is the freshest word this driver
+    // has, newer than the engine's refusal. It is a few string comparisons
+    // against a fixed table, which is what makes it affordable on the creation
+    // path.
+    let refused = !EXCLUSIONS.matches(path)
+        && REFUSALS.refused_recently(path, interrupt_time_100ns());
+    if refused {
+        // SAFETY: `create_info` is the live `PS_CREATE_NOTIFY_INFO` the kernel
+        // passed to this callback, and `CreationStatus` is declared `_Inout_`
+        // (`ntddk.h` 11211) — the header's own statement that a notify routine
+        // may write it to fail the creation.
+        unsafe { (*create_info).CreationStatus = STATUS_ACCESS_DENIED };
+    }
+
     // A dropped event is silent rather than counted, for the reason
     // [`defer_write_event`] gives: `DriverStats` has no field for one and its
     // layout is the protocol's.
@@ -1301,17 +1387,21 @@ unsafe extern "C" fn process_notify(
     pending.event.process_id = process_id as u32;
     pending.event.detail = 0;
     pending.event.subject = SubjectKind::Process;
-    pending.event.action = EventAction::ProcessStarted;
-    pending.units = units as u32;
-    // SAFETY: `buffer` is valid for `units` code units -- that is the whole
-    // content of a counted string's length field, and it is the guarantee the
-    // header gives. The source is the kernel's buffer and the destination is
-    // the block allocated above, which cannot overlap it.
-    unsafe { core::ptr::copy_nonoverlapping(buffer, pending.device.as_mut_ptr(), units) };
+    // The event says which of the two things happened, and `ExecutionBlocked`
+    // is the action the protocol already defines for "a process creation or a
+    // file execution was refused before it happened". It has never been sent
+    // before; the service's `drain_driver` is what turns it into a log line,
+    // and that line is what tells the next run whether this veto fired.
+    pending.event.action = if refused {
+        EventAction::ExecutionBlocked
+    } else {
+        EventAction::ProcessStarted
+    };
+    pending.units = path.len() as u32;
+    // The path is already the DOS form, and it is copied into the block because
+    // a callback cannot leave `dos` — its own stack — behind for the worker.
+    pending.path[..path.len()].copy_from_slice(path);
 
-    // The conversion to a DOS path happens on the worker and not here: it needs
-    // a 2 KiB scratch buffer and the volume cache, and the callback's job is to
-    // copy what it was given and get out of the way.
     unsafe {
         queue_pending(
             block.cast::<c_void>(),
@@ -1324,6 +1414,44 @@ unsafe extern "C" fn process_notify(
 }
 
 /// The pre-operation for `IRP_MJ_CREATE`.
+///
+/// # What this stopped doing on 2026-10-15
+///
+/// It used to ask the service for a decision and wait for the answer — up to
+/// [`DecisionPolicy::DEFAULT_TIMEOUT_MS`] on the calling thread, and up to
+/// `av-service`'s `DECISION_DEADLINE` on the port thread. **It could not act on
+/// that answer.** `av_service::filter_port`'s `refusing_gate` answers `false`
+/// for every request this gate sends, so the `Block` arm was unreachable and
+/// the verdict was discarded on every open the machine made.
+///
+/// What the wait cost was not the answer but the port: that thread is the only
+/// reader of the decision port, and it is serial. While it was producing a
+/// verdict for this gate, the acquire-for-section request behind it — the one
+/// gate in this product that can refuse an execution — was waiting to be read.
+/// And this gate is asked a great deal:
+///
+/// * `FILE_EXECUTE` is `0x0020` and `FILE_TRAVERSE` is `0x0020`, so **every
+///   directory open** arrives here as an execution question. That is the mask
+///   and not an inference; it is measured, and written down in that function's
+///   own documentation.
+/// * An icon or a manifest read that goes through the image loader needs a
+///   `FILE_EXECUTE` open, so listing a folder of programs arrives here too.
+///
+/// That is the shape of the 2026-10-14 WannaCry run: the engine convicted the
+/// sample's files repeatedly — the service log carries the convictions — and
+/// the sample ran, encrypted, and asked for a ransom anyway.
+///
+/// # Why the ask was removed rather than made asynchronous
+///
+/// Asynchronous would have kept the scan, and the scan is the part that was
+/// never wanted here: this gate's question is about a **read**, which
+/// [`section_pre_operation`]'s own documentation says this product does not
+/// promise to stop. The execution itself is asked about by that callback, from
+/// a request volume of images rather than of opens, and it is the one that can
+/// refuse. What is given up is real and narrow — a file the engine would
+/// convict is no longer noticed when something merely reads it, so it is no
+/// longer taken out of the vault's way before a user runs it — and it is the
+/// trade that buys the section gate its answer.
 ///
 /// # Safety
 ///
@@ -1341,26 +1469,25 @@ unsafe extern "system" fn create_pre_operation(
     let wanted = unsafe { desired_access(data) };
     if wanted & FILE_EXECUTE == 0 {
         // Not an open that intends to execute anything. This is the
-        // overwhelming majority of the file opens on a running system, and it
-        // is why the access check comes before the name lookup rather than
-        // after it.
+        // overwhelming majority of the file opens on a running system.
         bump(C_ALLOWED);
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
-    // SAFETY: `data` is the callback's own data pointer.
-    match unsafe { decide(data, SubjectKind::Process, ExecGate::Create) } {
-        Verdict::Block => {
-            // SAFETY: this is the callback data of the operation this
-            // pre-operation is completing with `FLT_PREOP_COMPLETE` below.
-            unsafe { refuse(data) };
-            FLT_PREOP_COMPLETE
-        }
-        // `Unresolved` is the fail-open case, and it is the one the timeout
-        // policy exists for: a path this driver could not name is not a
-        // detection.
-        Verdict::Allow | Verdict::Unresolved => FLT_PREOP_SUCCESS_NO_CALLBACK,
-    }
+    // An open asking `FILE_EXECUTE`, which the documentation above says is a
+    // much weaker statement than it looks. Counted and allowed, with the same
+    // counter as the arm above: `DriverStats` has eight fields and none of them
+    // is free, and a tenth counter is a protocol change rather than a comment.
+    // So how much of this gate's traffic is the `FILE_TRAVERSE` mask is not
+    // separable here — which is worth knowing before anybody reads `allowed` as
+    // a count of files this gate looked at.
+    //
+    // The access check itself stays because it is the only thing in this
+    // function that would have to change for the gate to ask again, and because
+    // reading it is one field of a structure the filter manager has already
+    // filled in.
+    bump(C_ALLOWED);
+    FLT_PREOP_SUCCESS_NO_CALLBACK
 }
 
 /// The pre-operation for `IRP_MJ_ACQUIRE_FOR_SECTION_SYNCHRONIZATION`.
@@ -1428,10 +1555,16 @@ unsafe extern "system" fn section_pre_operation(
     }
 
     // SAFETY: `data` is the callback's own data pointer.
-    match unsafe { decide(data, SubjectKind::Image, ExecGate::Section) } {
+    match unsafe { decide(data) } {
         Verdict::Block => {
+            // `STATUS_INSUFFICIENT_RESOURCES` and not `STATUS_ACCESS_DENIED`:
+            // it is the only failure the filter manager accepts for a created
+            // section, and the wrong one is silently ignored -- see [`refuse`]
+            // for the document and for the two measurements that read as a
+            // refusal that did nothing.
+            //
             // SAFETY: as in `create_pre_operation`.
-            unsafe { refuse(data) };
+            unsafe { refuse(data, STATUS_INSUFFICIENT_RESOURCES) };
             FLT_PREOP_COMPLETE
         }
         Verdict::Allow | Verdict::Unresolved => FLT_PREOP_SUCCESS_NO_CALLBACK,
@@ -1603,7 +1736,7 @@ unsafe extern "system" fn write_pre_operation(
     bump(C_BLOCKED_WRITES);
     // SAFETY: `data` is the callback data of the operation this pre-operation
     // is completing with `FLT_PREOP_COMPLETE` below.
-    unsafe { refuse(data) };
+    unsafe { refuse(data, STATUS_ACCESS_DENIED) };
     FLT_PREOP_COMPLETE
 }
 
@@ -1918,21 +2051,12 @@ unsafe fn protect_handle(
 // The decision itself
 // ---------------------------------------------------------------------------
 
-/// Which callback is asking. The two differ in which counter a refusal moves,
-/// and the counters are the only way an operator can tell which gate fired.
-#[derive(Clone, Copy)]
-enum ExecGate {
-    /// An open that asked for `FILE_EXECUTE`.
-    Create,
-    /// A section is being created, which is a mapping about to happen.
-    Section,
-}
-
 /// What the driver decided.
 enum Verdict {
     /// Let the operation continue.
     Allow,
-    /// Complete it with `STATUS_ACCESS_DENIED`.
+    /// Complete it with a failure status — `STATUS_INSUFFICIENT_RESOURCES` for
+    /// a section, `STATUS_ACCESS_DENIED` for a write. See [`refuse`].
     Block,
     /// The operation could not be turned into a well-formed question. Allowed,
     /// and counted separately so that a volume this driver cannot name is
@@ -1942,13 +2066,21 @@ enum Verdict {
 
 /// Resolve the path, consult the exclusions, ask the service, apply the answer.
 ///
+/// The only caller is [`section_pre_operation`], and the subject it sends is
+/// [`SubjectKind::Image`] for that reason. There used to be a second caller —
+/// the create gate, sending [`SubjectKind::Process`] — and the argument that
+/// removed it is in that callback's documentation. The subject is written here
+/// rather than passed in because a gate that cannot refuse has no business
+/// naming itself to the service as something that can, and because a parameter
+/// with one value is a parameter that can be given the wrong one.
+///
 /// # Safety
 ///
 /// `data` must be the callback data of the operation being decided, and this
 /// must be called from that operation's pre-operation callback, before it
-/// returns -- the name information fetched below is owned by the filter manager
-/// and is valid only for the duration of the callback.
-unsafe fn decide(data: *mut FltCallbackData, subject: SubjectKind, gate: ExecGate) -> Verdict {
+/// returns -- the name information fetched inside [`named`] is owned by the
+/// filter manager and is valid only for the duration of the callback.
+unsafe fn decide(data: *mut FltCallbackData) -> Verdict {
     // The IRQL gate, and it comes before the name lookup because the name
     // lookup is one of the two things it protects. `FltGetFileNameInformation`
     // is `_IRQL_requires_max_(APC_LEVEL)` (`fltKernel.h` 2843) and so is
@@ -1966,13 +2098,67 @@ unsafe fn decide(data: *mut FltCallbackData, subject: SubjectKind, gate: ExecGat
     // driver could ask the service and still be inside the callback. The
     // operation is allowed and counted as allowed, and the `DISPATCH_LEVEL`
     // case is a gap in what this driver sees rather than a decision it made.
-    // `create_pre_operation` cannot reach here -- a CREATE is always
-    // `PASSIVE_LEVEL` -- so this costs that path one comparison.
     if !flt::may_block_for_the_service() {
         bump(C_ALLOWED);
         return Verdict::Unresolved;
     }
 
+    let mut dos = [0u16; MAX_PATH_UNITS];
+    // SAFETY: `data` is the caller's contract, and `dos` is this frame's own
+    // 2 KiB of kernel stack.
+    let Some(path) = (unsafe { named(data, &mut dos) }) else {
+        // Every way of having no path to ask about has already counted itself.
+        // There is no verdict to apply, and `Unresolved` is what the caller
+        // turns into "let it continue".
+        return Verdict::Unresolved;
+    };
+
+    if ask_service(path) {
+        // An allow is the freshest word this driver has about the file, so it
+        // clears any refusal still standing for it. Without this line a refused
+        // path whose file was then re-uploaded, restored or re-allowed would
+        // keep vetoing creations until the window expired — the one way the
+        // creation veto could stop something the gate had just said yes to.
+        REFUSALS.forget(path);
+        bump(C_ALLOWED);
+        Verdict::Allow
+    } else {
+        // Recorded before the caller returns the refusal, so that a creation the
+        // refusal did not stop can still be stopped: see
+        // `av_driver_proto::refusal::RefusalMemo` for the measurement that made
+        // this necessary.
+        REFUSALS.remember(path, interrupt_time_100ns());
+        // The only remaining way to refuse, and therefore the only counter a
+        // refusal moves. `blocked_executions` is the field beside it and is
+        // always zero — see its own documentation in the protocol.
+        bump(C_IMAGES_BLOCKED);
+        Verdict::Block
+    }
+}
+
+/// The DOS path of the file an operation is about, or `None` if there is not
+/// one to ask about.
+///
+/// **The name information is released before this returns**, and that is a
+/// change of its own. `decide` used to hold it across `ask`, which is a
+/// `FltSendMessage` that can wait five seconds: the filter manager's
+/// name-information record is pool, and holding one across a blocking wait on
+/// every program launch is pool a busy machine cannot get back. Nothing below
+/// the copy needs it — the path lives in `dos` — so it goes back as soon as the
+/// copy is made, and there is no early return between the call and the release
+/// for it to leak on.
+///
+/// Every way of answering `None` bumps its own counter *and* `allowed`, so that
+/// the caller has nothing left to count but the outcome of the ask.
+///
+/// # Safety
+///
+/// `data` must be the callback data of an operation being decided, called from
+/// that operation's pre-operation callback.
+unsafe fn named<'a>(
+    data: *mut FltCallbackData,
+    dos: &'a mut [u16; MAX_PATH_UNITS],
+) -> Option<&'a [u16]> {
     let mut information: *mut FltFileNameInformation = core::ptr::null_mut();
     // SAFETY: `data` is the caller's contract. The options ask for the
     // normalised form in the device namespace, which is the form the protocol's
@@ -1993,73 +2179,56 @@ unsafe fn decide(data: *mut FltCallbackData, subject: SubjectKind, gate: ExecGat
         // only as allowed. That gap is recorded here rather than papered over
         // by incrementing a counter whose documented meaning is different.
         bump(C_ALLOWED);
-        return Verdict::Unresolved;
+        return None;
     }
 
     // SAFETY: `information` is non-null and was just returned by a successful
     // `FltGetFileNameInformation`.
     let device = unsafe { (*information).name.as_units() };
-
-    // The verdict is computed before the release, so that every early return
-    // inside `ask` is covered by the single release below. A leaked
-    // name-information structure is pool that is never given back, on a path
-    // that runs once per execution attempt.
-    let outcome = ask(device, subject, gate);
+    let resolved = device_to_dos_path(device, &VOLUMES, dos);
 
     // SAFETY: `information` came from `FltGetFileNameInformation`, is non-null,
-    // and has not been released on any path.
+    // and has not been released on any path -- `device` borrowed it, and the
+    // path has been copied out of it by the line above.
     unsafe { flt::FltReleaseFileNameInformation(information) };
 
-    outcome
-}
-
-/// The part of [`decide`] that runs while the name information is held.
-fn ask(device: &[u16], subject: SubjectKind, gate: ExecGate) -> Verdict {
-    // 2 KiB of kernel stack. A kernel stack is 12 KiB by default, and this is
-    // the largest thing this driver puts on one -- the request built below is
-    // another 2 KiB, in `ask_service`'s frame rather than this one.
-    let mut dos = [0u16; MAX_PATH_UNITS];
-    let path = match device_to_dos_path(device, &VOLUMES, &mut dos) {
-        Ok(path) => path,
-        Err(_) => {
-            // A volume with no DOS name is a path the service cannot match
-            // against a rule that names a drive letter. Sending it anyway would
-            // produce a request that cannot be answered correctly, and blocking
-            // on it would be blocking on a question nobody asked.
-            bump(C_UNRESOLVED_VOLUME);
-            bump(C_ALLOWED);
-            return Verdict::Unresolved;
-        }
-    };
-
-    if EXCLUSIONS.matches(path) {
+    match resolved {
+        Ok(path) if !EXCLUSIONS.matches(path) => Some(path),
         // `excluded` is a subset of `allowed`, not an alternative to it: the
         // operation was allowed, and this is why. An operator who adds the two
         // counters together has misread them, which is why the protocol's
         // documentation for `allowed` says it is large by design.
-        bump(C_EXCLUDED);
-        bump(C_ALLOWED);
-        return Verdict::Allow;
-    }
-
-    if ask_service(path, subject) {
-        bump(C_ALLOWED);
-        Verdict::Allow
-    } else {
-        match gate {
-            ExecGate::Create => bump(C_BLOCKED_EXECUTIONS),
-            ExecGate::Section => bump(C_IMAGES_BLOCKED),
+        Ok(_) => {
+            bump(C_EXCLUDED);
+            bump(C_ALLOWED);
+            None
         }
-        Verdict::Block
+        // A volume with no DOS name is a path the service cannot match against
+        // a rule that names a drive letter. Sending it anyway would produce a
+        // request that cannot be answered correctly, and blocking on it would
+        // be blocking on a question nobody asked.
+        Err(_) => {
+            bump(C_UNRESOLVED_VOLUME);
+            bump(C_ALLOWED);
+            None
+        }
     }
 }
 
 /// Send the request and read the answer. `true` means allow.
 ///
+/// **The subject is always [`SubjectKind::Image`]**, because [`decide`] is the
+/// only caller and [`section_pre_operation`] is its only caller. The service
+/// reads this field to decide which gate asked, and which gate asked is what
+/// decides whether a refusal is possible at all — see that field's own
+/// documentation in `av_service::filter_port`. Writing it from a constant here
+/// rather than taking it as a parameter means there is no call site that could
+/// name a gate it is not.
+///
 /// Every failure path returns `true`, which is `DecisionPolicy::DEFAULT`'s
 /// `on_timeout` rather than this function's opinion: a missed detection is
 /// recoverable, and a machine that cannot open its own files is not.
-fn ask_service(path: &[u16], subject: SubjectKind) -> bool {
+fn ask_service(path: &[u16]) -> bool {
     let port = CLIENT_PORT.load(Ordering::Acquire);
     if port.is_null() {
         // No service is connected. There is nobody to ask, and the answer to
@@ -2068,18 +2237,44 @@ fn ask_service(path: &[u16], subject: SubjectKind) -> bool {
     }
 
     let id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-    let mut request = DecisionRequestMessage::new(id, subject);
+    let mut request = DecisionRequestMessage::new(id, SubjectKind::Image);
+    // Who asked, for the service's log line and for nothing else.
+    //
+    // **The answer is not "the program about to run".** A section created
+    // during process creation is created on the thread that called
+    // `CreateProcess`, so this is the shell, the launcher or whatever else
+    // spawned the program -- which is exactly why the service must not
+    // terminate it. It is here because the field has been documented and zero
+    // since 2026-10-01 and because the one question it settles is which
+    // process's acquire a refusal belonged to: the 2026-10-13 fixture's own, or
+    // a bystander's.
+    //
+    // SAFETY: the only caller is `decide`, whose IRQL gate is what makes this
+    // `_IRQL_requires_max_(PASSIVE_LEVEL)` call legal. The function takes no
+    // pointer, reads a field of the current thread's process, and cannot fault;
+    // `flt.rs` says why it is not one of the `FltGetRequestorProcess*` family
+    // this module puts out of bounds.
+    request.process_id = unsafe { flt::PsGetCurrentProcessId() } as usize as u32;
     if request.set_path(path).is_err() {
         // A path longer than the protocol's maximum. The request cannot carry
         // it truncated -- a truncated path is a different file -- so it is not
-        // sent at all.
+        // sent at all. `C_ALLOWED` is bumped by the caller, once: this returns
+        // `true` and `decide` counts the outcome, so counting it here as well
+        // would make an oversize path read as two allowed operations.
         bump(C_OVERSIZE_PATH);
-        bump(C_ALLOWED);
         return true;
     }
 
     let mut reply = DecisionReplyMessage::new(0, Decision::Allow);
-    let mut reply_length = core::mem::size_of::<DecisionReplyMessage>() as u32;
+    // A *capacity*, and a capacity for the payload. The filter manager consumes
+    // the reply header itself — its `status` is this call's return value and its
+    // `message_id` is the correlation — and copies only what follows it into
+    // the buffer below, returning that smaller size. Passing the whole
+    // structure's size here is what made every answer look truncated: the reply
+    // length came back as 32 against an expectation of 48, and this function's
+    // contract turns an unreadable reply into an allow. See
+    // `DecisionReplyMessage::PAYLOAD_SIZE`.
+    let mut reply_length = DecisionReplyMessage::PAYLOAD_SIZE as u32;
 
     // The timeout is the protocol's, converted from its unit to the filter
     // manager's. `DecisionPolicy::DEFAULT.on_timeout` is `Allow`, so there is
@@ -2105,7 +2300,9 @@ fn ask_service(path: &[u16], subject: SubjectKind) -> bool {
             &mut client,
             out,
             out_length,
-            core::ptr::addr_of_mut!(reply).cast::<c_void>(),
+            // The payload's address, not the structure's. The header in front
+            // of it never makes the return trip; see `reply_length` above.
+            reply.payload_ptr().cast::<c_void>(),
             &mut reply_length,
             &mut timeout,
         )
@@ -2128,7 +2325,10 @@ fn ask_service(path: &[u16], subject: SubjectKind) -> bool {
     // bug this protocol is built to make impossible rather than to detect, and
     // it is checked here because the driver is where a stale verdict applied to
     // the wrong file would do its damage.
-    if reply_length as usize != core::mem::size_of::<DecisionReplyMessage>() {
+    // The payload, because that is what the filter manager copies and what it
+    // reports in `ReplyLength` on the way out. The whole-structure comparison
+    // that used to stand here rejected every reply the service ever sent.
+    if reply_length as usize != DecisionReplyMessage::PAYLOAD_SIZE {
         return true;
     }
     if reply.request_id != id || reply.path_tag != request.path_tag() {
@@ -2275,12 +2475,14 @@ struct PendingEvent {
     action: EventAction,
 }
 
-/// A process-start notification on its way to the service.
+/// A process-start (or refused-start) notification on its way to the service.
 ///
-/// The name is the one the kernel gave, still in the **device** namespace
-/// (`\Device\HarddiskVolume3\...`), because the conversion needs the volume
-/// cache and a 2 KiB scratch buffer and the process-creation callback should do
-/// neither.
+/// The name is in the **DOS** namespace (`C:\Windows\notepad.exe`), converted in
+/// the callback rather than on the worker. That is a deliberate inversion of the
+/// old arrangement: the creation veto needs the DOS path while `CreationStatus`
+/// is still writable, and that is only during the callback. The conversion is a
+/// memory lookup over the primed volume table, so what the callback gives up is
+/// a 2 KiB scratch buffer on its own stack and nothing else.
 ///
 /// `#[repr(C)]` so that `event` is at offset zero: [`process_event_worker`]
 /// receives a `*mut PendingProcessEvent` and reads the header out of it, and
@@ -2289,10 +2491,10 @@ struct PendingEvent {
 #[repr(C)]
 struct PendingProcessEvent {
     event: PendingEvent,
-    /// Meaningful length of `device`. Not an allocation size.
+    /// Meaningful length of `path`. Not an allocation size.
     units: u32,
-    /// The image name as UTF-16 code units, no terminating NUL.
-    device: [u16; MAX_PATH_UNITS],
+    /// The image as a DOS path, in UTF-16 code units, no terminating NUL.
+    path: [u16; MAX_PATH_UNITS],
 }
 
 /// Hand a filled block to a worker thread, or free it and return.
@@ -2599,10 +2801,11 @@ extern "system" fn event_worker(
 
 /// The routine a queued process-start notification runs on.
 ///
-/// This is where the kernel's device path becomes a DOS path, and it is here
-/// rather than in the callback because that is the whole point of deferring:
-/// the conversion needs the volume cache, a 2 KiB scratch buffer, and no
-/// particular hurry, and the process-creation callback has none of the three.
+/// It only sends; the path in the block is already the DOS form, because
+/// [`process_notify`] had to have it while `CreationStatus` was still writable.
+/// What is still deferred is the send itself, for the reason it always was:
+/// `FltSendMessage` is `_IRQL_requires_max_(APC_LEVEL)` and this callback can be
+/// entered at a higher one.
 ///
 /// # Safety
 ///
@@ -2622,8 +2825,9 @@ extern "system" fn process_event_worker(
         send_process_event(
             pending.event.sequence,
             pending.event.now_100ns,
+            pending.event.action,
             pending.event.process_id,
-            &pending.device[..units],
+            &pending.path[..units],
         );
     }
 
@@ -2636,18 +2840,18 @@ extern "system" fn process_event_worker(
     PENDING_PROCESS_EVENTS.fetch_sub(1, Ordering::Relaxed);
 }
 
-/// Convert one process's image name and send it.
+/// Send one process event, whose path is already the DOS form.
 ///
-/// Free-standing rather than inlined into the worker so that the one thing that
-/// can go wrong has somewhere to return from: the worker frees its block on
-/// every path out, and a body with two `return`s inside it is a body where one
-/// of them will eventually be written after the free.
+/// Free-standing rather than inlined into the worker so that the worker has one
+/// thing to call and one place to free: the block goes back on every path out
+/// of the worker, and a body with two `return`s inside it is a body where one of
+/// them will eventually be written after the free.
 ///
-/// A name that will not convert is **not sent**. The reasons are the ones
-/// [`device_to_dos_path`] names — a volume with no DOS letter, an embedded NUL,
-/// a parent component, a name that does not fit the output buffer — and every
-/// one of them means the string is not a path the service can match against a
-/// rule. Sending it truncated would name a different file.
+/// `action` is [`EventAction::ExecutionBlocked`] when the creation veto fired
+/// and [`EventAction::ProcessStarted`] otherwise. The two are distinct on the
+/// wire so that the service's log says which of them happened, which is the
+/// only measurement the veto has: `DriverStats` has no field for it, and the
+/// protocol's layout is not this driver's to extend.
 ///
 /// The exclusion table is deliberately **not** consulted here, and that is a
 /// correction rather than an omission.
@@ -2677,23 +2881,23 @@ extern "system" fn process_event_worker(
 /// edited (`skipped_allowed`) and against its own process tree
 /// (`skipped_own`) — rather than against a constant compiled into the driver,
 /// which is the copy that cannot be corrected by a user who disagrees with it.
-fn send_process_event(sequence: u64, now_100ns: u64, process_id: u32, device: &[u16]) {
-    // 2 KiB on the worker's stack. `EventMessage` below is another 2 KiB in
-    // `send_event`'s frame; a system worker thread's stack is the ordinary
-    // kernel stack, and the write path has been building a 2120-byte message
-    // on one since 10-01.
-    let mut dos = [0u16; MAX_PATH_UNITS];
-    let Ok(path) = device_to_dos_path(device, &VOLUMES, &mut dos) else {
-        return;
-    };
+fn send_process_event(
+    sequence: u64,
+    now_100ns: u64,
+    action: EventAction,
+    process_id: u32,
+    path: &[u16],
+) {
     // SAFETY: this is a worker thread at `PASSIVE_LEVEL`; `send_event`'s own
-    // documentation is the precondition, and it states it there.
+    // documentation is the precondition, and it states it there. `send_event`
+    // builds a 2120-byte `EventMessage` in its own frame, which the write path
+    // has been doing on this same kind of thread since 10-01.
     unsafe {
         send_event(
             sequence,
             now_100ns,
             SubjectKind::Process,
-            EventAction::ProcessStarted,
+            action,
             process_id,
             0,
             path,
@@ -2842,24 +3046,42 @@ unsafe fn send_event(
     }
 }
 
-/// Mark the operation refused.
+/// Mark the operation refused, with the status its caller will see.
 ///
 /// `FLT_PREOP_COMPLETE` is only a refusal because of what this writes: the
 /// status the caller of the file operation receives. Returning the code without
 /// the status completes the operation successfully, which is the worst possible
 /// outcome -- a driver that believes it blocked something.
 ///
+/// # Why the status is a parameter
+///
+/// **The filter manager does not honour an arbitrary status on every
+/// operation.** For `IRP_MJ_ACQUIRE_FOR_SECTION_SYNCHRONIZATION` the reference
+/// page for its [FLT_PARAMETERS][params] says a minifilter may fail the
+/// operation only when `SyncType` is `SyncTypeCreateSection` and only with
+/// `STATUS_INSUFFICIENT_RESOURCES`; a `SyncTypeOther` acquire may not be failed
+/// at all. This driver wrote `STATUS_ACCESS_DENIED` there from 2026-10-02 until
+/// 2026-10-18, and that status is not on the list: the section was created and
+/// the program ran. The service's `was refused` line was true -- it answered --
+/// and the operating system did not act on the answer, which is why a
+/// convicted image still executed on 2026-10-17.
+///
+/// The write gate keeps `STATUS_ACCESS_DENIED`, which is the ordinary status
+/// for a refused create or write and the one an application can report.
+///
+/// [params]: https://learn.microsoft.com/en-us/windows-hardware/drivers/ifs/flt-parameters-for-irp-mj-acquire-for-section-synchronization
+///
 /// # Safety
 ///
 /// `data` must be the callback data of the pre-operation that is returning
 /// `FLT_PREOP_COMPLETE`, and that pre-operation must not already have completed
 /// or pended the operation.
-unsafe fn refuse(data: *mut FltCallbackData) {
+unsafe fn refuse(data: *mut FltCallbackData, status: i32) {
     // SAFETY: the caller's contract. `IoStatus` is at a fixed offset, pinned by
     // `flt.rs`'s layout assertions, and it is where the filter manager reads
     // the status from when a pre-operation completes the operation.
     unsafe {
-        (*data).io_status.status = STATUS_ACCESS_DENIED;
+        (*data).io_status.status = status;
         (*data).io_status.information = 0;
     }
 }

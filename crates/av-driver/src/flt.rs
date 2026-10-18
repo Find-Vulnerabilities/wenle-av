@@ -1086,6 +1086,29 @@ extern "system" {
     /// the caller must not write and must not free.
     pub fn PsGetProcessImageFileName(process: *mut c_void) -> *const u8;
 
+    /// `PsGetCurrentProcessId`, from `ntddk.h` line 11385 -- declared here rather
+    /// than taken from `wdk-sys` because the binding generator emits the header's
+    /// `#if (NTDDI_VERSION >= NTDDI_WIN2K)` block only for the target it was run
+    /// for, and the name is in `ntoskrnl.lib` regardless.
+    ///
+    /// **This is not the requested-process API the module documentation puts out
+    /// of bounds.** That prohibition is about `FltGetRequestorProcess` and its two
+    /// siblings, which dereference `[CallbackData - 0xB8]` without a null check;
+    /// this one is a field read of the calling thread's own process and has no
+    /// pointer argument at all. What it answers is *who issued this operation*,
+    /// which for a section created during process creation is the process that
+    /// called `CreateProcess` -- not the program about to be started. Its only
+    /// use here is the pid on the service's log line.
+    ///
+    /// `ntddk.h` annotates it `_IRQL_requires_max_(PASSIVE_LEVEL)` by default, so
+    /// the only caller must already be at passive level; `decide`'s IRQL gate is
+    /// what provides that.
+    ///
+    /// The return type is `HANDLE` in the header and the value is the process
+    /// identifier, so it is widened to `usize` by the caller rather than
+    /// dereferenced as a pointer.
+    pub fn PsGetCurrentProcessId() -> *mut c_void;
+
     /// `SeExports`, reached through its import slot rather than by name.
     ///
     /// **Two declarations for one object, and the alternative does not link.**
