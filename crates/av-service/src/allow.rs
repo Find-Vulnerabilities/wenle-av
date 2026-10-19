@@ -252,18 +252,18 @@ mod tests {
         let list = AllowList::new();
         assert!(list.is_empty());
         assert_eq!(list.len(), 0);
-        assert!(!list.allows(std::path::Path::new(r"C:\Users\wensz\games\setup.exe")));
+        assert!(!list.allows(std::path::Path::new(r"C:\Users\example\games\setup.exe")));
     }
 
     /// An entry names a directory, and the directory itself *and* everything
     /// under it are allowed — a user who allows a folder means the folder.
     #[test]
     fn an_entry_covers_the_path_and_everything_under_it() {
-        let list = AllowList::from_paths(&[PathBuf::from(r"C:\Users\wensz\games")]);
+        let list = AllowList::from_paths(&[PathBuf::from(r"C:\Users\example\games")]);
         assert!(!list.is_empty());
-        assert!(list.allows(std::path::Path::new(r"C:\Users\wensz\games\setup.exe")));
-        assert!(list.allows(std::path::Path::new(r"C:\Users\wensz\games\a\b\c.dll")));
-        assert!(list.allows(std::path::Path::new(r"C:\Users\wensz\games")));
+        assert!(list.allows(std::path::Path::new(r"C:\Users\example\games\setup.exe")));
+        assert!(list.allows(std::path::Path::new(r"C:\Users\example\games\a\b\c.dll")));
+        assert!(list.allows(std::path::Path::new(r"C:\Users\example\games")));
     }
 
     /// The boundary question is the driver's matcher's, and this pins that the
@@ -287,9 +287,9 @@ mod tests {
     /// still be obeyed.
     #[test]
     fn case_does_not_matter() {
-        let list = AllowList::from_paths(&[PathBuf::from(r"C:\Users\Wensz\Games")]);
-        assert!(list.allows(std::path::Path::new(r"C:\users\wensz\games\setup.exe")));
-        assert!(list.allows(std::path::Path::new(r"c:\USERS\WENSZ\GAMES")));
+        let list = AllowList::from_paths(&[PathBuf::from(r"C:\Users\Example\Games")]);
+        assert!(list.allows(std::path::Path::new(r"C:\users\example\games\setup.exe")));
+        assert!(list.allows(std::path::Path::new(r"c:\USERS\EXAMPLE\GAMES")));
     }
 
     /// An entry added at run time takes effect at once, which is the whole
@@ -298,9 +298,9 @@ mod tests {
     #[test]
     fn an_added_entry_takes_effect_at_once() {
         let list = AllowList::new();
-        let path = std::path::Path::new(r"C:\Users\wensz\games\setup.exe");
+        let path = std::path::Path::new(r"C:\Users\example\games\setup.exe");
         assert!(!list.allows(path));
-        assert!(list.insert(std::path::Path::new(r"C:\Users\wensz\games")));
+        assert!(list.insert(std::path::Path::new(r"C:\Users\example\games")));
         assert!(list.allows(path));
         assert_eq!(list.len(), 1);
     }
@@ -369,10 +369,10 @@ mod tests {
     #[test]
     fn a_session_allow_survives_a_configuration_change() {
         let list = AllowList::new();
-        list.insert(std::path::Path::new(r"C:\Users\wensz\games"));
+        list.insert(std::path::Path::new(r"C:\Users\example\games"));
         list.set_configured(&[PathBuf::from(r"C:\Tools")]);
 
-        assert!(list.allows(std::path::Path::new(r"C:\Users\wensz\games\setup.exe")));
+        assert!(list.allows(std::path::Path::new(r"C:\Users\example\games\setup.exe")));
         assert!(list.allows(std::path::Path::new(r"C:\Tools\r.exe")));
         assert_eq!(list.len(), 2, "one configured entry and one session entry");
     }

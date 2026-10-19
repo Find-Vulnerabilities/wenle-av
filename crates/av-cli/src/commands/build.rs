@@ -103,7 +103,9 @@ pub fn run(args: &BuildArgs, globals: &Globals, context: &Context) -> Result<Exi
             .map(|path| path.display().to_string())
             .collect();
         bail!(
-            "no rule sources in {} — a rule source is a file ending in {}",
+            "no rule sources in {} — a rule source is a file ending in {}; the \
+             release runs the precompiled database in assets/rules.avdb, and \
+             this command is only needed when you add sources of your own",
             names.join(" or "),
             SOURCE_EXTENSIONS.join(", "),
         );

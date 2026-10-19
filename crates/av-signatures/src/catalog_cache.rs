@@ -57,7 +57,7 @@
 //! ```text
 //! NT AUTHORITY\SYSTEM     Allow  FullControl                 Inherited
 //! BUILTIN\Administrators  Allow  FullControl                 Inherited
-//! MSI\wensz               Allow  FullControl                 Inherited
+//! MSI\example               Allow  FullControl                 Inherited
 //! CREATOR OWNER           Allow  FullControl  (inherit-only) Inherited
 //! BUILTIN\Users           Allow  ReadAndExecute, Synchronize Inherited
 //! BUILTIN\Users           Allow  Write   Inheritance=ContainerInherit

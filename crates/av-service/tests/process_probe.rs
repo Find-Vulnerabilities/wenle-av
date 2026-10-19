@@ -36,7 +36,7 @@
 //! # Run it
 //!
 //! ```text
-//! $env:WENLE_PROBE_DATA = "C:\Users\wensz\Downloads\WenleAV\data"
+//! $env:WENLE_PROBE_DATA = "C:\WenleAV\data"
 //! cargo test -p av-service --release --test process_probe -- --nocapture
 //! ```
 //!
