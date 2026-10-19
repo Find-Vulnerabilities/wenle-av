@@ -1339,7 +1339,7 @@ mod tests {
     ///
     /// `wenle protect apply` on the VM, 2026-10-12, read the vault back as
     /// `OPEN  C:\ProgramData\WenleAV\quarantine: an ordinary user CAN write here
-    /// — S-1-5-21-3068414794-1231551665-1067906926-1001` and then failed with
+    /// — S-1-5-21-1-2-3-1001` and then failed with
     /// "the write reported success and the directory did not change" — about the
     /// one directory in the report it had not written to. The account named is
     /// the one that created the vault, which is the third access-control entry
@@ -1355,7 +1355,7 @@ mod tests {
     fn the_vault_is_reported_and_never_judged() {
         let audit = DirAudit {
             path: PathBuf::from(r"C:\ProgramData\WenleAV\quarantine"),
-            writeable_by: vec!["S-1-5-21-3068414794-1231551665-1067906926-1001".to_string()],
+            writeable_by: vec!["S-1-5-21-1-2-3-1001".to_string()],
             ..a_writable_directory(r"C:\ProgramData\WenleAV\quarantine")
         };
 

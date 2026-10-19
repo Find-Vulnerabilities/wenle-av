@@ -288,7 +288,7 @@ mod tests {
                 action: av_ipc::DriverEventAction::RegistryChanged,
                 subject: av_ipc::DriverSubject::Registry,
                 path: Some(std::path::PathBuf::from(format!(
-                    r"\REGISTRY\USER\S-1-5-21-3068414794-1231551665-1067906926-1001\Software\WenleBulk{step}"
+                    r"\REGISTRY\USER\S-1-5-21-1-2-3-1001\Software\WenleBulk{step}"
                 ))),
                 process_id: 8620,
                 parent_process_id: 0,

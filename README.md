@@ -15,16 +15,20 @@ cd crates/av-driver && cargo build     # the filter driver; needs the WDK and it
 The four user-mode programs must be built together; the AMSI provider is a
 separate `cdylib`.
 
+The rule database is compiled, not vendored: `assets/rules.avdb` is the
+10,764-rule database the release runs, and its sources are not in this
+repository. Copy it beside the executables.
+
 ## Quick start
 
 ```
-wenle build                            # compile the installed rules
 wenle scan C:\Users\you\Downloads      # scan a file or directory
 wenle memory                           # scan every process this account can open
 wenle-gui                              # the window
 ```
 
-`wenle build` compiles `%ProgramData%\WenleAV\rules` into
+`wenle build` compiles rule sources of your own — `%ProgramData%\WenleAV\rules`,
+or the empty `rules/` folder beside the executable — into
 `%ProgramData%\WenleAV\db\rules.avdb`. `--strict` refuses a release with any
 rule the engine cannot compile.
 
@@ -60,8 +64,8 @@ locally. The window is English only.
 
 ## Licensing
 
-The code is MIT (`LICENSE`). That grant does not cover `rules/`: the vendored
-YARA-Forge packages (Apache-2.0) merge upstream rules whose individual licenses
-are recorded in each package's headers, some of which state no license. Read
-those headers before redistributing a package. Hand corrections to vendored
-rules are recorded in each rule's `curation` metadata.
+The code is MIT (`LICENSE`). The rule sources are not distributed in this
+repository, and the MIT grant does not cover the shipped database:
+`assets/rules.avdb` is a compiled derivative of the YARA-Forge packages
+(Apache-2.0), which merge upstream rules whose individual licenses are recorded
+in each package's headers, some of which state no license.
