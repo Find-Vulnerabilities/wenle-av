@@ -26,7 +26,9 @@
 //! the product does and it runs while the user is working, so a pool sized to
 //! the core count would take the machine for the duration of a `%TEMP%` storm.
 //! And the work is bounded at both ends already: the debounce window collapses a
-//! burst into one scan per path, and a tree walk stops at [`RESCAN_FILE_LIMIT`].
+//! burst into one scan per path, a tree walk stops at [`RESCAN_FILE_LIMIT`],
+//! and the walk is abandoned at its next entry once the watcher is asked to
+//! stop — which is what keeps a shutdown from waiting on a walk.
 //! The queue this thread has to drain is small by construction rather than by
 //! luck. What a caller who configured `worker_threads` should know is that it
 //! changes nothing here, which is why [`WatchPlan::unhonoured`] says so.
@@ -388,11 +390,13 @@ impl RealtimeService {
     /// Stop watching, join the scanner, and return what it did.
     ///
     /// The order matters. The watches stop first, so no new event can arrive for
-    /// a scanner on its way out. The scanner then finishes the paths already due
-    /// and exits when its channel disconnects, and only then is it joined, so
-    /// the totals are complete. A path still inside its debounce window when
-    /// this is called is *not* scanned: the caller asked the watcher to stop, and
-    /// a shutdown that first walked `%TEMP%` would not be a shutdown. Everything
+    /// a scanner on its way out. The scanner then finishes the file it is
+    /// scanning, leaves a tree walk at its next entry, and exits when its
+    /// channel disconnects, and only then is it joined, so the totals are
+    /// complete. A path still inside its debounce window when this is called is
+    /// *not* scanned: the caller asked the watcher to stop, and a shutdown that
+    /// first walked `%TEMP%` would not be a shutdown — which is the same reason
+    /// the walk itself checks the flag. Everything
     /// already scanned reaches [`RealtimeService::events`] before the totals
     /// reach this caller, because the events are sent as they happen.
     ///
@@ -523,12 +527,26 @@ impl Scanner<'_> {
     /// One routine for two jobs that are the same job: catching up after the
     /// kernel dropped events, and looking inside a directory that arrived whole
     /// because something moved it into a watched tree.
-    fn tree(&mut self, root: &Path, limit: usize, stats: &mut ServiceStats) -> TreeOutcome {
+    fn tree(
+        &mut self,
+        root: &Path,
+        limit: usize,
+        stats: &mut ServiceStats,
+        stop: &AtomicBool,
+    ) -> TreeOutcome {
         let mut outcome = TreeOutcome::default();
         // `follow_links(false)` is the default and is written out anyway: a
         // junction into a profile directory would turn one walk into a walk of
         // everything, and a junction into a parent into an endless one.
         for entry in walkdir::WalkDir::new(root).follow_links(false) {
+            // Checked per entry, not only between passes of the event loop.
+            // `RealtimeService::stop` joins this thread, so a stop request that
+            // arrived during a walk used to wait for up to `RESCAN_FILE_LIMIT`
+            // scans — which is how `Stop-Service` came to hang for minutes.
+            if stop.load(Ordering::Relaxed) {
+                outcome.cancelled = true;
+                break;
+            }
             let entry = match entry {
                 Ok(entry) => entry,
                 // A directory that cannot be listed is a hole in the walk,
@@ -566,6 +584,12 @@ struct TreeOutcome {
     files: usize,
     /// True when the walk stopped at its limit.
     truncated: bool,
+    /// True when the walk stopped because the watcher is shutting down.
+    ///
+    /// Not the same as [`TreeOutcome::truncated`]: the tree has no more files
+    /// unexamined, the walk was simply asked to stop. Reported separately so a
+    /// caller never prints "the limit was reached" for a shutdown.
+    cancelled: bool,
     /// Directories that could not be listed.
     unreadable_entries: usize,
     /// Detections.
@@ -609,7 +633,9 @@ fn run(
 
         select! {
             recv(events) -> message => match message {
-                Ok(event) => handle(event, plan, &mut debouncer, &mut stats, out, &mut scanner),
+                Ok(event) => {
+                    handle(event, plan, &mut debouncer, &mut stats, out, &mut scanner, stop)
+                }
                 // Every watch has ended. The paths still inside their window are
                 // scanned below before the loop ends, which is the difference
                 // between a watcher that shuts down and one that drops work.
@@ -620,7 +646,7 @@ fn run(
         }
 
         for path in debouncer.due(Instant::now()) {
-            scan_due(&path, &mut scanner, &mut stats, out);
+            scan_due(&path, &mut scanner, &mut stats, out, stop);
         }
     }
 
@@ -635,6 +661,7 @@ fn handle(
     stats: &mut ServiceStats,
     out: &Sender<RealtimeEvent>,
     scanner: &mut Scanner<'_>,
+    stop: &AtomicBool,
 ) {
     match event {
         WatchEvent::Changed { root, changes } => {
@@ -648,7 +675,19 @@ fn handle(
             // The documented response to a dropped batch: walk the tree. See the
             // module documentation for why this is not a log line.
             stats.rescans += 1;
-            let outcome = scanner.tree(&root, RESCAN_FILE_LIMIT, stats);
+            let outcome = scanner.tree(&root, RESCAN_FILE_LIMIT, stats, stop);
+            if outcome.cancelled {
+                // Not reported as a `Rescan`: a report with `truncated: false`
+                // and a partial count would read as a finished walk. The
+                // caller is shutting down, and the number is in the log line
+                // the shutdown writes.
+                log::debug!(
+                    "the re-scan of {} was abandoned because the watcher is stopping ({} files)",
+                    root.display(),
+                    outcome.files
+                );
+                return;
+            }
             let _ = out.send(RealtimeEvent::Rescanned(Rescan {
                 root,
                 because,
@@ -711,9 +750,21 @@ fn scan_due(
     scanner: &mut Scanner<'_>,
     stats: &mut ServiceStats,
     out: &Sender<RealtimeEvent>,
+    stop: &AtomicBool,
 ) {
     if path.is_dir() {
-        let outcome = scanner.tree(path, RESCAN_FILE_LIMIT, stats);
+        let outcome = scanner.tree(path, RESCAN_FILE_LIMIT, stats, stop);
+        if outcome.cancelled {
+            // The same sentence the re-scan arm writes, so one grep finds every
+            // walk a stop request cut short, whichever path started it. Without
+            // it the only trace of a cancelled directory walk would be a scan
+            // count smaller than the tree — which reads as an exclusion.
+            log::debug!(
+                "the walk of {} was abandoned because the watcher is stopping ({} files)",
+                path.display(),
+                outcome.files
+            );
+        }
         for finding in outcome.findings {
             let _ = out.send(RealtimeEvent::Detected(finding));
         }
@@ -1169,6 +1220,56 @@ rule realtime_marker {
             assert_eq!(stats.quarantined, 0, "{stats:?}");
             assert_eq!(stats.quarantine_failed, 0, "{stats:?}");
             assert!(ordinary.exists(), "a clean file was taken");
+        }
+
+        #[test]
+        #[ignore = "touches the real filesystem"]
+        fn a_tree_walk_stops_at_its_next_entry_when_the_watcher_is_stopping() {
+            // The defect this pins: the stop flag used to be read only between
+            // passes of the event loop, so a stop request that arrived during a
+            // catch-up walk waited for up to `RESCAN_FILE_LIMIT` scans. The
+            // service's own stop path joins this thread, which is exactly how
+            // `Stop-Service` came to hang for minutes on a busy machine.
+            let temp = tempfile::tempdir().expect("a temp directory");
+            let root = temp.path().join("tree");
+            std::fs::create_dir_all(&root).expect("the tree");
+            for step in 0..5 {
+                std::fs::write(root.join(format!("f{step}.bin")), b"benign").expect("a file");
+            }
+
+            let (database, report) = av_rules::database::RuleDatabase::compile(RULES);
+            assert!(report.refusals.is_empty(), "the rule was refused");
+            let engine = ScanEngine::new(database);
+            let options = scan_options();
+            let exclusions = ExclusionSet::default();
+            let mut vault = QuarantineVault::open(
+                temp.path().join("quarantine"),
+                QuarantinePolicy::default(),
+            )
+            .expect("the vault opens");
+            let mut scanner = Scanner {
+                engine: &engine,
+                vault: &mut vault,
+                exclusions: &exclusions,
+                options: &options,
+                acts_on_detections: false,
+            };
+            let mut stats = ServiceStats::default();
+
+            // The control: with no stop requested the walk covers the tree, so
+            // the assertion below cannot pass because the walk never worked.
+            let walking = AtomicBool::new(false);
+            let outcome = scanner.tree(&root, 100, &mut stats, &walking);
+            assert_eq!(outcome.files, 5, "the walk did not cover the tree");
+            assert!(!outcome.cancelled);
+
+            let stopping = AtomicBool::new(true);
+            let outcome = scanner.tree(&root, 100, &mut stats, &stopping);
+            assert!(outcome.cancelled, "a stop request did not stop the walk");
+            assert_eq!(
+                outcome.files, 0,
+                "a walk kept scanning after the watcher was told to stop"
+            );
         }
     }
 }

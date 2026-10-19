@@ -149,6 +149,7 @@ pub fn translate(message: &av_driver_proto::wire::EventMessage) -> DriverEvent {
         subject: subject_from_wire(message.subject),
         path: path_of(message),
         process_id: message.process_id,
+        parent_process_id: message.parent_process_id,
         thread_id: message.thread_id,
         detail: message.detail,
         // The driver's own status picture travels in a `Status` message of its
@@ -172,6 +173,9 @@ fn action_from_wire(code: u32) -> DriverEventAction {
         Some(EventAction::Heartbeat) => DriverEventAction::Heartbeat,
         Some(EventAction::StateChanged) => DriverEventAction::StateChanged,
         Some(EventAction::EventsDropped) => DriverEventAction::EventsDropped,
+        Some(EventAction::FileRenamed) => DriverEventAction::FileRenamed,
+        Some(EventAction::FileDeleted) => DriverEventAction::FileDeleted,
+        Some(EventAction::RegistryChanged) => DriverEventAction::RegistryChanged,
         None => DriverEventAction::Unrecognised { code },
     }
 }
@@ -185,6 +189,7 @@ fn subject_from_wire(code: u32) -> DriverSubject {
         Some(SubjectKind::Image) => DriverSubject::Image,
         Some(SubjectKind::Driver) => DriverSubject::Driver,
         Some(SubjectKind::Protection) => DriverSubject::Protection,
+        Some(SubjectKind::Registry) => DriverSubject::Registry,
         None => DriverSubject::Unrecognised { code },
     }
 }
@@ -223,6 +228,7 @@ mod tests {
         message.path[..used].copy_from_slice(&units[..used]);
         message.path_units = used as u32;
         message.process_id = 4321;
+        message.parent_process_id = 4000;
         message.thread_id = 1234;
         message
     }
@@ -246,6 +252,12 @@ mod tests {
             (EventAction::Heartbeat, DriverEventAction::Heartbeat),
             (EventAction::StateChanged, DriverEventAction::StateChanged),
             (EventAction::EventsDropped, DriverEventAction::EventsDropped),
+            (EventAction::FileRenamed, DriverEventAction::FileRenamed),
+            (EventAction::FileDeleted, DriverEventAction::FileDeleted),
+            (
+                EventAction::RegistryChanged,
+                DriverEventAction::RegistryChanged,
+            ),
         ];
         for (driver_side, protocol_side) in named {
             assert_eq!(
@@ -269,6 +281,7 @@ mod tests {
             (SubjectKind::Image, DriverSubject::Image),
             (SubjectKind::Driver, DriverSubject::Driver),
             (SubjectKind::Protection, DriverSubject::Protection),
+            (SubjectKind::Registry, DriverSubject::Registry),
         ];
         for (driver_side, protocol_side) in named {
             assert_eq!(subject_from_wire(driver_side.as_wire()), protocol_side);
@@ -295,6 +308,10 @@ mod tests {
         assert_eq!(translated.action, DriverEventAction::ExecutionBlocked);
         assert_eq!(translated.subject, DriverSubject::Process);
         assert_eq!(translated.process_id, 4321);
+        // The creator, carried rather than looked up later: it is only knowable
+        // at creation time and the parent may be gone by the time a rule reads
+        // the event.
+        assert_eq!(translated.parent_process_id, 4000);
         assert_eq!(translated.thread_id, 1234);
         assert!(translated.path.is_some());
         // The one thing this build must not invent: a driver status it never

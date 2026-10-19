@@ -1,0 +1,497 @@
+# Wenle AV behaviour rules.
+#
+# These are evaluated over the driver's event stream, not over file bytes:
+# `subject` and `action` say which stream, `path_*` and `detail` narrow the
+# event, and `count`/`window_seconds` say how many are needed and how close
+# together. See `crates/av-behaviour/src/dsl.rs` for the language and
+# `crates/av-behaviour/src/lib.rs` for why it is not YARA.
+#
+# Every rule here is in the warning band: its score is below the malicious
+# threshold (100), so no rule can quarantine, delete or block anything on its
+# own. A finding is evidence that adds to a score. `severity` says how damaging
+# the behaviour would be if genuine; `score` says how much this evidence is
+# worth. They are different questions, which is why a few rules are `high`
+# severity with a score under 100.
+#
+# `dedupe_seconds` (default: the window) is how long a rule stays quiet for one
+# process after firing, so a sweep produces one warning rather than twenty
+# thousand.
+
+# ---------------------------------------------------------------------------
+# Ransomware: the file stream
+# ---------------------------------------------------------------------------
+
+[[rule]]
+id = "BEH-0001"
+name = "ransomware extension"
+description = "A file was renamed with the extension ransomware leaves behind."
+severity = "high"
+score = 90
+subject = "file"
+action = ["file_renamed"]
+path_suffix = [
+    ".locked", ".encrypted", ".encrypted1", ".crypt", ".crypted", ".wncry",
+    ".wcry", ".locky", ".zepto", ".cerber", ".ryk", ".petya", ".conti",
+    ".rhysida", ".blackcat", ".akira", ".makop", ".phobos", ".djvu", ".sage",
+]
+dedupe_seconds = 300
+
+[[rule]]
+id = "BEH-0002"
+name = "ransom note name"
+description = "A file with a ransom note's name appeared."
+severity = "high"
+score = 90
+subject = "file"
+action = ["file_renamed"]
+path_contains = [
+    "how_to_decrypt", "how to decrypt", "how_to_restore", "decrypt_instructions",
+    "decryption_instructions", "readme_for_decrypt", "your_files_are_encrypted",
+    "restore_your_files", "recover_your_files", "help_decrypt", "!!!readme",
+]
+dedupe_seconds = 300
+
+[[rule]]
+id = "BEH-0003"
+name = "mass file rename"
+description = "One process renamed twenty files in half a minute, which is the shape of a sweep."
+severity = "medium"
+subject = "file"
+action = ["file_renamed"]
+count = 20
+window_seconds = 30
+dedupe_seconds = 600
+
+[[rule]]
+id = "BEH-0004"
+name = "mass file delete"
+description = "One process requested the deletion of twenty-five files in half a minute."
+severity = "medium"
+subject = "file"
+action = ["file_deleted"]
+count = 25
+window_seconds = 30
+dedupe_seconds = 600
+
+[[rule]]
+id = "BEH-0005"
+name = "documents renamed in bulk"
+description = "One process renamed fifteen documents or archives within a minute."
+severity = "medium"
+subject = "file"
+action = ["file_renamed"]
+path_suffix = [
+    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".pdf", ".jpg", ".jpeg",
+    ".png", ".txt", ".csv", ".zip", ".rar", ".7z",
+]
+count = 15
+window_seconds = 60
+dedupe_seconds = 300
+
+[[rule]]
+id = "BEH-0006"
+name = "documents deleted in bulk"
+description = "One process requested the deletion of fifteen documents or archives within a minute."
+severity = "medium"
+subject = "file"
+action = ["file_deleted"]
+path_suffix = [
+    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".pdf", ".jpg", ".jpeg",
+    ".png", ".txt", ".csv", ".zip", ".rar", ".7z",
+]
+count = 15
+window_seconds = 60
+dedupe_seconds = 300
+
+[[rule]]
+id = "BEH-0007"
+name = "startup folder write"
+description = "An executable was placed in a Startup folder, which is how a program survives a reboot."
+severity = "medium"
+subject = "file"
+action = ["file_renamed"]
+path_contains = ["\\start menu\\programs\\startup\\"]
+path_suffix = [
+    ".lnk", ".exe", ".dll", ".bat", ".cmd", ".vbs", ".vbe", ".js", ".jse",
+    ".wsf", ".hta", ".ps1", ".scr",
+]
+
+# At low severity: an installer updating a DLL under System32 does this
+# legitimately, and a warning is all this evidence is worth.
+[[rule]]
+id = "BEH-0008"
+name = "system file renamed"
+description = "A file under System32 was renamed or moved."
+severity = "low"
+subject = "file"
+action = ["file_renamed"]
+path_contains = ["\\windows\\system32\\"]
+path_suffix = [".exe", ".dll", ".sys"]
+
+# ---------------------------------------------------------------------------
+# Registry: persistence
+# ---------------------------------------------------------------------------
+
+[[rule]]
+id = "BEH-0010"
+name = "Run key value"
+description = "A value was written under a Run key, which is where a program is listed to start at sign-in."
+severity = "medium"
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_value_set"]
+path_contains = [
+    "\\currentversion\\run\\", "\\currentversion\\runonce\\",
+    "\\currentversion\\runservices\\", "\\currentversion\\runservicesonce\\",
+]
+
+[[rule]]
+id = "BEH-0011"
+name = "Run key created"
+description = "A key was created under a Run key."
+severity = "low"
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_key_created"]
+path_contains = [
+    "\\currentversion\\run\\", "\\currentversion\\runonce\\",
+    "\\currentversion\\runservices\\", "\\currentversion\\runservicesonce\\",
+]
+
+[[rule]]
+id = "BEH-0012"
+name = "Winlogon value"
+description = "A Winlogon value was written, which is a way to start a program at sign-in that no Run key lists."
+severity = "high"
+score = 90
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_value_set"]
+path_contains = [
+    "\\winlogon\\shell", "\\winlogon\\userinit", "\\winlogon\\taskman",
+    "\\winlogon\\appsetup", "\\winlogon\\vmapplet",
+]
+
+[[rule]]
+id = "BEH-0013"
+name = "IFEO debugger"
+description = "A debugger was attached to a program through Image File Execution Options."
+severity = "medium"
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_value_set"]
+path_contains = ["\\image file execution options\\"]
+
+[[rule]]
+id = "BEH-0014"
+name = "Silent process exit"
+description = "A SilentProcessExit value was written, which starts a monitor when a named process exits."
+severity = "medium"
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_value_set"]
+path_contains = ["\\silentprocessexit\\"]
+
+[[rule]]
+id = "BEH-0015"
+name = "service image path"
+description = "A service's image path was changed."
+severity = "medium"
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_value_set"]
+path_contains = ["\\services\\"]
+path_suffix = ["\\imagepath"]
+
+[[rule]]
+id = "BEH-0016"
+name = "AppInit_DLLs"
+description = "AppInit_DLLs was written, which loads a DLL into most processes on the machine."
+severity = "high"
+score = 90
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_value_set"]
+path_contains = ["\\currentversion\\windows\\appinit_dlls"]
+
+[[rule]]
+id = "BEH-0017"
+name = "shell open command"
+description = "A file association's open command was changed."
+severity = "medium"
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_value_set"]
+path_suffix = ["\\shell\\open\\command"]
+
+[[rule]]
+id = "BEH-0018"
+name = "credential caching enabled"
+description = "WDigest's UseLogonCredential was written, which can make Windows keep readable passwords in memory."
+severity = "high"
+score = 90
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_value_set"]
+path_contains = ["\\wdigest\\uselogoncredential"]
+
+[[rule]]
+id = "BEH-0019"
+name = "user shell folders"
+description = "A user shell folder was redirected, which is how a folder path is hijacked."
+severity = "low"
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_value_set"]
+path_contains = [
+    "\\currentversion\\explorer\\user shell folders",
+    "\\currentversion\\explorer\\shell folders",
+]
+
+[[rule]]
+id = "BEH-0020"
+name = "App Paths value"
+description = "An App Paths entry was written, which can redirect which program runs for a name."
+severity = "medium"
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_value_set"]
+path_contains = ["\\currentversion\\app paths\\"]
+
+# ---------------------------------------------------------------------------
+# Registry: the machine's defences
+# ---------------------------------------------------------------------------
+
+[[rule]]
+id = "BEH-0021"
+name = "Defender policy change"
+description = "A Defender policy value was written."
+severity = "medium"
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_value_set"]
+path_contains = ["\\policies\\microsoft\\windows defender\\"]
+
+[[rule]]
+id = "BEH-0022"
+name = "firewall policy change"
+description = "A Windows Firewall policy value was written."
+severity = "low"
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_value_set"]
+path_contains = ["\\policies\\microsoft\\windowsfirewall\\"]
+
+[[rule]]
+id = "BEH-0023"
+name = "UAC disabled"
+description = "EnableLUA was written, which turns off the consent prompt for elevation."
+severity = "medium"
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_value_set"]
+path_suffix = ["\\policies\\system\\enablelua"]
+
+[[rule]]
+id = "BEH-0024"
+name = "safe mode tampered with"
+description = "A SafeBoot value was written, which is how recovery is disabled."
+severity = "medium"
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_value_set"]
+path_contains = ["\\control\\safeboot\\"]
+
+[[rule]]
+id = "BEH-0025"
+name = "boot configuration changed"
+description = "A value was written in the boot configuration database."
+severity = "high"
+score = 90
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_value_set"]
+path_contains = ["\\registry\\machine\\bcd00000000\\"]
+
+[[rule]]
+id = "BEH-0026"
+name = "LSA package list"
+description = "A package list under LSA was written, which is how a credential provider is loaded into every sign-in."
+severity = "high"
+score = 90
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_value_set"]
+path_suffix = [
+    "\\control\\lsa\\security packages",
+    "\\control\\lsa\\authentication packages",
+    "\\control\\lsa\\notification packages",
+]
+
+# ---------------------------------------------------------------------------
+# Registry: bulk operations
+# ---------------------------------------------------------------------------
+
+[[rule]]
+id = "BEH-0027"
+name = "mass registry key delete"
+description = "One process deleted thirty registry keys in half a minute."
+severity = "medium"
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_key_deleted"]
+# The application (AppContainer) hive is where Windows' own app-container
+# bookkeeping lives and it is created and deleted constantly: measured in the
+# test VM on 2026-10-18, `svchost.exe` deleted thirty keys under
+# `\REGISTRY\A\{…}\WorkItems\{…}` in half a minute and this rule warned about a
+# healthy machine. Excluded rather than raising the count, because the hive's
+# volume is not evidence of anything.
+#
+# The second exclusion is the per-user service instances. Windows creates one
+# key per per-user service under `…\ControlSet001\Services\<name>_<hex>` at
+# logon and deletes the instance key's subkeys when the session ends. Measured
+# in the test VM on 2026-10-19: twenty-four instances carrying twenty-four
+# `Security` and six `TriggerInfo` subkeys — exactly thirty deletes, this rule's
+# whole threshold, at every boot on a healthy machine. The underscore marks an
+# instance name, and the names cannot be listed in advance (Windows adds
+# services between versions), so the wildcard form excludes the instance's
+# subtree whatever it is called. The plain service key, `P9RdrService`, has no
+# underscore and is still covered.
+#
+# The third is Windows Search's index. When the indexer rebuilds, it deletes
+# its scopes' path lists in bulk: measured in the test VM on 2026-10-19,
+# `SearchIndexer` deleted thirty keys under
+# `\REGISTRY\MACHINE\SOFTWARE\Microsoft\Windows Search\Gather\Windows\SystemIndex\
+# Sites\LocalHost\Paths\…` at a session end. The tree exists to be rewritten,
+# so its volume says nothing about the process that rewrites it.
+path_excludes = [
+    "\\registry\\a\\",
+    "\\registry\\machine\\system\\controlset*\\services\\*_*",
+    "\\registry\\machine\\software\\microsoft\\windows search\\",
+]
+count = 30
+window_seconds = 30
+dedupe_seconds = 300
+
+[[rule]]
+id = "BEH-0028"
+name = "mass registry key rename"
+description = "One process renamed ten registry keys in half a minute."
+severity = "low"
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_key_renamed"]
+# The same exclusion as BEH-0027, for the same measured reason.
+path_excludes = ["\\registry\\a\\"]
+count = 10
+window_seconds = 30
+dedupe_seconds = 300
+
+# ---------------------------------------------------------------------------
+# Process lineage
+# ---------------------------------------------------------------------------
+
+# The shell list shared by the lineage rules. A document reader, a browser or a
+# script host starting one of these is a program handing control to a command
+# interpreter, which is a macro's or an exploit's next step.
+[[rule]]
+id = "BEH-0029"
+name = "document reader started a shell"
+description = "An Office program started a command interpreter."
+severity = "high"
+score = 90
+subject = "process"
+action = ["process_started"]
+parent_image = [
+    "winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe", "msaccess.exe",
+    "onenote.exe", "mspub.exe", "visio.exe",
+]
+path_suffix = [
+    "\\cmd.exe", "\\powershell.exe", "\\pwsh.exe", "\\wscript.exe",
+    "\\cscript.exe", "\\mshta.exe", "\\certutil.exe", "\\bitsadmin.exe",
+    "\\rundll32.exe", "\\regsvr32.exe", "\\msiexec.exe",
+]
+
+[[rule]]
+id = "BEH-0030"
+name = "browser started a shell"
+description = "A browser started a command interpreter or a scripting host."
+severity = "medium"
+subject = "process"
+action = ["process_started"]
+parent_image = [
+    "chrome.exe", "msedge.exe", "firefox.exe", "iexplore.exe", "brave.exe",
+    "opera.exe", "vivaldi.exe",
+]
+path_suffix = [
+    "\\cmd.exe", "\\powershell.exe", "\\pwsh.exe", "\\wscript.exe",
+    "\\cscript.exe", "\\mshta.exe", "\\certutil.exe", "\\bitsadmin.exe",
+    "\\rundll32.exe", "\\regsvr32.exe",
+]
+
+[[rule]]
+id = "BEH-0031"
+name = "script host started a shell"
+description = "A script host or an unsigned-library loader started another interpreter."
+severity = "medium"
+subject = "process"
+action = ["process_started"]
+parent_image = [
+    "wscript.exe", "cscript.exe", "mshta.exe", "rundll32.exe", "regsvr32.exe",
+    "msbuild.exe", "installutil.exe", "hh.exe", "wmic.exe",
+]
+path_suffix = [
+    "\\cmd.exe", "\\powershell.exe", "\\pwsh.exe", "\\wscript.exe",
+    "\\cscript.exe", "\\mshta.exe", "\\certutil.exe", "\\bitsadmin.exe",
+]
+
+[[rule]]
+id = "BEH-0032"
+name = "shell started a download tool"
+description = "A command interpreter started a tool often used to fetch a file."
+severity = "low"
+subject = "process"
+action = ["process_started"]
+parent_image = ["cmd.exe", "powershell.exe", "pwsh.exe"]
+path_suffix = ["\\certutil.exe", "\\bitsadmin.exe", "\\mshta.exe", "\\wmic.exe", "\\hh.exe"]
+
+[[rule]]
+id = "BEH-0033"
+name = "process started from a temp folder"
+description = "A program was started from a temporary folder."
+severity = "low"
+subject = "process"
+action = ["process_started"]
+path_contains = ["\\appdata\\local\\temp\\", "\\windows\\temp\\"]
+
+[[rule]]
+id = "BEH-0034"
+name = "process started from a startup folder"
+description = "A program was started from a Startup folder."
+severity = "medium"
+subject = "process"
+action = ["process_started"]
+path_contains = ["\\start menu\\programs\\startup\\"]
+
+[[rule]]
+id = "BEH-0035"
+name = "Office program started a temp-folder program"
+description = "An Office program started a program from a temporary folder."
+severity = "medium"
+subject = "process"
+action = ["process_started"]
+parent_image = [
+    "winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe", "msaccess.exe",
+    "onenote.exe", "mspub.exe", "visio.exe",
+]
+path_contains = ["\\appdata\\local\\temp\\", "\\windows\\temp\\"]
+
+[[rule]]
+id = "BEH-0036"
+name = "screensaver or control panel program started"
+description = "A .scr, .pif or .cpl file was executed from a user profile folder."
+severity = "low"
+subject = "process"
+action = ["process_started"]
+path_contains = ["\\appdata\\"]
+path_suffix = [".scr", ".pif", ".cpl", ".hta"]

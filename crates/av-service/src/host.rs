@@ -185,6 +185,35 @@ fn file_identity(path: &Path) -> Option<FileIdentity> {
     Some((metadata.len(), metadata.modified().ok()))
 }
 
+/// The behaviour engine over the rule file embedded in `av-behaviour`.
+///
+/// A parse failure is a build defect, not a runtime condition: the file is
+/// compiled into the binary and `av-behaviour`'s own tests parse and validate
+/// it on every run. It is still not a panic, because a service that will not
+/// start is a machine with no on-access scanning at all — a strictly worse
+/// outcome than one running with only the file engine and an error line saying
+/// why. The empty rule set here fires nothing, which is the safe direction.
+fn behaviour_engine() -> av_behaviour::Engine {
+    let engine = av_behaviour::builtin().unwrap_or_else(|error| {
+        log::error!(
+            "the built-in behaviour rules did not parse ({}); behaviour monitoring is off \
+             for this run, and file detection is unaffected",
+            error
+        );
+        av_behaviour::Engine::new(av_behaviour::RuleSet { rules: Vec::new() })
+    });
+    // Said once, at start, because the failure this makes visible is silent:
+    // an engine with no rules warns about nothing and looks exactly like a
+    // machine with nothing to warn about. One line per service start is the
+    // cheapest way for "the shipped rules are loaded" to be a fact a person can
+    // check rather than a claim about the binary.
+    log::info!(
+        "behaviour monitoring: {} rules loaded from the embedded rule file",
+        engine.rules().len()
+    );
+    engine
+}
+
 /// The service's state.
 #[derive(Debug)]
 pub struct Host {
@@ -196,6 +225,14 @@ pub struct Host {
     loaded: LoadedConfig,
     /// The engine, the database and the catalog index.
     engine: Engine,
+    /// The behaviour rules, evaluated over the driver's telemetry streams.
+    ///
+    /// Fed only by [`Host::drain_driver`]: the four streams it reads — process
+    /// starts, writes, renames and deletes, registry changes — exist only on
+    /// the driver's port. What it returns is evidence in the warning band and
+    /// never a decision; see [`Host::observe_behaviour`], which is where the
+    /// shape of that is argued.
+    behaviour: av_behaviour::Engine,
     /// The paths the user has allowed, shared with the filter-port thread.
     ///
     /// Held here because this is the thread that hears the user: a decision
@@ -292,6 +329,14 @@ pub struct Host {
     /// failure be overwritten by the other's success, and would then say
     /// "registered" about the one that had failed.
     object_callbacks: Option<i32>,
+    /// What the driver said `CmRegisterCallbackEx` answered.
+    ///
+    /// The third registration the driver reports when the service connects, and
+    /// carried in a slot of its own for the reason [`Self::object_callbacks`]
+    /// gives: registry notifications are a third mechanism that fails on its
+    /// own, and a driver whose registry callback was refused would otherwise
+    /// report whatever `ObRegisterCallbacks` said as though it applied to both.
+    registry_notify: Option<i32>,
     /// What the driver answered the configuration this service sent it.
     ///
     /// The third of the three statuses a connection produces, and the only one
@@ -431,6 +476,7 @@ impl Host {
             started: Instant::now(),
             loaded,
             engine,
+            behaviour: behaviour_engine(),
             allow,
             vault,
             taken: HashMap::new(),
@@ -445,6 +491,7 @@ impl Host {
             driver_connected: false,
             process_notify: None,
             object_callbacks: None,
+            registry_notify: None,
             configuration_reply: None,
             scan_results: Vec::new(),
             scan_detections: 0,
@@ -690,6 +737,9 @@ impl Host {
         }
         if let Some(code) = self.object_callbacks {
             status.detail = format!("{}; {}", status.detail, describe_object_callbacks(code));
+        }
+        if let Some(code) = self.registry_notify {
+            status.detail = format!("{}; {}", status.detail, describe_registry_notify(code));
         }
         if let Some(code) = self.configuration_reply {
             status.detail = format!("{}; {}", status.detail, describe_configuration(code));
@@ -1506,6 +1556,20 @@ impl Host {
             // leaves it `None` because an `EventMessage` carries no status.
             // Both facts are documented where they are produced.
             if let Event::Driver(reported) = &event {
+                // Before the chain below, and deliberately: that chain is
+                // about logging and about which events a client is told, and
+                // several of its arms `continue`. A process start, in
+                // particular, teaches the engine who started whom and then
+                // leaves this loop through one of those `continue`s, so a call
+                // at the bottom would never see the one event that makes the
+                // lineage rules evaluable.
+                //
+                // Connection events are excluded: they are this process's own
+                // note about the port, carry no driver action, and
+                // `Record::from_driver` would reject them anyway.
+                if reported.driver_state.is_none() {
+                    self.observe_behaviour(reported, out);
+                }
                 if reported.driver_state.is_some() {
                     // The service's own note about the connection, recorded
                     // rather than passed on unread: it is what
@@ -1515,27 +1579,31 @@ impl Host {
                     self.driver_connected = reported.detail != 0;
                 } else if reported.action == DriverEventAction::StateChanged {
                     // The driver's own reports, queued from its connect
-                    // callback. `detail` is an `NTSTATUS` in both cases and the
-                    // *subject* is what says which one — two registrations, two
-                    // statuses, and `av-driver`'s `defer_driver_state_event` is
-                    // where they are queued.
+                    // callback. `detail` is an `NTSTATUS` in every case and the
+                    // *subject* is what says which one — three registrations,
+                    // three statuses, and `av-driver`'s
+                    // `defer_driver_state_event` is where they are queued.
                     //
                     // Split by subject rather than stored in one slot because
-                    // the two say different things about different mechanisms,
-                    // and a single slot would report whichever arrived last as
-                    // if it were the state of both.
+                    // they say different things about different mechanisms, and
+                    // a single slot would report whichever arrived last as if it
+                    // were the state of all three.
                     //
                     // The remaining subjects are named rather than folded into a
                     // wildcard, so a `DriverSubject` added later stops this build
                     // instead of quietly becoming a status nothing records. They
                     // record nothing because a `StateChanged` event names a
-                    // registration, and these are the only two the driver makes.
+                    // registration, and these are the only three the driver
+                    // makes.
                     match reported.subject {
                         DriverSubject::Driver => {
                             self.process_notify = Some(reported.detail as i32);
                         }
                         DriverSubject::Protection => {
                             self.object_callbacks = Some(reported.detail as i32);
+                        }
+                        DriverSubject::Registry => {
+                            self.registry_notify = Some(reported.detail as i32);
                         }
                         DriverSubject::Configuration => {
                             self.configuration_reply = Some(reported.detail as i32);
@@ -1585,8 +1653,102 @@ impl Host {
                     // driver takes it from `PS_CREATE_NOTIFY_INFO`'s own
                     // process identifier. `path` is its image, translated from
                     // the device path on the driver's worker.
+                    //
+                    // `parent_process_id` is the creator, read in the same
+                    // callback from the same structure. Logged at `debug`
+                    // rather than `info` because a machine starting four hundred
+                    // programs would otherwise produce four hundred lines; it is
+                    // here so that the lineage the behaviour engine will use can
+                    // be seen on a machine whose log level says `debug`, which
+                    // is how this field was verified.
+                    log::debug!(
+                        "process {} started, created by {}: {}",
+                        reported.process_id,
+                        reported.parent_process_id,
+                        reported
+                            .path
+                            .as_ref()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_default()
+                    );
                     self.note_process_start(reported.process_id, reported.path.clone());
                     continue;
+                } else if reported.action == DriverEventAction::FileWritten {
+                    // The write notification used to arrive with `process_id`
+                    // zero -- the driver names the writing process since
+                    // 2026-10-18 -- and no path, which stays true: resolving a
+                    // write's name is only legal inside the callback, and the
+                    // driver sends this from a worker. Traced rather than
+                    // logged because a machine writes constantly; it is here so
+                    // that `logging.level = "trace"` is the measurement that the
+                    // attribution crossed the port.
+                    log::trace!("process {} wrote a file", reported.process_id);
+                    // Not `continue`: a client may render a bare driver event,
+                    // and this branch only adds the trace line.
+                } else if reported.action == DriverEventAction::FileRenamed
+                    || reported.action == DriverEventAction::FileDeleted
+                {
+                    // The first driver events that carry both a path and the
+                    // process responsible. Traced for the same reason the write
+                    // notification is: an editor saves constantly, and a rename
+                    // is how it saves. `detail = 1` says the path is the old
+                    // name because the target could not be resolved.
+                    //
+                    // This line is the VM test's criterion for the rename and
+                    // delete callback: `logging.level = "trace"`.
+                    log::trace!(
+                        "process {} {}: {}{}",
+                        reported.process_id,
+                        if reported.action == DriverEventAction::FileRenamed {
+                            "renamed"
+                        } else {
+                            "requested a delete of"
+                        },
+                        reported
+                            .path
+                            .as_ref()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_default(),
+                        if reported.detail == 1 { " (old name)" } else { "" }
+                    );
+                } else if reported.action == DriverEventAction::RegistryChanged {
+                    // A registry key or value changed, reported by
+                    // `CmRegisterCallbackEx` since 2026-10-18. `detail` names
+                    // the change and is the only field that does — `path` is the
+                    // key, or the key and value for the two value classes.
+                    //
+                    // Traced, not logged: a machine touches the registry
+                    // constantly, and this callback sees every one of them. The
+                    // line is the VM test's criterion for the registry callback,
+                    // at `logging.level = "trace"`.
+                    log::trace!(
+                        "process {} {} {}{} [sequence {}]",
+                        reported.process_id,
+                        match reported.detail {
+                            av_driver_proto::event::EventAction::REGISTRY_KEY_CREATED => "created key",
+                            av_driver_proto::event::EventAction::REGISTRY_KEY_DELETED => "deleted key",
+                            av_driver_proto::event::EventAction::REGISTRY_VALUE_SET => "set value",
+                            av_driver_proto::event::EventAction::REGISTRY_VALUE_DELETED =>
+                                "deleted value",
+                            av_driver_proto::event::EventAction::REGISTRY_KEY_RENAMED =>
+                                "renamed key",
+                            // A code from a later driver. Reported with its
+                            // number rather than being guessed at.
+                            _ => "changed the registry in a way this build has no name for",
+                        },
+                        reported
+                            .path
+                            .as_ref()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_default(),
+                        if reported.detail > av_driver_proto::event::EventAction::REGISTRY_KEY_RENAMED
+                        {
+                            " (a change code from a later driver)"
+                        } else {
+                            ""
+                        },
+                        reported.sequence
+                    );
                 }
             }
             match event {
@@ -1610,6 +1772,86 @@ impl Host {
                 }
                 other => out.push(other),
             }
+        }
+    }
+
+    /// Offer one driver event to the behaviour engine and publish what it
+    /// completed, in the warning band only.
+    ///
+    /// # Why this cannot act
+    ///
+    /// Every detection built here is [`DetectionAction::Reported`] and every
+    /// finding it publishes is classified [`Verdict::Suspicious`] before it is
+    /// published — a finding whose score falls outside that band is *not*
+    /// published, and says so in the log. That is not caution around a
+    /// dangerous call: it is the policy the engine was built under. Every rule
+    /// in the embedded file scores 90, and `av_behaviour`'s
+    /// `every_shipped_rule_is_in_the_warning_band` refuses a rule that reaches
+    /// the malicious threshold, so a behaviour event can never quarantine a
+    /// file, stop a process or ask the driver for anything. Evidence adds to a
+    /// score; it does not become a verdict, and a detector that acted on one
+    /// event would be one that acts on a name or a count as if it were a
+    /// file's contents — see `av-behaviour`'s crate documentation.
+    ///
+    /// # What a detection carries
+    ///
+    /// `path` is whatever the event named: the renamed or deleted file, the
+    /// registry key (registry paths are `\REGISTRY\…`, not file paths), or the
+    /// image a process start executed. `size` is zero because nothing here
+    /// measured a file, and `in_process` stays `None` because that field means
+    /// "where inside a running process the bytes were found", which is a
+    /// different question from "which process did this". The process is in the
+    /// log line and in `rules`/`score`; giving it a field that means something
+    /// else would be the kind of overloading that ends up rendered as a path.
+    fn observe_behaviour(&mut self, event: &av_ipc::DriverEvent, out: &mut Vec<Event>) {
+        let thresholds = av_core::VerdictThresholds::default();
+        for finding in self.behaviour.observe_driver(event) {
+            let verdict = thresholds.classify(finding.score);
+            if verdict != Verdict::Suspicious {
+                log::error!(
+                    "behaviour rule {} (pid {}) scored {}, which is {} and not the warning \
+                     band; not published. The embedded rule file is supposed to contain no \
+                     rule outside that band",
+                    finding.rule_id,
+                    finding.process_id,
+                    finding.score,
+                    verdict
+                );
+                continue;
+            }
+            let path = finding
+                .path
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(format!("pid {}", finding.process_id)));
+            log::warn!(
+                "behaviour: {} {} (pid {}, {} event{} in {} s): {}",
+                finding.rule_id,
+                finding.name,
+                finding.process_id,
+                finding.count,
+                if finding.count == 1 { "" } else { "s" },
+                finding.window_seconds,
+                path.display()
+            );
+            out.push(Event::Detection(Detection {
+                file_name: file_name_of(&path),
+                path,
+                verdict,
+                score: finding.score,
+                severity: finding.severity,
+                threat: None,
+                rules: vec![finding.rule_id],
+                action: DetectionAction::Reported,
+                source: EntrySource::Behaviour,
+                size: 0,
+                at: Utc::now(),
+                in_process: None,
+                terminated: false,
+                // `false`: nothing was stopped, and the word this produces is
+                // "found after it appeared".
+                phase: Phase::observed(EntrySource::Behaviour, false),
+            }));
         }
     }
 
@@ -2715,6 +2957,35 @@ fn describe_object_callbacks(code: i32) -> String {
             "the driver reports that its object callbacks are NOT registered \
              (ObRegisterCallbacks returned 0x{:08X}), so another process's request to terminate \
              or write into this product is not being stripped of those rights",
+            code as u32
+        )
+    }
+}
+
+/// One sentence for what the driver said about its registry callback.
+///
+/// `code` is the `NTSTATUS` `CmRegisterCallbackEx` returned, reported by the
+/// driver with [`DriverSubject::Registry`]. A third mechanism, a third sentence:
+/// process-start notifications are how a starting program's memory gets
+/// examined, the object callbacks are how another process is stopped from
+/// terminating this one, and this is how a registry write or key creation is
+/// seen at all. A machine can have any two of the three.
+///
+/// The failure case is the loud one. An unregistered registry callback reports
+/// nothing, and a report that said nothing there would read as a machine where
+/// nothing touches its registry — the same silence-means-nothing-happened
+/// mistake [`describe_process_notify`] exists to prevent.
+fn describe_registry_notify(code: i32) -> String {
+    if code == 0 {
+        "the driver reports that its registry callback is registered, so key creation, key \
+         deletion, value writes, value deletions and key renames are being reported to this \
+         service"
+            .to_string()
+    } else {
+        format!(
+            "the driver reports that its registry callback is NOT registered \
+             (CmRegisterCallbackEx returned 0x{:08X}), so changes to the registry are not being \
+             observed at all",
             code as u32
         )
     }
@@ -3946,6 +4217,135 @@ mod tests {
         }
     }
 
+    /// One driver event, in the shape the port produces.
+    fn port_event(
+        action: av_ipc::DriverEventAction,
+        subject: av_ipc::DriverSubject,
+        path: &str,
+        detail: u32,
+        process_id: u32,
+        parent_process_id: u32,
+    ) -> av_ipc::DriverEvent {
+        av_ipc::DriverEvent {
+            sequence: 0,
+            timestamp_100ns: 1,
+            action,
+            subject,
+            path: Some(PathBuf::from(path)),
+            process_id,
+            parent_process_id,
+            thread_id: 0,
+            detail,
+            driver_state: None,
+        }
+    }
+
+    fn detections_in(events: &[Event]) -> Vec<&Detection> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Detection(detection) => Some(detection),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_registry_write_a_rule_names_becomes_a_reported_detection() {
+        // The wiring's whole claim: a shipped rule firing on one driver event
+        // reaches a client as evidence, and nothing else happens. BEH-0023 is
+        // `PathSuffix(\policies\system\enablelua)` on a value set, which is one
+        // event and no count.
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let mut host = host(&dir);
+        let (sender, receiver) = crossbeam_channel::unbounded::<Event>();
+        host.driver_out = Some(receiver);
+
+        sender
+            .send(Event::Driver(port_event(
+                av_ipc::DriverEventAction::RegistryChanged,
+                av_ipc::DriverSubject::Registry,
+                r"\REGISTRY\MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\EnableLUA",
+                av_driver_proto::event::EventAction::REGISTRY_VALUE_SET,
+                4242,
+                1,
+            )))
+            .expect("queued");
+
+        let drained = host.drain();
+        let detections = detections_in(&drained);
+        assert_eq!(
+            detections.len(),
+            1,
+            "expected one warning, got {drained:?}"
+        );
+        let detection = detections[0];
+        assert_eq!(detection.source, EntrySource::Behaviour);
+        assert_eq!(detection.action, DetectionAction::Reported);
+        assert_eq!(detection.verdict, Verdict::Suspicious);
+        assert_eq!(detection.rules, vec!["BEH-0023".to_string()]);
+        assert!(detection.path.to_string_lossy().contains("EnableLUA"));
+        assert!(
+            !detection.phase.claims_a_block(),
+            "nothing was stopped, so the notification must not say it was"
+        );
+        assert_eq!(
+            host.quarantine_list(None).total,
+            0,
+            "a behaviour finding took a file into the vault"
+        );
+    }
+
+    #[test]
+    fn a_process_start_is_read_by_the_engine_before_it_is_consumed() {
+        // The start branch of `drain_driver` ends in `continue`, which is what
+        // makes this worth pinning: the engine learns lineage from exactly
+        // these events, so a call placed after the branch would never see one
+        // and every `parent_image` rule would be unevaluable. Only the second
+        // start can fire BEH-0029, and only because the first taught the engine
+        // that pid 100 is winword.exe.
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let mut host = host(&dir);
+        let (sender, receiver) = crossbeam_channel::unbounded::<Event>();
+        host.driver_out = Some(receiver);
+
+        sender
+            .send(Event::Driver(port_event(
+                av_ipc::DriverEventAction::ProcessStarted,
+                av_ipc::DriverSubject::Process,
+                r"C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE",
+                0,
+                100,
+                1,
+            )))
+            .expect("queued");
+        let first = host.drain();
+        assert!(
+            detections_in(&first).is_empty(),
+            "the parent start alone is not evidence: {first:?}"
+        );
+
+        sender
+            .send(Event::Driver(port_event(
+                av_ipc::DriverEventAction::ProcessStarted,
+                av_ipc::DriverSubject::Process,
+                r"C:\Windows\System32\cmd.exe",
+                0,
+                200,
+                100,
+            )))
+            .expect("queued");
+        let second = host.drain();
+        let detections = detections_in(&second);
+        assert_eq!(
+            detections.len(),
+            1,
+            "an Office program starting a shell is BEH-0029; got {second:?}"
+        );
+        assert_eq!(detections[0].rules, vec!["BEH-0029".to_string()]);
+        assert_eq!(detections[0].action, DetectionAction::Reported);
+    }
+
     #[test]
     fn the_configuration_sent_to_the_driver_follows_the_settings_that_ask_for_it() {
         // What this pins is the mapping between a user's configuration and the
@@ -4109,6 +4509,7 @@ mod tests {
             subject,
             path: None,
             process_id: 0,
+            parent_process_id: 0,
             thread_id: 0,
             detail,
             driver_state: None,
@@ -4250,6 +4651,65 @@ mod tests {
             detail.contains("process-start notifications are NOT registered"),
             "{detail}"
         );
+    }
+
+    #[test]
+    fn the_registry_registration_is_reported_in_its_own_slot() {
+        // The third mechanism, and the same defect the test above is about: a
+        // driver whose `CmRegisterCallbackEx` was refused would report whatever
+        // `ObRegisterCallbacks` said as though it applied to both, and a machine
+        // whose registry is unwatched would read as watched.
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (mut host, sender) = host_with_driver_channel(&dir);
+
+        const STATUS_FLT_INSTANCE_ALTITUDE_COLLISION: u32 = 0xC01F_0002;
+        sender
+            .send(Event::Driver(driver_report(
+                DriverEventAction::StateChanged,
+                av_ipc::DriverSubject::Protection,
+                0,
+            )))
+            .expect("queued");
+        sender
+            .send(Event::Driver(driver_report(
+                DriverEventAction::StateChanged,
+                av_ipc::DriverSubject::Registry,
+                STATUS_FLT_INSTANCE_ALTITUDE_COLLISION,
+            )))
+            .expect("queued");
+        assert!(host.drain().is_empty(), "both are consumed, not published");
+
+        let detail = host.status().driver.detail;
+        assert!(
+            detail.contains("object callbacks are registered"),
+            "the object callbacks registered and the sentence does not say so: {detail}"
+        );
+        assert!(
+            detail.contains("registry callback is NOT registered"),
+            "the registry registration failed and nothing says so: {detail}"
+        );
+        assert!(
+            detail.contains("0xC01F0002"),
+            "the exact NTSTATUS is what a reader looks up: {detail}"
+        );
+        // The other direction: a registered registry callback must not be
+        // reported as a failed object callback, which is what a shared slot
+        // produces in the opposite order.
+        let (mut host, sender) = host_with_driver_channel(&dir);
+        sender
+            .send(Event::Driver(driver_report(
+                DriverEventAction::StateChanged,
+                av_ipc::DriverSubject::Registry,
+                0,
+            )))
+            .expect("queued");
+        let _ = host.drain();
+        let detail = host.status().driver.detail;
+        assert!(
+            detail.contains("registry callback is registered"),
+            "{detail}"
+        );
+        assert!(!detail.contains("object callbacks are"), "{detail}");
     }
 
     #[test]
@@ -5872,6 +6332,7 @@ mod tests {
             subject: av_ipc::DriverSubject::Process,
             path,
             process_id: pid,
+            parent_process_id: 0,
             thread_id: 0,
             detail: 0,
             driver_state: None,

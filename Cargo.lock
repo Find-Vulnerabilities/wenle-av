@@ -531,6 +531,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "av-behaviour"
+version = "0.1.0"
+dependencies = [
+ "av-core",
+ "av-driver-proto",
+ "av-ipc",
+ "log",
+ "serde",
+ "thiserror 2.0.20",
+ "toml",
+]
+
+[[package]]
 name = "av-cli"
 version = "0.1.0"
 dependencies = [
@@ -797,6 +810,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "av-amsi",
+ "av-behaviour",
  "av-core",
  "av-driver-proto",
  "av-guard",

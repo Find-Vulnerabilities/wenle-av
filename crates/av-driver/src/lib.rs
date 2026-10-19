@@ -299,7 +299,7 @@ mod flt;
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
 use core::sync::atomic::{
-    AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+    AtomicBool, AtomicI32, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };
 
 use av_driver_proto::decision::{Decision, DecisionPolicy};
@@ -318,13 +318,16 @@ use av_driver_proto::{
 };
 
 use flt::{
+    FileDispositionInformation, FileDispositionInformationEx, FileRenameInformation,
     FltCallbackData, FltFileNameInformation, FltFilter, FltOperationRegistration, FltPort,
-    FltRegistration, FltRelatedObjects, IoSecurityContext, NtStatus, ObjectAttributes,
-    UnicodeString, FILE_EXECUTE, FLT_FILE_NAME_NORMALIZED, FLT_FILE_NAME_QUERY_DEFAULT,
-    FLT_PORT_ALL_ACCESS, FLT_POSTOP_FINISHED_PROCESSING, FLT_PREOP_COMPLETE,
-    FLT_PREOP_SUCCESS_NO_CALLBACK, FLT_PREOP_SUCCESS_WITH_CALLBACK,
-    IRP_MJ_ACQUIRE_FOR_SECTION_SYNCHRONIZATION, IRP_MJ_CREATE,
-    IRP_MJ_OPERATION_END, IRP_MJ_WRITE, OBJ_CASE_INSENSITIVE, OBJ_KERNEL_HANDLE,
+    FltRegistration, FltRelatedObjects, FltSetFileInformationParameters, IoSecurityContext,
+    NtStatus, ObjectAttributes, UnicodeString, FILE_DISPOSITION_INFORMATION_CLASS,
+    FILE_DISPOSITION_INFORMATION_EX_CLASS, FILE_EXECUTE, FILE_RENAME_INFORMATION_CLASS,
+    FILE_RENAME_INFORMATION_EX_CLASS, FILE_RENAME_NAME_OFFSET, FLT_FILE_NAME_NORMALIZED,
+    FLT_FILE_NAME_QUERY_DEFAULT, FLT_PORT_ALL_ACCESS, FLT_POSTOP_FINISHED_PROCESSING,
+    FLT_PREOP_COMPLETE, FLT_PREOP_SUCCESS_NO_CALLBACK, FLT_PREOP_SUCCESS_WITH_CALLBACK,
+    IRP_MJ_ACQUIRE_FOR_SECTION_SYNCHRONIZATION, IRP_MJ_CREATE, IRP_MJ_OPERATION_END,
+    IRP_MJ_SET_INFORMATION, IRP_MJ_WRITE, OBJ_CASE_INSENSITIVE, OBJ_KERNEL_HANDLE,
     STATUS_ACCESS_DENIED, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_PARAMETER, STATUS_SUCCESS,
 };
 
@@ -485,6 +488,31 @@ static OB_STATUS: AtomicI32 = AtomicI32::new(STATUS_REGISTRATION_UNATTEMPTED);
 /// callbacks registered across an unload — is a callback into a driver that has
 /// been unloaded, which is a bugcheck rather than a leak.
 static OB_HANDLE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
+
+/// What `CmRegisterCallbackEx` answered in `DriverEntry`.
+///
+/// The third registration, kept for the same reason as the other two and
+/// reported through the same channel: a
+/// [`SubjectKind::Registry`](av_driver_proto::SubjectKind::Registry) event the
+/// moment a service connects. Registry notifications are how a key creation or a
+/// value write is seen at all — the file callbacks cannot see them — and they
+/// fail independently of both other mechanisms.
+static REGISTRY_STATUS: AtomicI32 = AtomicI32::new(STATUS_REGISTRATION_UNATTEMPTED);
+
+/// The cookie `CmRegisterCallbackEx` returned, valid only when
+/// [`REGISTRY_REGISTERED`] is set.
+///
+/// A separate flag rather than "nonzero means registered": the cookie is a
+/// `LARGE_INTEGER` the configuration manager chooses, and nothing in the API
+/// says it cannot be zero. A zero check would then skip `CmUnRegisterCallback`
+/// and leave a callback pointing into an unloaded image.
+static REGISTRY_COOKIE: AtomicI64 = AtomicI64::new(0);
+
+/// Whether [`REGISTRY_COOKIE`] holds a registration to undo.
+///
+/// Set after the cookie is stored and cleared when it is unregistered, so a
+/// reader that sees the flag set sees the cookie too.
+static REGISTRY_REGISTERED: AtomicBool = AtomicBool::new(false);
 
 /// The value of [`PROCESS_NOTIFY_STATUS`] and [`OB_STATUS`] before the attempt.
 ///
@@ -739,26 +767,28 @@ pub unsafe extern "system" fn driver_entry(
         let _ = unsafe { EXCLUSIONS.insert(entry.as_bytes()) };
     }
 
-    // Both registrations come before the port, and the order is not stylistic.
+    // All three registrations come before the port, and the order is not
+    // stylistic.
     // `port_connect` reports what each of them answered, and a service is free
     // to connect the instant `FltCreateCommunicationPort` returns -- so a port
     // created first is a window in which a service is told
     // [`STATUS_REGISTRATION_UNATTEMPTED`] for a registration that is about to
     // succeed. Doing them first removes the window rather than narrowing it.
     //
-    // Neither failure fails the load. The minifilter is the part that refuses
+    // No failure fails the load. The minifilter is the part that refuses
     // anything: process-start notifications are how the memory monitor learns a
-    // process exists, and object callbacks are how this product keeps a handle
-    // to itself from being turned into a termination, and a machine without
-    // either still scans and still blocks. Refusing to protect a system because
-    // it could not protect itself is the worse of the two failures, and it is
-    // the one that is invisible: the product would be absent rather than
-    // degraded.
+    // process exists, object callbacks are how this product keeps a handle to
+    // itself from being turned into a termination, and the registry callback is
+    // how a key creation or a value write is seen at all — and a machine without
+    // any of the three still scans and still blocks. Refusing to protect a
+    // system because it could not protect itself is the worse of the two
+    // failures, and it is the one that is invisible: the product would be absent
+    // rather than degraded.
     //
-    // What changed on 2026-10-09 is that neither value is *thrown away* any
-    // more. Both bodies exist now, and a body that never runs looks exactly like
-    // a machine on which nothing happens — so each answer is stored here and
-    // sent to the service when it connects.
+    // What changed on 2026-10-09 is that no value is *thrown away* any more.
+    // Every body exists now, and a body that never runs looks exactly like a
+    // machine on which nothing happens — so each answer is stored here and sent
+    // to the service when it connects.
 
     // SAFETY: `ObRegisterCallbacks` requires `PASSIVE_LEVEL` (it is documented
     // `_IRQL_requires_max_(PASSIVE_LEVEL)`), which `DriverEntry` runs at, and it
@@ -773,6 +803,13 @@ pub unsafe extern "system" fn driver_entry(
     let notify_status =
         unsafe { wdk_sys::ntddk::PsSetCreateProcessNotifyRoutineEx(Some(process_notify), 0u8) };
     PROCESS_NOTIFY_STATUS.store(notify_status, Ordering::Release);
+
+    // SAFETY: `CmRegisterCallbackEx` is `_IRQL_requires_max_(APC_LEVEL)`, which
+    // `DriverEntry` satisfies, and `driver` is what the loader passed --
+    // the kernel keeps the association for the life of the registration.
+    // Neither failure fails the load, on the same reasoning as the two above.
+    let registry_status = unsafe { register_registry_callback(driver.cast::<c_void>()) };
+    REGISTRY_STATUS.store(registry_status, Ordering::Release);
 
     // The port is created before filtering starts, so that no operation can
     // ever be decided by a driver with nowhere to ask.
@@ -818,7 +855,7 @@ pub unsafe extern "system" fn driver_entry(
     STATUS_SUCCESS
 }
 
-/// Undo the two registrations `driver_entry` makes, in the reverse order.
+/// Undo the three registrations `driver_entry` makes, in the reverse order.
 ///
 /// Shared by the unload callback and both of `driver_entry`'s failure paths,
 /// which is the reason it exists: the unload path inlined the process-notify
@@ -827,18 +864,21 @@ pub unsafe extern "system" fn driver_entry(
 /// arriving after `FltUnregisterFilter` has returned is a callback into a filter
 /// that is gone.
 ///
-/// Both calls are unconditional and neither result is checked. Removing a
-/// registration that was never made returns an error status rather than
-/// faulting, which is the case when the registration itself failed; and a
+/// The first two calls are unconditional and neither result is checked.
+/// Removing a registration that was never made returns an error status rather
+/// than faulting, which is the case when the registration itself failed; and a
 /// registration that succeeded is one this has to remove regardless of what the
-/// other one did.
+/// other one did. The third is skipped when no cookie was stored, because
+/// `CmUnRegisterCallback` takes the cookie and there is no harmless value to
+/// pass it for a registration that was never made.
 ///
 /// # Safety
 ///
-/// Must not run while a callback of either registration can be executing.
-/// `ObUnRegisterCallbacks` blocks until the callbacks it is removing have
-/// returned, so the object half is safe wherever it is called; the process half
-/// is not, and both callers here satisfy it — `DriverEntry` has not started
+/// Must not run while a callback of any of the three registrations can be
+/// executing. All three unregister calls block until the callbacks they are
+/// removing have returned, so each half is safe wherever it is called; the
+/// process half's guarantee is `PsSetCreateProcessNotifyRoutineEx`'s rather than
+/// blocking's, and both callers here satisfy it — `DriverEntry` has not started
 /// filtering, and `FltUnregisterFilter` does not return until it has drained
 /// this filter's callbacks.
 unsafe fn unregister_notifications() {
@@ -854,6 +894,294 @@ unsafe fn unregister_notifications() {
     unsafe {
         let _ = wdk_sys::ntddk::PsSetCreateProcessNotifyRoutineEx(Some(process_notify), 1u8);
     }
+    // The registry callback goes last and only when one was made: the flag and
+    // the cookie are the pair that says so, and `CmUnRegisterCallback` waits
+    // for callbacks already running on other threads, so nothing of ours can be
+    // inside `registry_notify` when this returns.
+    if REGISTRY_REGISTERED.swap(false, Ordering::AcqRel) {
+        let cookie = REGISTRY_COOKIE.load(Ordering::Acquire);
+        // SAFETY: `cookie` is the value `CmRegisterCallbackEx` returned and this
+        // is its single unregister, which the flag swap above guarantees.
+        unsafe {
+            let _ = flt::CmUnRegisterCallback(cookie);
+        }
+    }
+}
+
+/// Register the registry callback, and keep the cookie that undoes it.
+///
+/// Split out of `driver_entry` for the reason [`register_object_callbacks`] is:
+/// the altitude string has to be alive for the call, and a `static` a callee
+/// could keep a pointer into is not something this file will hand out. The
+/// configuration manager copies out of it.
+///
+/// The altitude is in the **minifilter** altitude numbering for the same reason
+/// `OB_CALLBACK_REGISTRATION`'s is — the two registrations share the namespace,
+/// and the published table is the only authority for it — so the value is one
+/// above [`OB_ALTITUDE`]'s and inside the same `FSFilter Anti-Virus` band.
+///
+/// # Safety
+///
+/// Must run at `PASSIVE_LEVEL`, and `driver` must be the `PDRIVER_OBJECT` the
+/// loader passed to `DriverEntry`, which the kernel keeps for the life of the
+/// registration.
+unsafe fn register_registry_callback(driver: *mut c_void) -> i32 {
+    let mut altitude_units = [0u16; 16];
+    let length = encode_ascii(REGISTRY_ALTITUDE, &mut altitude_units);
+    let altitude = flt::UnicodeString {
+        // Bytes, not units, as in `register_object_callbacks`.
+        length: (length * 2) as u16,
+        maximum_length: (length * 2) as u16,
+        pad: 0,
+        buffer: altitude_units.as_mut_ptr(),
+    };
+
+    let mut cookie: i64 = 0;
+    // SAFETY: `altitude` and `altitude_units` are alive for the call and are
+    // only read by it; `driver` is the value the loader passed; `cookie` is a
+    // local out-parameter; `reserved` is documented as null.
+    let status = unsafe {
+        flt::CmRegisterCallbackEx(
+            registry_notify,
+            &altitude,
+            driver,
+            core::ptr::null_mut(),
+            &mut cookie,
+            core::ptr::null_mut(),
+        )
+    };
+    if status == STATUS_SUCCESS {
+        // The cookie first, then the flag: a reader that sees the flag set sees
+        // the cookie the unregister call needs.
+        REGISTRY_COOKIE.store(cookie, Ordering::Release);
+        REGISTRY_REGISTERED.store(true, Ordering::Release);
+    }
+    status
+}
+
+/// The registry callback: name the change, hand it to a worker, refuse nothing.
+///
+/// Five `REG_NOTIFY_CLASS`es are reported — key created, key deleted, value set,
+/// value deleted, key renamed — and every other class returns immediately. The
+/// set is what persistence and ransomware-relevant registry activity are made
+/// of; the rest of the registers (queries, enumerations, security changes) are
+/// volume rather than signal, and this callback sees all of it on a running
+/// machine.
+///
+/// # What it costs with no service connected
+///
+/// One atomic load: the class is not decoded and no path is resolved until a
+/// service is there to receive the event. That check is why a machine with the
+/// driver loaded and the service stopped pays nothing for this registration.
+///
+/// # Why it never refuses
+///
+/// A registry callback *can* fail an operation, and that is how a security
+/// product turns a machine into one that cannot boot. This one returns success
+/// on every path, the same boundary the rename and delete telemetry draws.
+///
+/// # Safety
+///
+/// Called by the configuration manager with the `EX_CALLBACK_FUNCTION`
+/// signature: `argument1` is the `REG_NOTIFY_CLASS` as a pointer value and
+/// `argument2` is that class's information block, both valid only for the
+/// duration of this call. Everything read out of them is copied.
+unsafe extern "system" fn registry_notify(
+    _callback_context: *mut c_void,
+    argument1: *mut c_void,
+    argument2: *mut c_void,
+) -> flt::NtStatus {
+    // Registry callbacks run at `PASSIVE_LEVEL`, and this is where that becomes
+    // a checked fact rather than an assumption: `CmCallbackGetKeyObjectIDEx`
+    // is capped at `APC_LEVEL`.
+    if !flt::may_block_for_the_service() {
+        return STATUS_SUCCESS;
+    }
+    // Nobody to tell. See the cost note above.
+    if CLIENT_PORT.load(Ordering::Acquire).is_null() {
+        return STATUS_SUCCESS;
+    }
+
+    // `Argument1` carries the class as a value, so `RegNtDeleteKey` -- which is
+    // zero -- arrives as a null pointer. That is why the constants here are
+    // `i32` and why this cast, rather than a null check, is the decode.
+    let class = argument1 as usize as i32;
+    let mut path = [0u16; MAX_PATH_UNITS];
+
+    let (detail, units) = match class {
+        flt::REG_NT_PRE_CREATE_KEY_EX => {
+            let info = argument2.cast::<flt::RegCreateKeyInformation>();
+            if info.is_null() {
+                return STATUS_SUCCESS;
+            }
+            // SAFETY: `argument2` is this class's `REG_CREATE_KEY_INFORMATION`
+            // (or `_V1`, whose `CompleteName` is at the same offset), and it is
+            // valid for the duration of the call.
+            let name = unsafe { (*info).complete_name };
+            // The block already carries the full path, so this class needs no
+            // object lookup -- and does not have one: the key does not exist
+            // yet, so there is no object to ask about.
+            match unsafe { copy_counted_string(name, &mut path) } {
+                Some(units) => (EventAction::REGISTRY_KEY_CREATED, units),
+                None => return STATUS_SUCCESS,
+            }
+        }
+        flt::REG_NT_DELETE_KEY => {
+            let info = argument2.cast::<flt::RegDeleteKeyInformation>();
+            if info.is_null() {
+                return STATUS_SUCCESS;
+            }
+            // SAFETY: as above, for this class's structure.
+            let object = unsafe { (*info).object };
+            match unsafe { key_object_path(object, &mut path) } {
+                Some(units) => (EventAction::REGISTRY_KEY_DELETED, units),
+                None => return STATUS_SUCCESS,
+            }
+        }
+        flt::REG_NT_RENAME_KEY => {
+            let info = argument2.cast::<flt::RegRenameKeyInformation>();
+            if info.is_null() {
+                return STATUS_SUCCESS;
+            }
+            let object = unsafe { (*info).object };
+            // The *object's* path, not `NewName`: a rename's new name is
+            // relative to the parent key, and a relative name reported as
+            // though it were a path is a path to something else. The key that
+            // is being renamed is the fact this event can state exactly.
+            match unsafe { key_object_path(object, &mut path) } {
+                Some(units) => (EventAction::REGISTRY_KEY_RENAMED, units),
+                None => return STATUS_SUCCESS,
+            }
+        }
+        flt::REG_NT_SET_VALUE_KEY => {
+            let info = argument2.cast::<flt::RegSetValueKeyInformation>();
+            if info.is_null() {
+                return STATUS_SUCCESS;
+            }
+            // SAFETY: `argument2` is this class's structure.
+            let (object, value_name) = unsafe { ((*info).object, (*info).value_name) };
+            match unsafe { named_value_path(object, value_name, &mut path) } {
+                Some(units) => (EventAction::REGISTRY_VALUE_SET, units),
+                None => return STATUS_SUCCESS,
+            }
+        }
+        flt::REG_NT_DELETE_VALUE_KEY => {
+            let info = argument2.cast::<flt::RegDeleteValueKeyInformation>();
+            if info.is_null() {
+                return STATUS_SUCCESS;
+            }
+            // SAFETY: as above.
+            let (object, value_name) = unsafe { ((*info).object, (*info).value_name) };
+            match unsafe { named_value_path(object, value_name, &mut path) } {
+                Some(units) => (EventAction::REGISTRY_VALUE_DELETED, units),
+                None => return STATUS_SUCCESS,
+            }
+        }
+        // Every other class: queries, enumerations, security, notifications.
+        // Volume rather than signal, and each one is a key name resolved for
+        // nothing if it were reported.
+        _ => return STATUS_SUCCESS,
+    };
+
+    // SAFETY: no arguments, and `ntddk.h` 11385 declares it without a pointer
+    // parameter -- unlike the filter-manager `FltGetRequestorProcess`, which is
+    // what faulted on 2026-09-27 and is not used here. The header's return type
+    // is `HANDLE` and the value is the identifier, so it is widened the way the
+    // write path widens it.
+    let process_id = unsafe { flt::PsGetCurrentProcessId() } as usize as u32;
+    defer_registry_event(detail, process_id, &path[..units]);
+    STATUS_SUCCESS
+}
+
+/// Copy a counted string the kernel handed over into `out`.
+///
+/// `None` when the pointer is null, the string names nothing, or it does not
+/// fit — a truncated key path names a different key, which is a worse answer
+/// than no event.
+///
+/// # Safety
+///
+/// `name`, when non-null, must point to a live counted string for the duration
+/// of the call.
+unsafe fn copy_counted_string(name: *const flt::UnicodeString, out: &mut [u16]) -> Option<usize> {
+    if name.is_null() {
+        return None;
+    }
+    // SAFETY: the caller's contract.
+    let units = unsafe { (*name).as_units() };
+    if units.is_empty() || units.len() > out.len() {
+        return None;
+    }
+    out[..units.len()].copy_from_slice(units);
+    Some(units.len())
+}
+
+/// Resolve a key object's full path through `CmCallbackGetKeyObjectIDEx`.
+///
+/// The only way to name a key from inside a callback: the object is opaque and
+/// the information blocks carry no path except create-key's `CompleteName`.
+///
+/// # Safety
+///
+/// `object` must be the key object from an information block whose callback is
+/// running, and this must run at `APC_LEVEL` or below.
+unsafe fn key_object_path(object: *mut c_void, out: &mut [u16]) -> Option<usize> {
+    if object.is_null() {
+        return None;
+    }
+    // The cookie the registration returned. Read into a local: the call takes a
+    // pointer, and the static's address is not something to hand a callee.
+    let cookie = REGISTRY_COOKIE.load(Ordering::Acquire);
+    let mut object_id: usize = 0;
+    let mut name: *mut flt::UnicodeString = core::ptr::null_mut();
+    // SAFETY: `object` is the caller's live key object, the out-parameters are
+    // locals, and `flags` must be zero.
+    let status =
+        unsafe { flt::CmCallbackGetKeyObjectIDEx(&cookie, object, &mut object_id, &mut name, 0) };
+    if status != STATUS_SUCCESS || name.is_null() {
+        return None;
+    }
+    // SAFETY: the call above succeeded, so `name` points to a counted string it
+    // allocated.
+    let units = unsafe { copy_counted_string(name, out) };
+    // SAFETY: allocated by the call above and released exactly once, here,
+    // whatever `copy_counted_string` made of it.
+    unsafe { flt::CmCallbackReleaseKeyObjectIDEx(name) };
+    units
+}
+
+/// A key object's path with the value name appended: `key\Value`.
+///
+/// A value with an empty name is the key's default value, and `regedit` spells
+/// that `(Default)`. Here it is reported as the key path with nothing appended,
+/// because the registry has no name for the default value and inventing one
+/// would be a string no rule could match against a real key.
+///
+/// # Safety
+///
+/// As for [`key_object_path`], and `value_name` must be the counted string from
+/// the running callback's information block.
+unsafe fn named_value_path(
+    object: *mut c_void,
+    value_name: *const flt::UnicodeString,
+    out: &mut [u16],
+) -> Option<usize> {
+    // SAFETY: the caller's contract, forwarded.
+    let used = unsafe { key_object_path(object, out) }?;
+    if value_name.is_null() {
+        return Some(used);
+    }
+    // SAFETY: the caller's contract.
+    let value = unsafe { (*value_name).as_units() };
+    if value.is_empty() {
+        return Some(used);
+    }
+    if used + 1 + value.len() > out.len() {
+        return None;
+    }
+    out[used] = u16::from(b'\\');
+    out[used + 1..used + 1 + value.len()].copy_from_slice(value);
+    Some(used + 1 + value.len())
 }
 
 /// Register the object callbacks that protect this product's own processes.
@@ -970,19 +1298,28 @@ static REGISTRATION: Registration = Registration(FltRegistration {
 });
 
 /// The operation table, terminated by [`IRP_MJ_OPERATION_END`].
-struct Operations([FltOperationRegistration; 4]);
+struct Operations([FltOperationRegistration; 5]);
 
 // SAFETY: as for `Registration`: a `static`, never written, read only by the
 // filter manager.
 unsafe impl Sync for Operations {}
 
-/// The four entries themselves, as a `const` so that the checks at the end of
+/// How many entries above the terminator.
+///
+/// Named rather than repeated as a literal, because the checks at the end of
+/// this file walk the table and every one of them has been written with the
+/// count inline at least once. A count that is wrong by one is not a compile
+/// error -- it is a loop that stops before the last entry, and an entry nothing
+/// asserts anything about.
+const REGISTERED_OPERATIONS: usize = 4;
+
+/// The entries themselves, as a `const` so that the checks at the end of
 /// this file can read them -- a `static` cannot be read in a const context.
 ///
 /// `OPERATIONS` below is built from this rather than from a second literal. The
 /// invariants being checked are about these exact values, and a check against a
 /// copy of them would go on passing while the table drifted.
-const OPERATION_TABLE: [FltOperationRegistration; 4] = [
+const OPERATION_TABLE: [FltOperationRegistration; REGISTERED_OPERATIONS + 1] = [
     FltOperationRegistration {
         major_function: IRP_MJ_CREATE,
         flags: 0,
@@ -1033,6 +1370,21 @@ const OPERATION_TABLE: [FltOperationRegistration; 4] = [
         flags: flt::FLTFL_OPERATION_REGISTRATION_SKIP_PAGING_IO,
         pre_operation: Some(write_pre_operation),
         post_operation: Some(write_post_operation),
+        reserved1: core::ptr::null_mut(),
+    },
+    // Rename and delete telemetry, added 2026-10-18. A pre-operation only: it
+    // observes and never refuses, so there is nothing for a post-operation to
+    // add, and [`FLT_PREOP_SUCCESS_NO_CALLBACK`] is the correct return for the
+    // same reason it would be wrong on the write entry above.
+    //
+    // `SKIP_PAGING_IO` for the reason the two entries above carry it: the
+    // callback resolves a file name, which is `_IRQL_requires_max_(APC_LEVEL)`,
+    // and it checks the IRQL itself as well.
+    FltOperationRegistration {
+        major_function: IRP_MJ_SET_INFORMATION,
+        flags: flt::FLTFL_OPERATION_REGISTRATION_SKIP_PAGING_IO,
+        pre_operation: Some(set_information_pre_operation),
+        post_operation: None,
         reserved1: core::ptr::null_mut(),
     },
     // The terminator, and it has to be this major function. This entry read
@@ -1385,6 +1737,12 @@ unsafe extern "C" fn process_notify(
     // identifier is a pointer whose value is the number. A process id fits in
     // 32 bits on this platform, which is also what the protocol's field is.
     pending.event.process_id = process_id as u32;
+    // SAFETY: as above — `create_info` is live for this call, and
+    // `ParentProcessId` is an `_In_ HANDLE` the kernel has already filled in
+    // (`ntddk.h` 11206). Read here because the structure is not valid once this
+    // callback returns. `HANDLE` is a pointer in `wdk-sys`; the same two-step
+    // cast as `process_id` above, for the same reason.
+    pending.parent_process_id = unsafe { (*create_info).ParentProcessId } as usize as u32;
     pending.event.detail = 0;
     pending.event.subject = SubjectKind::Process;
     // The event says which of the two things happened, and `ExecutionBlocked`
@@ -1594,13 +1952,31 @@ unsafe extern "system" fn section_pre_operation(
 /// valid only until the callback returns, which is before the worker that sends
 /// the notification runs. Reading it there would be reading it after it
 /// expired, so nothing is taken from it here.
+///
+/// # The one field taken from the write, since 2026-10-18
+///
+/// The identifier of the process running this post-operation, from
+/// [`flt::PsGetCurrentProcessId`]. That call reads the current thread, not the
+/// callback data: it takes no argument that could be null or inconsistent, and
+/// it cannot fault the way `FltGetRequestorProcess` did on 2026-09-27 (see the
+/// module documentation). What it answers is "the process whose thread is
+/// running now", which is the writing process when the write completed inline
+/// -- the ordinary case, including cached and buffered writes -- and can be a
+/// different process when the I/O manager completes the IRP on a worker
+/// thread. The event is therefore attributable and not authoritative; a rule
+/// that convicts on it must corroborate, which is the same standard the
+/// threshold policy sets for every count-based signal.
 unsafe extern "system" fn write_post_operation(
     _data: *mut FltCallbackData,
     _flt_objects: *const c_void,
     _completion_context: *mut c_void,
     _flags: u32,
 ) -> i32 {
-    defer_write_event();
+    // SAFETY: `PsGetCurrentProcessId` has no precondition beyond "called from
+    // kernel mode" in its declaration (`ntddk.h` 11385); it takes no argument
+    // and dereferences nothing this driver supplies.
+    let process_id = unsafe { flt::PsGetCurrentProcessId() } as usize as u32;
+    defer_write_event(process_id);
     FLT_POSTOP_FINISHED_PROCESSING
 }
 
@@ -1686,45 +2062,21 @@ unsafe extern "system" fn write_pre_operation(
         return FLT_PREOP_SUCCESS_WITH_CALLBACK;
     }
 
-    let mut information: *mut FltFileNameInformation = core::ptr::null_mut();
-    // SAFETY: `data` is the callback's own data pointer, and the options are
-    // the ones `decide` uses for the same reason: the normalised form in the
-    // device namespace is what the protocol's normaliser is written against,
-    // and `FLT_FILE_NAME_QUERY_DEFAULT` lets the filter manager answer from its
-    // cache. The name is valid only until this callback returns, which is why
-    // everything below happens here rather than being deferred.
-    let status = unsafe {
-        flt::FltGetFileNameInformation(
-            data,
-            FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT,
-            &mut information,
-        )
-    };
-    if status != STATUS_SUCCESS || information.is_null() {
+    let mut dos = [0u16; MAX_PATH_UNITS];
+    // SAFETY: `data` is the callback's own data pointer, and this is an
+    // `APC_LEVEL` or lower context -- checked just above.
+    let matched = match unsafe { operation_file_dos_path(data, &mut dos) } {
+        Some(units) => gate_matches(&dos[..units]),
         // A write whose name could not be had is a write this driver cannot
         // decide about, and there is no counter for it: `C_OVERSIZE_PATH` means
         // the path did not fit the protocol's buffer and `C_UNRESOLVED_VOLUME`
         // means the device had no DOS name. Neither is this, and incrementing
-        // one of them would be recording a fact that is not so.
-        return FLT_PREOP_SUCCESS_WITH_CALLBACK;
-    }
-
-    // SAFETY: `information` is non-null and was just returned by a successful
-    // `FltGetFileNameInformation`.
-    let device = unsafe { (*information).name.as_units() };
-    let mut dos = [0u16; MAX_PATH_UNITS];
-    let matched = match device_to_dos_path(device, &VOLUMES, &mut dos) {
-        Ok(path) => gate_matches(path),
-        // A volume with no DOS name cannot match a directory the service named
-        // by drive letter, so there is nothing to compare and nothing to count
-        // a second time -- `ask` already counts this case for the gates that
-        // reach the service.
-        Err(_) => false,
+        // one of them would be recording a fact that is not so. The same arm
+        // covers a volume with no DOS name, which cannot match a directory the
+        // service named by drive letter, so there is nothing to compare and
+        // nothing to count a second time either.
+        None => false,
     };
-
-    // SAFETY: `information` came from `FltGetFileNameInformation`, is non-null,
-    // and has not been released on any path above.
-    unsafe { flt::FltReleaseFileNameInformation(information) };
 
     if !matched {
         return FLT_PREOP_SUCCESS_WITH_CALLBACK;
@@ -1738,6 +2090,291 @@ unsafe extern "system" fn write_pre_operation(
     // is completing with `FLT_PREOP_COMPLETE` below.
     unsafe { refuse(data, STATUS_ACCESS_DENIED) };
     FLT_PREOP_COMPLETE
+}
+
+/// The pre-operation for `IRP_MJ_SET_INFORMATION`: rename and delete
+/// telemetry, added 2026-10-18.
+///
+/// # What this is for
+///
+/// Ransomware's most legible signature is not the content of the files it
+/// writes — which is encrypted, and which the write notification above sees only
+/// as "something wrote a file". It is the *shape* of the file operations around
+/// them: a burst of renames into a new extension, or a burst of deletes of
+/// originals. Until this callback existed, this driver could not see either of
+/// them at all: `IRP_MJ_WRITE` is a write to a file that exists, and a rename is
+/// neither a write nor a create.
+///
+/// # What it is not
+///
+/// **It never refuses.** The return is [`FLT_PREOP_SUCCESS_NO_CALLBACK`] on
+/// every path, including the ones that saw exactly what a targeted refusal would
+/// want to stop. That is deliberate and it is the increment boundary: the three
+/// refusals this driver makes are the ones with a measured false-positive story
+/// behind them (see the module documentation), and a rename gate has none yet.
+/// A rename is also the *ordinary* way an editor saves a file and the way an
+/// installer moves every file it installs, so a gate here would be the
+/// section-gate mistake in a second place: a class far wider than the intent.
+/// The event is data for the engine to weigh, not a verdict.
+///
+/// # Where the path comes from, and why it is the target
+///
+/// `path` is the name the file is being **renamed to**, which is the ransomware
+/// signal: `report.docx` becoming `report.docx.WNCRY` is told by the target and
+/// not by the source. [`rename_target_units`] reads it out of the information
+/// buffer and converts it, and falls back to the source name when the target
+/// cannot be resolved (a rename relative to a directory handle), setting
+/// `detail = 1` so that a consumer can tell a source name from a target one.
+///
+/// A delete has no target: `path` is the file being deleted, and the event means
+/// "a delete was requested", not "the file is gone" — the delete happens when
+/// the last handle closes, which can be long after this callback and can be
+/// never.
+///
+/// # The IRQL
+///
+/// The name resolution is `_IRQL_requires_max_(APC_LEVEL)`, and the
+/// registration carries `FLTFL_OPERATION_REGISTRATION_SKIP_PAGING_IO`. The
+/// callback checks the IRQL as well, because the flag removes the common case
+/// and not all of them; a set-information above `APC_LEVEL` is reported as
+/// nothing rather than as a fault.
+///
+/// # Safety
+///
+/// As for [`create_pre_operation`]: called by the filter manager with a valid
+/// `data` for an `IRP_MJ_SET_INFORMATION` operation, and the completion context
+/// is never written.
+unsafe extern "system" fn set_information_pre_operation(
+    data: *mut FltCallbackData,
+    _flt_objects: *const c_void,
+    _completion_context: *mut *mut c_void,
+) -> i32 {
+    if !flt::may_block_for_the_service() {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    // SAFETY: the callback's contract is that `data` and the parameter block it
+    // points at are valid for the duration of this call, and this is the
+    // set-information pre-operation, so the arm read is the arm this operation
+    // carries.
+    let Some(parameters) = (unsafe { set_information_parameters(data) }) else {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    };
+
+    let action = match parameters.file_information_class {
+        FILE_RENAME_INFORMATION_CLASS | FILE_RENAME_INFORMATION_EX_CLASS => {
+            EventAction::FileRenamed
+        }
+        FILE_DISPOSITION_INFORMATION_CLASS => {
+            // `FILE_DISPOSITION_INFORMATION::DeleteFile`, one byte. A zero is a
+            // *cancellation* of a delete another operation requested -- the way
+            // a tool that opened a file for delete-on-close changes its mind --
+            // and reporting it as a delete would be reporting the opposite.
+            let buffer = parameters.info_buffer;
+            if buffer.is_null() || (parameters.length as usize) < core::mem::size_of::<FileDispositionInformation>() {
+                return FLT_PREOP_SUCCESS_NO_CALLBACK;
+            }
+            // SAFETY: non-null, and the parameter block declares at least the
+            // one byte this reads.
+            if unsafe { (*buffer.cast::<FileDispositionInformation>()).delete_file } == 0 {
+                return FLT_PREOP_SUCCESS_NO_CALLBACK;
+            }
+            EventAction::FileDeleted
+        }
+        FILE_DISPOSITION_INFORMATION_EX_CLASS => {
+            let buffer = parameters.info_buffer;
+            if buffer.is_null() || (parameters.length as usize) < core::mem::size_of::<FileDispositionInformationEx>() {
+                return FLT_PREOP_SUCCESS_NO_CALLBACK;
+            }
+            // SAFETY: as above, for the four-byte flags word. Most set-
+            // information calls with this class clear a flag rather than ask
+            // for a delete, so this is the field that decides whether the event
+            // is about a delete at all.
+            if unsafe { (*buffer.cast::<FileDispositionInformationEx>()).flags }
+                & flt::FILE_DISPOSITION_DELETE
+                == 0
+            {
+                return FLT_PREOP_SUCCESS_NO_CALLBACK;
+            }
+            EventAction::FileDeleted
+        }
+        // Every other information class -- an allocation size, an end-of-file,
+        // a valid-data length, a compression or sparse flag -- is a change to a
+        // file that this event vocabulary has no name for. Counted nowhere and
+        // reported nowhere: an event whose action is a guess is worse than none.
+        _ => return FLT_PREOP_SUCCESS_NO_CALLBACK,
+    };
+
+    // One scratch buffer rather than one per candidate name: a kernel thread's
+    // stack is 12 KiB and this callback is already deeper than the write gate's
+    // by the rename header it reads.
+    let mut dos = [0u16; MAX_PATH_UNITS];
+    let (units, detail) = match action {
+        EventAction::FileRenamed => {
+            // SAFETY: `parameters` is the set-information arm of a rename, and
+            // `dos` is this function's own buffer.
+            match unsafe { rename_target_units(&parameters, &mut dos) } {
+                // The target converted. This is the name the event carries.
+                Some(units) => (units, 0),
+                // Relative to a directory handle, an unknown volume, or a name
+                // that did not convert. The source is still a true statement
+                // about which file moved, so it is reported with `detail = 1`
+                // rather than dropped.
+                None => match unsafe { operation_file_dos_path(data, &mut dos) } {
+                    Some(units) => (units, 1),
+                    None => return FLT_PREOP_SUCCESS_NO_CALLBACK,
+                },
+            }
+        }
+        _ => match unsafe { operation_file_dos_path(data, &mut dos) } {
+            Some(units) => (units, 0),
+            None => return FLT_PREOP_SUCCESS_NO_CALLBACK,
+        },
+    };
+
+    // SAFETY: `PsGetCurrentProcessId` has no precondition beyond "called from
+    // kernel mode" in its declaration (`ntddk.h` 11385), and the read happens
+    // here, inside the callback, rather than on the worker for the reason the
+    // write post-operation gives: it reads the current thread and dereferences
+    // nothing this driver supplies. The attribution is the same
+    // attributable-not-authoritative kind.
+    let process_id = unsafe { flt::PsGetCurrentProcessId() } as usize as u32;
+    defer_file_event(action, process_id, detail, &dos[..units]);
+    FLT_PREOP_SUCCESS_NO_CALLBACK
+}
+
+/// The `SetFileInformation` arm of a set-information operation, or `None`.
+///
+/// # Safety
+///
+/// `data` must be the callback data of an `IRP_MJ_SET_INFORMATION` operation,
+/// from that operation's pre-operation.
+unsafe fn set_information_parameters(
+    data: *mut FltCallbackData,
+) -> Option<FltSetFileInformationParameters> {
+    if data.is_null() {
+        return None;
+    }
+    // SAFETY: the caller's contract.
+    let iopb = unsafe { (*data).iopb };
+    if iopb.is_null() {
+        return None;
+    }
+    // SAFETY: `iopb` is non-null, belongs to the operation, and the operation
+    // is the one whose arm this reads. Copied out because the union is not
+    // readable in the caller's frame without carrying the same proof there.
+    Some(unsafe { (*iopb).parameters.set_file_information })
+}
+
+/// Resolve an operation's file to a DOS path in `out`, returning its length.
+///
+/// Extracted from [`write_pre_operation`] on 2026-10-18 when the rename and
+/// delete callback became its second caller. The body is that callback's own;
+/// what the extraction buys is that "resolve the file this operation is about"
+/// is one piece of code, and a defect in it is one place rather than two that
+/// have to be kept in step.
+///
+/// `None` covers both "the filter manager could not name it" and "the volume
+/// has no DOS name", which every caller treats the same way: an event about a
+/// path nobody can read is not an event.
+///
+/// # Safety
+///
+/// `data` must be the callback data of an operation whose file name the caller
+/// may resolve, called at `APC_LEVEL` or below.
+unsafe fn operation_file_dos_path(
+    data: *mut FltCallbackData,
+    out: &mut [u16; MAX_PATH_UNITS],
+) -> Option<usize> {
+    let mut information: *mut FltFileNameInformation = core::ptr::null_mut();
+    // SAFETY: `data` is the caller's live callback data. The options are the
+    // ones every caller wants for the same reason: the normalised form in the
+    // device namespace is what the protocol's normaliser is written against,
+    // and `FLT_FILE_NAME_QUERY_DEFAULT` lets the filter manager answer from its
+    // cache. The name is valid only until the callback returns, which is why
+    // the conversion happens here rather than being deferred.
+    let status = unsafe {
+        flt::FltGetFileNameInformation(
+            data,
+            FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT,
+            &mut information,
+        )
+    };
+    if status != STATUS_SUCCESS || information.is_null() {
+        return None;
+    }
+
+    // SAFETY: `information` is non-null and was just returned by a successful
+    // `FltGetFileNameInformation`.
+    let device = unsafe { (*information).name.as_units() };
+    let converted = device_to_dos_path(device, &VOLUMES, out).ok().map(|p| p.len());
+
+    // SAFETY: `information` came from `FltGetFileNameInformation`, is non-null,
+    // and has not been released on any path above.
+    unsafe { flt::FltReleaseFileNameInformation(information) };
+    converted
+}
+
+/// The rename target, converted to the DOS namespace, or `None`.
+///
+/// `FILE_RENAME_INFORMATION` and `FILE_RENAME_INFORMATION_EX` have the same
+/// offsets for the three fields read here — a four-byte union, the root
+/// directory handle, the byte length — so one reader serves both. The name
+/// itself is at [`FILE_RENAME_NAME_OFFSET`], **not** at `size_of`, which rounds
+/// the header to 24 and would drop the first two characters of every name.
+///
+/// # The bounds
+///
+/// `FileNameLength` is the I/O manager's own field and the parameter block's
+/// `Length` is the size of the same buffer, so the two are read against each
+/// other: a length longer than the buffer would be a read past its end, and the
+/// smaller of the two is the only safe answer. A name of odd length is not a
+/// UTF-16 string at all and is truncated to the even count rather than read
+/// past.
+///
+/// # Safety
+///
+/// `parameters` must be the `SetFileInformation` arm of a rename operation,
+/// read from that operation's pre-operation.
+unsafe fn rename_target_units(
+    parameters: &FltSetFileInformationParameters,
+    out: &mut [u16; MAX_PATH_UNITS],
+) -> Option<usize> {
+    let buffer = parameters.info_buffer;
+    if buffer.is_null() {
+        return None;
+    }
+    let declared = parameters.length as usize;
+    if declared < FILE_RENAME_NAME_OFFSET + 2 {
+        return None;
+    }
+
+    // SAFETY: the buffer is non-null and the block declares at least the
+    // header plus two bytes, which is what this reads.
+    let header = unsafe { &*buffer.cast::<FileRenameInformation>() };
+    if !header.root_directory.is_null() {
+        // The new name is relative to a directory handle, and that handle names
+        // a directory this callback has not been given. The source path is the
+        // caller's fallback.
+        return None;
+    }
+
+    let available = declared - FILE_RENAME_NAME_OFFSET;
+    let bytes = (header.file_name_length as usize).min(available) & !1;
+    if bytes == 0 {
+        return None;
+    }
+
+    // SAFETY: the name starts at `FILE_RENAME_NAME_OFFSET` and `bytes` is no
+    // more than what remains of a buffer the parameter block declares, rounded
+    // down to whole UTF-16 units.
+    let name = unsafe {
+        core::slice::from_raw_parts(
+            buffer.cast::<u8>().add(FILE_RENAME_NAME_OFFSET).cast::<u16>(),
+            bytes / 2,
+        )
+    };
+    device_to_dos_path(name, &VOLUMES, out).ok().map(|p| p.len())
 }
 
 /// Whether a resolved path is one of the files the write gate protects.
@@ -1797,6 +2434,16 @@ fn gate_matches(path: &[u16]) -> bool {
 /// authority for it is the table, and the only thing this driver needs from it
 /// is to be inside it and to be unique on the machine.
 const OB_ALTITUDE: &[u8] = b"321001";
+
+/// The altitude this driver's registry callback is registered at.
+///
+/// `CmRegisterCallbackEx` orders registry callbacks by this string, and
+/// `ObRegisterCallbacks` answers `STATUS_FLT_INSTANCE_ALTITUDE_COLLISION` when
+/// two registrations on the machine hold the same value — so it is one above
+/// [`OB_ALTITUDE`]'s rather than equal to it, on the same reasoning that made
+/// that one 321001 rather than 321000. Still inside the `FSFilter Anti-Virus`
+/// band, and still a documented value rather than a header one.
+const REGISTRY_ALTITUDE: &[u8] = b"321002";
 
 /// `OB_PREOP_SUCCESS`, from `wdm.h`. `OB_PREOP_CALLBACK_STATUS` has exactly one
 /// member, which is why a pre-operation callback has no verdict to return --
@@ -2365,10 +3012,11 @@ const MAX_PENDING_EVENTS: usize = 1024;
 /// for one of them would be dropped by exactly the machine that has the most
 /// processes starting.
 ///
-/// Eight rather than four since 2026-10-09, because a connection now reports
-/// **two** registrations rather than one — the process notification and the
-/// object callbacks — so the previous four was two connections' worth and had
-/// silently become one. The number is still a bound on reconnects rather than
+/// Eight rather than four since 2026-10-09, because a connection reports
+/// **three** registrations rather than one — the process notification, the
+/// object callbacks and the registry callback — so four was a single
+/// connection's worth and had silently become a cap on how much of one report a
+/// reconnect could keep. The number is still a bound on reconnects rather than
 /// on machines: a report is queued once per registration per connection, and a
 /// reconnect storm must not queue more work than the connects that caused it.
 const MAX_PENDING_STATE_EVENTS: usize = 8;
@@ -2383,9 +3031,31 @@ const MAX_PENDING_STATE_EVENTS: usize = 8;
 /// bigger problem than a dropped notification.
 const MAX_PENDING_PROCESS_EVENTS: usize = 64;
 
+/// How many rename and delete notifications may be waiting for a worker
+/// thread.
+///
+/// The same size as [`MAX_PENDING_PROCESS_EVENTS`] and for the same reason: a
+/// block of this kind carries a path, so it is about 2 KiB, and the count is a
+/// bound on pool rather than on anything a consumer can observe. The number a
+/// ransomware burst produces is exactly the case this has to survive without
+/// becoming a leak, so it is small on purpose: the events over the cap are
+/// dropped, and what a consumer does with a burst is read from the ones that
+/// arrived rather than wait for the tail.
+const MAX_PENDING_FILE_EVENTS: usize = 64;
+
+/// How many registry notifications may be waiting for a worker thread.
+///
+/// The same size as [`MAX_PENDING_FILE_EVENTS`], and the cap matters more here:
+/// a registry callback sees every write to `HKCU\Software`, and a process
+/// looping on `RegSetValueEx` would otherwise queue a block per write. Sixty-four
+/// blocks of about 2 KiB is 128 KiB, and what is over the cap is dropped — the
+/// same trade the file callbacks make, and the reason a consumer reads a burst
+/// from what arrived rather than waiting for the tail.
+const MAX_PENDING_REGISTRY_EVENTS: usize = 64;
+
 /// How long a driver-state report waits for the service to ask for it.
 ///
-/// **Why this event waits where every other event does not.** A state report is
+/// **Why this event waits longer than every other event.** A state report is
 /// queued from the filter manager's connect callback
 /// ([`defer_driver_state_event`]'s documentation says why it is deferred rather
 /// than sent from there), so it is sent in the moment between the service's
@@ -2423,6 +3093,29 @@ const MAX_PENDING_PROCESS_EVENTS: usize = 64;
 /// is part of the type's contract rather than a caller's habit.
 const STATE_REPORT_TIMEOUT_100NS: i64 = -20_000_000;
 
+/// How long an ordinary event's send waits for the service to be reading.
+///
+/// **Not zero, and this is the value a measurement changed.** The driver used to
+/// send every event but a state report with a timeout of zero, on the reasoning
+/// that the events are repeats in effect and a blocked worker thread stalls the
+/// ones behind it. The first half of that reasoning was wrong for the registry
+/// events, and 2026-10-18 measured it in the test VM: forty keys deleted in one
+/// tight loop, forty delete events queued (the service's log showed consecutive
+/// sequence numbers with exactly one consumed per key that never arrived), and
+/// thirteen received. The twenty-seven others were not dropped before the queue
+/// and not refused by the service — they were sent into the microseconds the
+/// receive thread spends between one `FilterGetMessage` returning and the next
+/// one being issued, and a send that does not wait fails into that gap. The same
+/// forty keys deleted 150 ms apart arrive forty for forty, which is what made the
+/// loss look like capacity rather than a race.
+///
+/// A hundred milliseconds, negative because the timeout is relative. It costs
+/// nothing when a receive is outstanding, which is nearly always; when none is,
+/// the cap on each pending queue (sixty-four) bounds the worst case at six
+/// seconds of one worker thread, and a service that has stopped reading by
+/// definition cannot answer a scan either.
+const ORDINARY_EVENT_TIMEOUT_100NS: i64 = -1_000_000;
+
 /// How many header-only events are queued, incremented by the two `defer_`
 /// functions and decremented by [`event_worker`].
 static PENDING_EVENTS: AtomicUsize = AtomicUsize::new(0);
@@ -2438,6 +3131,14 @@ static PENDING_STATE_EVENTS: AtomicUsize = AtomicUsize::new(0);
 /// outlives the filter.
 static PENDING_PROCESS_EVENTS: AtomicUsize = AtomicUsize::new(0);
 
+/// How many rename and delete notifications are queued, incremented by
+/// [`defer_file_event`] and decremented by [`file_event_worker`].
+static PENDING_FILE_EVENTS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many registry notifications are queued, incremented by
+/// [`defer_registry_event`] and decremented by [`registry_event_worker`].
+static PENDING_REGISTRY_EVENTS: AtomicUsize = AtomicUsize::new(0);
+
 /// Which counter an event of this action is counted in.
 ///
 /// One function rather than a field in the block, because a stored counter
@@ -2448,6 +3149,14 @@ static PENDING_PROCESS_EVENTS: AtomicUsize = AtomicUsize::new(0);
 fn pending_counter(action: EventAction) -> &'static AtomicUsize {
     match action {
         EventAction::StateChanged => &PENDING_STATE_EVENTS,
+        // The path-carrying blocks have their own caps: a rename burst and a
+        // process-start burst are different quantities, and one counter for both
+        // would let either starve the other.
+        EventAction::FileRenamed | EventAction::FileDeleted => &PENDING_FILE_EVENTS,
+        // Registry notifications carry a path too, and have their own cap for
+        // the reason above: a key-writing loop and a rename burst are different
+        // quantities and one counter for both would let either starve the other.
+        EventAction::RegistryChanged => &PENDING_REGISTRY_EVENTS,
         _ => &PENDING_EVENTS,
     }
 }
@@ -2491,9 +3200,37 @@ struct PendingEvent {
 #[repr(C)]
 struct PendingProcessEvent {
     event: PendingEvent,
+    /// The creating process, from `PS_CREATE_NOTIFY_INFO::ParentProcessId`.
+    ///
+    /// Read in [`process_notify`] rather than on the worker because the
+    /// structure it comes from is only valid during that callback. Zero when
+    /// the creator has already exited.
+    parent_process_id: u32,
     /// Meaningful length of `path`. Not an allocation size.
     units: u32,
     /// The image as a DOS path, in UTF-16 code units, no terminating NUL.
+    path: [u16; MAX_PATH_UNITS],
+}
+
+/// A rename or delete notification on its way to the service.
+///
+/// The path is the **target** for a rename and the deleted file for a delete,
+/// already in the DOS namespace because the conversion needs
+/// `FltGetFileNameInformation`'s result, which expires when the callback
+/// returns.
+///
+/// `#[repr(C)]` for the same reason [`PendingProcessEvent`] has it: the worker
+/// is handed a pointer to the header and reads through it.
+///
+/// A registry notification reuses this structure — see [`defer_registry_event`]
+/// — because its block is the same shape: a header and one path. Two structures
+/// that must stay byte-identical are two structures that will not.
+#[repr(C)]
+struct PendingFileEvent {
+    event: PendingEvent,
+    /// Meaningful length of `path`. Not an allocation size.
+    units: u32,
+    /// The file, in UTF-16 code units, no terminating NUL.
     path: [u16; MAX_PATH_UNITS],
 }
 
@@ -2592,18 +3329,20 @@ unsafe fn queue_pending(
 /// `FltGetFileNameInformation`'s result is valid only for the duration of the
 /// callback, and this no longer runs inside one.
 ///
-/// It takes no arguments, and that is the point rather than an omission: what
-/// it queues is `SubjectKind::File` and `EventAction::FileWritten` plus a
-/// sequence number and a timestamp, none of which comes from the write, and
-/// reading the write's callback data here -- or on the worker -- would be
-/// reading it outside the window it is valid in.
+/// It takes the writing process's identifier and nothing else. That number is
+/// read by the caller from the current thread rather than from the callback
+/// data, because the callback data is not valid here -- `FltGetRequestorProcess`
+/// on it is what faulted on 2026-09-27 -- and the identifier is the one fact
+/// this path can take from a write safely. The path remains empty: resolving it
+/// needs `FltGetFileNameInformation` inside the callback, and that result would
+/// be expired before the worker runs.
 ///
 /// Safe, not `unsafe`: the handle it passes to `FltQueueGenericWorkItem` comes
 /// from the `FILTER` static, and the driver sets that before `FltStartFiltering`
 /// and clears it in the unload callback, so no callback of this filter can run
 /// with a null or stale one. That is an invariant this module keeps rather than
 /// a precondition its caller has to know.
-fn defer_write_event() {
+fn defer_write_event(process_id: u32) {
     // The IRQL this can be entered at is `DISPATCH_LEVEL`, and
     // `FltAllocateGenericWorkItem` and `FltQueueGenericWorkItem` are capped
     // there. Both facts are in `flt.rs`; this is where they meet.
@@ -2650,9 +3389,10 @@ fn defer_write_event() {
     // Read now rather than in the worker: that is what makes the timestamp the
     // time of the write instead of the time of the send.
     pending.now_100ns = interrupt_time_100ns();
-    // Nothing was done to a process by a write, and there is no detail: the
-    // write's own path is deliberately not read here.
-    pending.process_id = 0;
+    // The process whose thread issued the write, read by the caller before it
+    // got here. The write's own path is still deliberately not read: resolving
+    // it needs the callback, and the callback has returned.
+    pending.process_id = process_id;
     pending.detail = 0;
     pending.subject = SubjectKind::File;
     pending.action = EventAction::FileWritten;
@@ -2665,6 +3405,143 @@ fn defer_write_event() {
             flt::EVENT_TAG,
             event_worker,
             &PENDING_EVENTS,
+            filter,
+        );
+    }
+}
+
+/// Hand a rename or delete notification to a worker thread, which will send it.
+///
+/// Deferred for the same reason every other event is: `FltSendMessage` is
+/// `_IRQL_requires_max_(APC_LEVEL)` (`fltKernel.h` 4642), and a set-information
+/// pre-operation can be entered above that.
+///
+/// Takes an already-converted DOS path rather than resolving one, because the
+/// callback had to hold `FltGetFileNameInformation`'s result while it was still
+/// valid, and this function runs after the callback may have returned.
+///
+/// A dropped event is silent rather than counted, for the reason
+/// [`defer_write_event`] gives: `DriverStats` has no field for one.
+fn defer_file_event(action: EventAction, process_id: u32, detail: u32, path: &[u16]) {
+    if !flt::may_defer_for_the_service() {
+        return;
+    }
+    if PENDING_FILE_EVENTS.load(Ordering::Relaxed) >= MAX_PENDING_FILE_EVENTS {
+        return;
+    }
+    let filter = FILTER.load(Ordering::Acquire);
+    if filter.is_null() {
+        return;
+    }
+
+    // SAFETY: `ExAllocatePool2` with non-paged flags is
+    // `_IRQL_requires_max_(DISPATCH_LEVEL)` (`wdm.h` 25427), which is as high as
+    // this can run. A null return is the pool refusing, and it is handled.
+    let block = unsafe {
+        flt::ExAllocatePool2(
+            flt::POOL_FLAG_NON_PAGED,
+            core::mem::size_of::<PendingFileEvent>(),
+            flt::FILE_EVENT_TAG,
+        )
+    }
+    .cast::<PendingFileEvent>();
+    if block.is_null() {
+        return;
+    }
+
+    // SAFETY: `block` came from the non-paged pool just above, is
+    // `size_of::<PendingFileEvent>()` bytes, and nothing else can reach it
+    // until it is queued.
+    let pending = unsafe { &mut *block };
+    pending.event.sequence = NEXT_EVENT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    // Read here rather than on the worker: the timestamp is the time of the
+    // rename or delete, not of the send.
+    pending.event.now_100ns = interrupt_time_100ns();
+    pending.event.process_id = process_id;
+    pending.event.detail = detail;
+    pending.event.subject = SubjectKind::File;
+    pending.event.action = action;
+    pending.units = path.len() as u32;
+    pending.path[..path.len()].copy_from_slice(path);
+
+    // SAFETY: as documented on `queue_pending`; `block` was allocated with
+    // `FILE_EVENT_TAG` and `filter` was checked above.
+    unsafe {
+        queue_pending(
+            block.cast::<c_void>(),
+            flt::FILE_EVENT_TAG,
+            file_event_worker,
+            &PENDING_FILE_EVENTS,
+            filter,
+        );
+    }
+}
+
+/// Hand a registry notification to a worker thread, which will send it.
+///
+/// Deferred for the same reason the file events are — `FltSendMessage` is
+/// `_IRQL_requires_max_(APC_LEVEL)` — and for one more: the path is built in the
+/// callback out of a string `CmCallbackGetKeyObjectIDEx` allocated, which is
+/// released before the callback returns. Nothing of it can be left for later.
+///
+/// The block is a [`PendingFileEvent`]: the shape (a header and one path) is the
+/// same, the allocation is tagged [`flt::REGISTRY_EVENT_TAG`] so that the two
+/// are still distinguishable in a pool dump, and the counter is
+/// [`PENDING_REGISTRY_EVENTS`] so that neither kind can starve the other.
+///
+/// `detail` is one of the `EventAction::REGISTRY_*` codes — what kind of change
+/// this is — because a registry event's path alone does not say whether a key
+/// was created, a value written, or a key deleted.
+fn defer_registry_event(detail: u32, process_id: u32, path: &[u16]) {
+    if !flt::may_defer_for_the_service() {
+        return;
+    }
+    if PENDING_REGISTRY_EVENTS.load(Ordering::Relaxed) >= MAX_PENDING_REGISTRY_EVENTS {
+        return;
+    }
+    let filter = FILTER.load(Ordering::Acquire);
+    if filter.is_null() {
+        return;
+    }
+
+    // SAFETY: `ExAllocatePool2` with non-paged flags is
+    // `_IRQL_requires_max_(DISPATCH_LEVEL)` (`wdm.h` 25427), which is as high as
+    // this can run. A null return is the pool refusing, and it is handled.
+    let block = unsafe {
+        flt::ExAllocatePool2(
+            flt::POOL_FLAG_NON_PAGED,
+            core::mem::size_of::<PendingFileEvent>(),
+            flt::REGISTRY_EVENT_TAG,
+        )
+    }
+    .cast::<PendingFileEvent>();
+    if block.is_null() {
+        return;
+    }
+
+    // SAFETY: `block` came from the non-paged pool just above, is
+    // `size_of::<PendingFileEvent>()` bytes, and nothing else can reach it
+    // until it is queued.
+    let pending = unsafe { &mut *block };
+    pending.event.sequence = NEXT_EVENT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    // Read here rather than on the worker: the timestamp is the time of the
+    // registry operation, not of the send.
+    pending.event.now_100ns = interrupt_time_100ns();
+    pending.event.process_id = process_id;
+    pending.event.detail = detail;
+    pending.event.subject = SubjectKind::Registry;
+    pending.event.action = EventAction::RegistryChanged;
+    pending.units = path.len() as u32;
+    pending.path[..path.len()].copy_from_slice(path);
+
+    // SAFETY: as documented on `queue_pending`; `block` was allocated with
+    // `REGISTRY_EVENT_TAG` and `filter` was checked above.
+    unsafe {
+        queue_pending(
+            block.cast::<c_void>(),
+            flt::REGISTRY_EVENT_TAG,
+            registry_event_worker,
+            &PENDING_REGISTRY_EVENTS,
             filter,
         );
     }
@@ -2686,9 +3563,10 @@ fn defer_write_event() {
 /// list a user would want to trust.
 ///
 /// `subject` is which registration this is about, and it is a parameter rather
-/// than a constant since 2026-10-09 because there are now two of them:
-/// [`SubjectKind::Driver`] is `PsSetCreateProcessNotifyRoutineEx` and
-/// [`SubjectKind::Protection`] is `ObRegisterCallbacks`. They are two different
+/// than a constant since 2026-10-09 because there are now three of them:
+/// [`SubjectKind::Driver`] is `PsSetCreateProcessNotifyRoutineEx`,
+/// [`SubjectKind::Protection`] is `ObRegisterCallbacks`, and
+/// [`SubjectKind::Registry`] is `CmRegisterCallbackEx`. They are three different
 /// facts about the machine and a service that could not tell them apart would
 /// have to guess which one had failed — which is the whole reason the report
 /// exists.
@@ -2781,6 +3659,10 @@ extern "system" fn event_worker(
             pending.subject,
             pending.action,
             pending.process_id,
+            // A state report or a write notification names no creator. Zero is
+            // this protocol's "none", the same value the field's documentation
+            // gives every action other than a process start.
+            0,
             pending.detail,
             &[],
         );
@@ -2827,6 +3709,7 @@ extern "system" fn process_event_worker(
             pending.event.now_100ns,
             pending.event.action,
             pending.event.process_id,
+            pending.parent_process_id,
             &pending.path[..units],
         );
     }
@@ -2838,6 +3721,94 @@ extern "system" fn process_event_worker(
         flt::ExFreePoolWithTag(context, flt::PROCESS_EVENT_TAG);
     }
     PENDING_PROCESS_EVENTS.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// The routine a queued rename or delete notification runs on.
+///
+/// It only sends: the path in the block is already the DOS form, and the
+/// `detail` that says whether it is a source name or a target one was decided
+/// in the callback, where the information buffer was still valid.
+///
+/// # Safety
+///
+/// Called by the filter manager with the work item and the `context` that
+/// [`defer_file_event`] queued, which is always a `PendingFileEvent` it
+/// allocated.
+extern "system" fn file_event_worker(
+    work_item: flt::FltGenericWorkItem,
+    _filter: *mut c_void,
+    context: *mut c_void,
+) {
+    // SAFETY: `context` is that block. Every field read here is read once, and
+    // nothing else holds a reference to it.
+    let action = unsafe {
+        let pending = &*context.cast::<PendingFileEvent>();
+        let units = (pending.units as usize).min(MAX_PATH_UNITS);
+        send_event(
+            pending.event.sequence,
+            pending.event.now_100ns,
+            SubjectKind::File,
+            pending.event.action,
+            pending.event.process_id,
+            // A file event has no creator; zero is this protocol's "none".
+            0,
+            pending.event.detail,
+            &pending.path[..units],
+        );
+        pending.event.action
+    };
+
+    // SAFETY: as in `event_worker` -- this routine's own work item, the block
+    // the queueing callback allocated, freed once, counter last.
+    unsafe {
+        flt::FltFreeGenericWorkItem(work_item);
+        flt::ExFreePoolWithTag(context, flt::FILE_EVENT_TAG);
+    }
+    pending_counter(action).fetch_sub(1, Ordering::Relaxed);
+}
+
+/// The routine a queued registry notification runs on.
+///
+/// It only sends: the path in the block is already the registry namespace form,
+/// resolved in the callback while the configuration manager's object was still
+/// valid, and `detail` was read there from the `REG_NOTIFY_CLASS`.
+///
+/// # Safety
+///
+/// Called by the filter manager with the work item and the `context` that
+/// [`defer_registry_event`] queued, which is always a [`PendingFileEvent`] it
+/// allocated with [`flt::REGISTRY_EVENT_TAG`].
+extern "system" fn registry_event_worker(
+    work_item: flt::FltGenericWorkItem,
+    _filter: *mut c_void,
+    context: *mut c_void,
+) {
+    // SAFETY: `context` is that block. Every field read here is read once, and
+    // nothing else holds a reference to it.
+    let action = unsafe {
+        let pending = &*context.cast::<PendingFileEvent>();
+        let units = (pending.units as usize).min(MAX_PATH_UNITS);
+        send_event(
+            pending.event.sequence,
+            pending.event.now_100ns,
+            SubjectKind::Registry,
+            pending.event.action,
+            pending.event.process_id,
+            // A registry event has no creator; zero is this protocol's "none".
+            0,
+            pending.event.detail,
+            &pending.path[..units],
+        );
+        pending.event.action
+    };
+
+    // SAFETY: as in `event_worker` -- this routine's own work item, the block
+    // the queueing callback allocated, freed once, counter last.
+    unsafe {
+        flt::FltFreeGenericWorkItem(work_item);
+        flt::ExFreePoolWithTag(context, flt::REGISTRY_EVENT_TAG);
+    }
+    pending_counter(action).fetch_sub(1, Ordering::Relaxed);
 }
 
 /// Send one process event, whose path is already the DOS form.
@@ -2886,6 +3857,7 @@ fn send_process_event(
     now_100ns: u64,
     action: EventAction,
     process_id: u32,
+    parent_process_id: u32,
     path: &[u16],
 ) {
     // SAFETY: this is a worker thread at `PASSIVE_LEVEL`; `send_event`'s own
@@ -2899,6 +3871,7 @@ fn send_process_event(
             SubjectKind::Process,
             action,
             process_id,
+            parent_process_id,
             0,
             path,
         );
@@ -2958,8 +3931,10 @@ fn outbound<T>(message: *mut T) -> (*mut c_void, u32) {
 const _: () = assert!(core::mem::size_of::<DecisionRequestMessage>() >= PortMessageHeader::SIZE);
 const _: () = assert!(core::mem::size_of::<EventMessage>() >= PortMessageHeader::SIZE);
 
-/// Send one event upward, waiting for nothing — except a state report, which
-/// waits [`STATE_REPORT_TIMEOUT_100NS`].
+/// Send one event upward, waiting [`ORDINARY_EVENT_TIMEOUT_100NS`] for the
+/// service to be reading — except a state report, which waits
+/// [`STATE_REPORT_TIMEOUT_100NS`], and a write notification, which does not
+/// wait at all.
 ///
 /// Called from the two worker routines, which is what makes the call below
 /// legal: `FltSendMessage` is `_IRQL_requires_max_(APC_LEVEL)`
@@ -2979,6 +3954,7 @@ unsafe fn send_event(
     subject: SubjectKind,
     action: EventAction,
     process_id: u32,
+    parent_process_id: u32,
     detail: u32,
     path: &[u16],
 ) {
@@ -3002,6 +3978,7 @@ unsafe fn send_event(
 
     let mut event = EventMessage::new(sequence, now_100ns, subject, action);
     event.process_id = process_id;
+    event.parent_process_id = parent_process_id;
     event.detail = detail;
     if !path.is_empty() && event.set_path(path).is_err() {
         // Longer than `MAX_PATH_UNITS`. Refused rather than truncated: see the
@@ -3011,17 +3988,22 @@ unsafe fn send_event(
         return;
     }
 
-    // A state report waits; every other event does not. The three ordinary
-    // events are repeats in effect -- a write notification the file's own scan
-    // covers, a process start the next process start will not make up for but
-    // which a busy machine is already producing faster than this service can
-    // read -- and a worker thread blocked on one of them would stall the others
-    // behind it. A state report is the opposite: there are exactly two per
-    // connection, they are the only record that a registration succeeded, and
-    // they are sent in the one window where no receive is outstanding.
+    // A state report waits two seconds; an ordinary event waits a hundred
+    // milliseconds; a write notification does not wait at all. The reasons are
+    // in the two constants and in the measurement recorded on
+    // `ORDINARY_EVENT_TIMEOUT_100NS` -- in short, a zero-timeout send is lost
+    // whenever it lands in the gap between two receives, which is most of a
+    // tight burst.
+    //
+    // A write notification keeps the zero because it is the one stream that is
+    // genuinely expendable: it is by far the highest volume on the machine (the
+    // service's own log writes produce them, so a service at `trace` feeds
+    // itself), and no rule in `rules.toml` reads it. Making it wait is what
+    // would stall a worker thread behind a service that is not reading.
     let mut timeout: i64 = match action {
         EventAction::StateChanged => STATE_REPORT_TIMEOUT_100NS,
-        _ => 0,
+        EventAction::FileWritten => 0,
+        _ => ORDINARY_EVENT_TIMEOUT_100NS,
     };
     let mut client = port;
     // SAFETY: `FILTER` is a live filter here -- `FltUnregisterFilter` does not
@@ -3029,9 +4011,10 @@ unsafe fn send_event(
     // manager's -- and `client` is a local copy of the port, because the filter
     // manager writes through the pointer it is given when a connection dies.
     // The reply buffer and its length are null, which `FltSendMessage` allows
-    // and which is what makes this a send with no reply, and a relative timeout
-    // of zero returns immediately when the service is not reading -- so a
-    // stopped service cannot stall the worker thread.
+    // and which is what makes this a send with no reply. The timeout is
+    // relative and negative or zero, so a service that has stopped reading
+    // costs at most one timeout per queued event rather than the life of the
+    // connection.
     let (out, out_length) = outbound(core::ptr::addr_of_mut!(event));
     unsafe {
         let _ = flt::FltSendMessage(
@@ -3249,6 +4232,7 @@ extern "system" fn port_connect(
         SubjectKind::Driver,
     );
     defer_driver_state_event(OB_STATUS.load(Ordering::Acquire), SubjectKind::Protection);
+    defer_driver_state_event(REGISTRY_STATUS.load(Ordering::Acquire), SubjectKind::Registry);
 
     STATUS_SUCCESS
 }
@@ -3530,16 +4514,16 @@ const _: () = {
 const _: () = {
     // The array ends at the terminator, which is the only thing that marks the
     // end of it. `IRP_MJ_OPERATION_END` is 0x80; `IRP_MJ_CREATE` is 0x00.
-    assert!(OPERATION_TABLE[3].major_function == IRP_MJ_OPERATION_END);
+    assert!(OPERATION_TABLE[REGISTERED_OPERATIONS].major_function == IRP_MJ_OPERATION_END);
 
     // And nothing is registered twice, which is what the filter manager
     // rejects. The terminator is excluded from the comparison because it is not
     // an operation -- including it would make this check pass for the wrong
-    // reason on the day one of the three above happens to be 0x80.
+    // reason on the day one of the entries above happens to be 0x80.
     let mut i = 0;
-    while i < 3 {
+    while i < REGISTERED_OPERATIONS {
         let mut j = i + 1;
-        while j < 3 {
+        while j < REGISTERED_OPERATIONS {
             assert!(OPERATION_TABLE[i].major_function != OPERATION_TABLE[j].major_function);
             j += 1;
         }
@@ -3550,7 +4534,7 @@ const _: () = {
     // filter manager would never call it and the entry would be a claim the
     // driver does not keep.
     let mut k = 0;
-    while k < 3 {
+    while k < REGISTERED_OPERATIONS {
         assert!(
             OPERATION_TABLE[k].pre_operation.is_some()
                 || OPERATION_TABLE[k].post_operation.is_some()
@@ -3567,7 +4551,7 @@ const _: () = {
     // armed and never fires, no post-operation means writes stop being reported
     // while the `.rdata` counts still look healthy.
     let mut w = 0;
-    while w < 3 {
+    while w < REGISTERED_OPERATIONS {
         if OPERATION_TABLE[w].major_function == IRP_MJ_WRITE {
             assert!(OPERATION_TABLE[w].pre_operation.is_some());
             assert!(OPERATION_TABLE[w].post_operation.is_some());
@@ -3575,8 +4559,8 @@ const _: () = {
         w += 1;
     }
 
-    // The two entries whose callbacks can run at `DISPATCH_LEVEL` must skip
-    // paging I/O, because both of them reach an API the header caps at
+    // The entries whose callbacks can run at `DISPATCH_LEVEL` must skip
+    // paging I/O, because each of them reaches an API the header caps at
     // `APC_LEVEL`. This is the check that would have caught the defect that
     // bugchecked the test VM on 2026-09-27 -- an entry whose `flags` was left at
     // zero looks exactly like a correct one at every other level, and the cost
@@ -3587,10 +4571,11 @@ const _: () = {
     // function rather than by index so that reordering the table cannot make
     // this pass for the wrong entry.
     let mut m = 0;
-    while m < 3 {
+    while m < REGISTERED_OPERATIONS {
         let entry = &OPERATION_TABLE[m];
         let reaches_a_blocking_api = entry.major_function == IRP_MJ_WRITE
-            || entry.major_function == IRP_MJ_ACQUIRE_FOR_SECTION_SYNCHRONIZATION;
+            || entry.major_function == IRP_MJ_ACQUIRE_FOR_SECTION_SYNCHRONIZATION
+            || entry.major_function == IRP_MJ_SET_INFORMATION;
         if reaches_a_blocking_api {
             assert!(
                 entry.flags & flt::FLTFL_OPERATION_REGISTRATION_SKIP_PAGING_IO != 0,
@@ -3607,6 +4592,16 @@ const _: () = {
     // kernel against every other driver's, with nothing to say so.
     assert!(OB_ALTITUDE.len() == 6);
     assert!(OB_ALTITUDE.len() <= 15);
+    // The registry altitude is a counted string handed to
+    // `CmRegisterCallbackEx` the same way, and it must differ from the object
+    // callback's: the two share the numbering, and a collision is a registration
+    // that fails with a status nobody would think to check for.
+    assert!(REGISTRY_ALTITUDE.len() == 6);
+    assert!(REGISTRY_ALTITUDE.len() <= 15);
+    // The two differ in their last digit, which is the fact the collision
+    // status above is about. Spelled as the byte rather than as a slice
+    // comparison because slice `PartialEq` is not a `const fn`.
+    assert!(OB_ALTITUDE[5] != REGISTRY_ALTITUDE[5]);
 
     // `wdm.h`'s `MODE::UserMode`: the caller's own token rather than the
     // token's. Kernel mode would ask about the process as the kernel sees it,

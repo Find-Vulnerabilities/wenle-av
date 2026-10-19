@@ -59,7 +59,21 @@ pub const MAGIC: [u8; 8] = *b"WENLEIPC";
 /// [`crate::Request`] therefore changes the wire format without changing any
 /// type's name, and a peer built against the other order would read
 /// `QuarantineDelete` as `QuarantineList`.
-pub const PROTOCOL_VERSION: u32 = 0x0001_0002;
+///
+/// `0x0001_0003` (2026-10-18) added `DriverEvent::parent_process_id`. bincode
+/// has no field names to skip, so an older client would read every field after
+/// it one word early; the exact-match check is what turns that into a refused
+/// connection rather than a misread event.
+///
+/// `0x0001_0004` (2026-10-18) added `DriverEventAction::FileRenamed` and
+/// `FileDeleted`. An enum is its declaration index, so these are two more
+/// values a peer must agree about — and they sit before `Unrecognised`, which
+/// moved with them.
+///
+/// `0x0001_0005` (2026-10-18) added `DriverEventAction::RegistryChanged` and
+/// `DriverSubject::Registry`, each before its enum's `Unrecognised`, so the
+/// indices after them moved again.
+pub const PROTOCOL_VERSION: u32 = 0x0001_0005;
 
 /// Bytes of length prefix in front of every frame.
 pub const FRAME_PREFIX_BYTES: usize = 4;

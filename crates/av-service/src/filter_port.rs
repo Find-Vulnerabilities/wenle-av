@@ -1405,6 +1405,8 @@ pub(crate) fn connection_event(connected: bool, port_name: &str) -> DriverEvent 
         // Nothing was done to a file, so there is no path.
         path: None,
         process_id: std::process::id(),
+        // The service's own connection report has no creator worth naming.
+        parent_process_id: 0,
         thread_id: 0,
         detail: u32::from(connected),
         driver_state: Some(if connected {
@@ -1842,6 +1844,7 @@ fn configure(
             subject: DriverSubject::Configuration,
             path: None,
             process_id: std::process::id(),
+            parent_process_id: 0,
             thread_id: 0,
             detail: detail as u32,
             driver_state: None,
@@ -1899,20 +1902,202 @@ impl ReceiveBuffer {
     }
 }
 
+/// How many messages the receive thread may hand either of the two lanes.
+///
+/// Large enough that an ordinary burst — a build writing a thousand files, a
+/// registry sweep — never makes the receive thread wait, and bounded because
+/// the alternative is a queue that grows with whatever the machine is doing.
+/// When it does fill, the receive thread blocks on the hand-off and the driver
+/// is back to losing ordinary events; that is a machine asking more of the
+/// decision path than it can answer, and a bigger queue would only move it.
+const INBOX_MESSAGES: usize = 1024;
+
+/// Which of the two lanes a received message belongs on.
+///
+/// Two, and the split is 2026-10-18's answer to a measured loss. [`serve`] ran
+/// one dispatcher thread over one queue, and a decision on that thread blocks
+/// for as long as its scan takes — up to [`DECISION_DEADLINE`]. The test VM
+/// showed what that costs the other messages: forty registry keys deleted in a
+/// tight loop right after boot delivered too few delete events for a
+/// thirty-count rule to fire, while the same forty on a warmed-up machine
+/// delivered all forty. At boot the machine is asking for decisions on
+/// `mpengine.dll` and five OneDrive DLLs, each scan outliving the deadline, so
+/// the dispatch thread was inside a scan for most of that minute, the queue
+/// filled behind it, and the receive thread stopped receiving.
+///
+/// So decisions keep the serialised lane they had — one at a time, the design
+/// this module documents — and everything else is reported on a thread that
+/// never scans and therefore never stops reading.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Lane {
+    /// Work the driver is waiting for an answer to.
+    Decide,
+    /// A report about something that already happened.
+    Events,
+}
+
+/// The lane `message` belongs on.
+///
+/// Exhaustive with no wildcard: a message kind added to [`Received`] stops this
+/// build rather than being reported by a guess on the wrong thread.
+pub fn lane(message: &Received) -> Lane {
+    match message {
+        Received::DecisionRequest(_) => Lane::Decide,
+        // Cheap and rare, and it is the dispatcher's own state: the same lane
+        // as the decisions so that `Dispatcher::reported_status` keeps meaning
+        // what it says.
+        Received::Status(_) => Lane::Decide,
+        Received::Event(_) => Lane::Events,
+        Received::Unreadable { .. } => Lane::Events,
+    }
+}
+
+/// How often the decision thread looks up from an empty inbox, so that a stop
+/// with nothing arriving is still noticed.
+const INBOX_POLL: Duration = Duration::from_millis(50);
+
+/// How many threads wait in `FilterGetMessage` at once.
+///
+/// **One, and a second one is not merely unhelpful — it breaks the port.**
+/// Measured in the test VM on 2026-10-18: with two threads waiting on the same
+/// port handle, `FilterGetMessage` began returning *success* without writing a
+/// message, thousands of times a second. Each empty success is a message this
+/// service reads as `kind 0, version 0` and refuses, and the log said so —
+/// `service.log` grew from 10.9 MB in seventeen minutes to 6.3 MB in
+/// twenty-four seconds the moment that build started. Whatever pairing the
+/// filter manager does between a send and a waiting receive is per connection
+/// rather than per waiting thread, and a second waiter is answered with
+/// nothing.
+///
+/// Two threads *were* tried because one measured badly: forty registry keys
+/// deleted in one tight loop delivered twenty-nine `deleted key` events rather
+/// than forty, while the same forty deleted 150 ms apart delivered all forty.
+/// That deficit was real and was **not** answered here. It had two causes, both
+/// fixed elsewhere on 2026-10-18: the driver sent an ordinary event with a zero
+/// timeout, so it was delivered only if a receive was outstanding at that
+/// instant (`send_event` in `av-driver/src/lib.rs` now waits a hundred
+/// milliseconds), and the one dispatch thread blocked inside decision scans,
+/// which is what [`Lane`] splits apart. Forty for forty was measured after
+/// both changes.
+const RECEIVE_THREADS: usize = 1;
+
 /// Serve one connection until it ends or the service stops.
 ///
-/// `stop` is checked between messages and not during one; see this module's
-/// documentation for why that window cannot be closed.
+/// # Why receiving and deciding are two threads
+///
+/// The driver sends every ordinary event — a process start, a registry change,
+/// a rename — with a **zero** timeout, and `FltSendMessage` with a zero timeout
+/// fails immediately when no receive is outstanding (`av-driver/src/lib.rs`,
+/// `send_event`). The failure is the event: it is not queued, not retried and
+/// not counted. So an event is delivered only if this process is inside
+/// `FilterGetMessage` at the instant the driver sends it, which makes the
+/// receive path's occupancy a correctness property rather than a performance
+/// one.
+///
+/// Until 2026-10-18 both halves ran on one thread, and the decision half blocks
+/// for as long as the scan it waits for takes — up to `DECISION_DEADLINE`.
+/// Measured in the test VM that evening: forty registry keys deleted in one
+/// tight loop delivered forty `created key` events and **seventeen**
+/// `deleted key` events, because the port thread was scanning for most of the
+/// loop. A second run of the same loop delivered twenty-seven. The behaviour
+/// engine saw too few deletions for a thirty-count rule to fire, and no amount
+/// of rule tuning would have changed that.
+///
+/// So this thread does nothing but receive and hand over, and what it hands
+/// over goes to one of two lanes ([`lane`]): [`serve_messages`] decides, and
+/// [`report_events`] reports. The two are separate threads because the same VM
+/// measured the same loss again with only the receive half split off — forty
+/// deletes in a tight loop one minute after boot still did not reach the
+/// thirty-count rule, while the same forty on a warmed-up machine delivered all
+/// forty. At boot the decisions in flight are scans of `mpengine.dll` and five
+/// OneDrive DLLs, each outliving the deadline, and the single dispatch thread
+/// was inside one of them for most of that minute. Decisions still serialise
+/// on exactly one thread; what changed is that no other message waits behind
+/// them.
+///
+/// The receive thread ends when the port ends or when both lanes have gone.
+/// Its own exit is not waited for: `run` closes the port after this function
+/// returns, and the filter manager then completes the receive with an
+/// error — the same policy [`crate::host`] applies to this whole client.
 #[cfg(windows)]
 fn serve(port: &windows::Win32::Foundation::HANDLE, dispatcher: &mut Dispatcher, events: &Sender<Event>, stop: &AtomicBool) {
-    // `FilterReplyMessage` is not here: answering is `reply_to_driver`, and this
-    // loop only receives.
+    let (decisions, deciding) = crossbeam_channel::bounded::<Received>(INBOX_MESSAGES);
+    let (notices, reporting) = crossbeam_channel::bounded::<Received>(INBOX_MESSAGES);
+    // The reporter first, so that its failure can be answered by sending
+    // everything down the decision lane instead — the single-threaded behaviour
+    // this split replaces, which loses events under load but never loses a
+    // decision. `None` is that fallback.
+    let reporter = events.clone();
+    let notices = match std::thread::Builder::new()
+        .name("wenle-av-filter-events".to_string())
+        .spawn(move || report_events(&reporting, &reporter))
+    {
+        Ok(_) => Some(notices),
+        Err(error) => {
+            log::error!(
+                "the filter port event thread could not be started ({error}); driver events will \
+                 be reported behind decisions, which is where they stopped arriving on 10-18"
+            );
+            None
+        }
+    };
+    // The handle as a number: `HANDLE` is not `Send` and the receive threads
+    // need a copy rather than the borrow. Nothing closes it while they can
+    // still use it — `run` closes it only after this returns.
+    let raw = port.0 as isize;
+    let mut waiting = 0;
+    for index in 0..RECEIVE_THREADS {
+        let inbox = decisions.clone();
+        let notices = notices.clone();
+        let spawned = std::thread::Builder::new()
+            .name(format!("wenle-av-filter-receive-{index}"))
+            .spawn(move || receive_until_the_port_ends(raw, inbox, notices.as_ref()));
+        match spawned {
+            Ok(_) => waiting += 1,
+            // The same failure `start_on` handles the same way: the driver
+            // allows what it cannot get an answer for, so one fewer waiting
+            // thread is a narrower window rather than a reason to give the
+            // connection up. The send below drops the extra sender clone.
+            Err(error) => log::error!(
+                "filter port receive thread {index} of {RECEIVE_THREADS} could not be started: \
+                 {error}"
+            ),
+        }
+    }
+    if waiting == 0 {
+        // Not one could be created: the connection is up and nobody is
+        // listening, so end it and let `run` try again rather than hold a port
+        // that will never answer.
+        log::error!(
+            "no filter port receive thread could be started; closing the connection to the \
+             driver"
+        );
+        return;
+    }
+    drop(decisions);
+    drop(notices);
+    serve_messages(port, &deciding, dispatcher, events, stop);
+}
+
+/// Receive until the connection ends, handing every message to its lane.
+///
+/// This thread never scans, never replies, and logs nothing between receives:
+/// every microsecond it spends doing anything else is a microsecond in which
+/// the driver's send finds no receive outstanding. See [`serve`].
+///
+/// `notices` is `None` when the reporting thread could not be started; every
+/// message then goes down the decision lane, which is the pre-split behaviour.
+#[cfg(windows)]
+fn receive_until_the_port_ends(
+    port: isize,
+    decisions: Sender<Received>,
+    notices: Option<&Sender<Received>>,
+) {
+    use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Storage::InstallableFileSystems::FilterGetMessage;
+    let port = HANDLE(port as *mut core::ffi::c_void);
     let mut buffer = ReceiveBuffer::zeroed();
     loop {
-        if stop.load(Ordering::SeqCst) {
-            return;
-        }
         // Cleared before every receive rather than after: the filter manager
         // does not report how long the message it wrote is, so a byte it did
         // *not* write has to read as zero rather than as the tail of the
@@ -1925,7 +2110,7 @@ fn serve(port: &windows::Win32::Foundation::HANDLE, dispatcher: &mut Dispatcher,
         // no `OVERLAPPED` is passed, so the call is synchronous and the buffer
         // is not touched after it returns.
         let outcome = unsafe {
-            FilterGetMessage(*port, buffer.header(), RECEIVE_BYTES as u32, None)
+            FilterGetMessage(port, buffer.header(), RECEIVE_BYTES as u32, None)
         };
         if let Err(error) = outcome {
             let code = crate::win32::code(&error);
@@ -1946,7 +2131,77 @@ fn serve(port: &windows::Win32::Foundation::HANDLE, dispatcher: &mut Dispatcher,
             }
             return;
         }
-        match dispatcher.handle(received(buffer.bytes())) {
+        let message = received(buffer.bytes());
+        let routed = match (lane(&message), notices) {
+            (Lane::Events, Some(notices)) => notices.send(message),
+            _ => decisions.send(message),
+        };
+        if routed.is_err() {
+            // The thread that lane belongs to has gone, so there is nothing
+            // left to decide or report, and no one to answer.
+            return;
+        }
+    }
+}
+
+/// Report the messages that are not decisions, on their own thread.
+///
+/// Nothing here can block: `driver::translate` copies fields and [`publish`]
+/// hands the event to a channel. That is the point of the lane — see [`serve`]
+/// for the measurement that made events stop arriving behind a scan.
+#[cfg(windows)]
+fn report_events(messages: &Receiver<Received>, events: &Sender<Event>) {
+    loop {
+        // No stop flag: this thread ends when the receive thread drops the last
+        // sender, which happens when the port ends or the service stops, and
+        // the two are the same event from here.
+        let message = match messages.recv() {
+            Ok(message) => message,
+            Err(_) => return,
+        };
+        match message {
+            Received::Event(event) => publish(events, Event::Driver(driver::translate(&event))),
+            Received::Unreadable { reason } => {
+                log::debug!("a driver message was ignored: {reason}")
+            }
+            // [`lane`] puts these on the decision lane. A message here is a
+            // defect in that function, and it is said rather than decided on a
+            // thread that holds no engine.
+            Received::DecisionRequest(_) | Received::Status(_) => {
+                log::error!("a decision message reached the event thread; it was not answered")
+            }
+        }
+    }
+}
+
+/// Decide the messages the receive thread hands over on the decision lane, and
+/// answer the driver.
+///
+/// Only [`Lane::Decide`] messages arrive here; the rest are reported by
+/// [`report_events`]. What this loop blocks on — one scan at a time, up to
+/// `DECISION_DEADLINE` — is therefore no longer in front of anything else.
+///
+/// `stop` is checked between messages and not during one; see this module's
+/// documentation for why that window cannot be closed.
+#[cfg(windows)]
+fn serve_messages(
+    port: &windows::Win32::Foundation::HANDLE,
+    messages: &Receiver<Received>,
+    dispatcher: &mut Dispatcher,
+    events: &Sender<Event>,
+    stop: &AtomicBool,
+) {
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        let message = match messages.recv_timeout(INBOX_POLL) {
+            Ok(message) => message,
+            Err(RecvTimeoutError::Timeout) => continue,
+            // The receive thread has ended: the connection is over.
+            Err(RecvTimeoutError::Disconnected) => return,
+        };
+        match dispatcher.handle(message) {
             Action::Reply(reply) => reply_to_driver(*port, reply),
             Action::ReplyAndReport(reply, detection) => {
                 // The order matters, and it is not the obvious one. The driver
@@ -2087,6 +2342,32 @@ mod tests {
             Dispatcher::on_a_deadline(engine, events, deadline, allow, own_tree),
             published,
         )
+    }
+
+    /// Every message kind reaches the lane that serves it.
+    ///
+    /// The routing is the whole of the 2026-10-18 split: a decision arriving on
+    /// the reporting lane is dropped with an error, and an event that reached
+    /// the decision lane is behind a scan again. [`lane`] is exhaustive, so
+    /// what this test pins is the four answers rather than a default.
+    #[test]
+    fn every_message_kind_takes_the_lane_that_serves_it() {
+        use av_driver_proto::wire::{EventMessage, StatusMessage};
+
+        let request = request_for(r"C:\Windows\notepad.exe");
+        assert_eq!(lane(&Received::DecisionRequest(request)), Lane::Decide);
+        assert_eq!(
+            lane(&Received::Status(StatusMessage::new(DriverStatus::default()))),
+            Lane::Decide
+        );
+        let event = EventMessage::new(1, 0, SubjectKind::Process, EventAction::ProcessStarted);
+        assert_eq!(lane(&Received::Event(event)), Lane::Events);
+        assert_eq!(
+            lane(&Received::Unreadable {
+                reason: "a message this build cannot read".to_string()
+            }),
+            Lane::Events
+        );
     }
 
     /// The bytes of a protocol structure, for feeding the reader under test.

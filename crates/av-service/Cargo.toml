@@ -13,6 +13,7 @@ name = "wenle-av-service"
 path = "src/main.rs"
 
 [dependencies]
+av-behaviour.workspace = true
 av-core.workspace = true
 av-driver-proto.workspace = true
 # Self-protection: this service protects its own process, its own directories

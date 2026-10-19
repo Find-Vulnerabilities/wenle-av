@@ -724,6 +724,14 @@ pub struct DriverEvent {
     pub path: Option<PathBuf>,
     /// The process responsible, when there is one.
     pub process_id: u32,
+    /// The process that created [`DriverEvent::process_id`], for a process
+    /// start. Zero for every other action, and for a creation whose parent has
+    /// already exited.
+    ///
+    /// Carried rather than looked up later by the consumer: `parent_process_id`
+    /// is only knowable at creation time, and the creating process may be gone
+    /// before anything reads the report.
+    pub parent_process_id: u32,
     /// The thread responsible, when there is one.
     pub thread_id: u32,
     /// Action-specific detail. Meaningless without [`DriverEvent::action`],
@@ -766,6 +774,23 @@ pub enum DriverEventAction {
     StateChanged,
     /// The driver's event queue overflowed.
     EventsDropped,
+    /// A file was renamed or moved, reported since 2026-10-18.
+    ///
+    /// `path` is the **new** name when the driver could resolve it. `detail` is
+    /// 1 when it could not — a rename relative to a directory handle — and the
+    /// path is then the old name.
+    FileRenamed,
+    /// A delete was requested on a file, reported since 2026-10-18.
+    ///
+    /// "A delete was asked for", not "the file is gone": the file goes when the
+    /// last handle closes, which may be after the event and may be never.
+    FileDeleted,
+    /// A registry key or value changed, reported since 2026-10-18.
+    ///
+    /// `detail` says which change: 1 a key was created, 2 a key was deleted, 3 a
+    /// value was set, 4 a value was deleted, 5 a key was renamed. The codes are
+    /// `av_driver_proto::event::EventAction`'s `REGISTRY_*` constants.
+    RegistryChanged,
     /// An action code this build does not define, carried rather than dropped.
     Unrecognised {
         /// The wire code, so a reader can log it and a later build can name it.
@@ -833,6 +858,13 @@ pub enum DriverSubject {
     /// every consumer already reads `subject`, and a second field that only one
     /// producer fills is a field every match has to be extended for anyway.
     Configuration,
+    /// A registry key or value, reported since 2026-10-18.
+    ///
+    /// Separate from [`DriverSubject::File`] because the `path` is in a
+    /// different namespace — `\REGISTRY\MACHINE\...`, not a DOS path. For the
+    /// two value classes the path is the key path with `\` and the value name
+    /// appended, which is how `regedit` spells one.
+    Registry,
     /// A subject code this build does not define.
     Unrecognised {
         /// The wire code.
@@ -929,6 +961,7 @@ mod tests {
                 subject: DriverSubject::Process,
                 path: Some(PathBuf::from(r"C:\Users\me\evil.exe")),
                 process_id: 1234,
+                parent_process_id: 1200,
                 thread_id: 5678,
                 detail: 0,
                 driver_state: None,

@@ -94,6 +94,28 @@ pub type FltGenericWorkItem = *mut c_void;
 pub const IRP_MJ_CREATE: u8 = 0x00;
 /// `IRP_MJ_WRITE`, from `wdm.h`. Reported, never refused.
 pub const IRP_MJ_WRITE: u8 = 0x04;
+
+/// `IRP_MJ_SET_INFORMATION`, from `wdm.h` 30896. Renames and deletions.
+pub const IRP_MJ_SET_INFORMATION: u8 = 0x06;
+
+/// `FileRenameInformation`, from `wdm.h` 7833.
+pub const FILE_RENAME_INFORMATION_CLASS: u32 = 10;
+
+/// `FileDispositionInformation`, from `wdm.h` 7836. A delete requested by
+/// setting the disposition; the file goes when the last handle closes.
+pub const FILE_DISPOSITION_INFORMATION_CLASS: u32 = 13;
+
+/// `FileDispositionInformationEx`, from `wdm.h` 7901.
+pub const FILE_DISPOSITION_INFORMATION_EX_CLASS: u32 = 64;
+
+/// `FileRenameInformationEx`, from `wdm.h` 7902. Same structure as
+/// [`FILE_RENAME_INFORMATION_CLASS`], with a flags word in place of the single
+/// "replace if exists" byte.
+pub const FILE_RENAME_INFORMATION_EX_CLASS: u32 = 65;
+
+/// `FILE_DISPOSITION_DELETE`, from `ntddk.h` 5000: the bit in
+/// `FILE_DISPOSITION_INFORMATION_EX::Flags` that requests a delete.
+pub const FILE_DISPOSITION_DELETE: u32 = 0x0000_0001;
 /// `IRP_MJ_ACQUIRE_FOR_SECTION_SYNCHRONIZATION`, from `fltKernel.h`.
 ///
 /// Not a major function in the I/O manager's table: `fltKernel.h` defines it as
@@ -538,6 +560,22 @@ pub const EVENT_TAG: u32 = u32::from_le_bytes(*b"WlEv");
 /// tag, from [`EVENT_TAG`].
 pub const PROCESS_EVENT_TAG: u32 = u32::from_le_bytes(*b"WlPs");
 
+/// Four characters read as a little-endian `u32`: `WlFl`.
+///
+/// A rename or delete notification carries a path, like a process-start
+/// notification does, and has its own block for the same reason: a tag is what
+/// a dump reader uses to find the owner of a pool allocation, and the sizes are
+/// what make the blocks separate rather than a preference.
+pub const FILE_EVENT_TAG: u32 = u32::from_le_bytes(*b"WlFl");
+
+/// Four characters read as a little-endian `u32`: `WlRg`.
+///
+/// A registry notification's block has the same shape as a file event's — a
+/// header and a path — but a tag of its own, because the two are freed by
+/// different workers and a dump reader that found the wrong one would be told
+/// the wrong thing about who allocated it.
+pub const REGISTRY_EVENT_TAG: u32 = u32::from_le_bytes(*b"WlRg");
+
 /// `PFLT_FILTER_UNLOAD_CALLBACK`, `fltKernel.h` line 2033:
 ///
 /// ```c
@@ -748,7 +786,102 @@ pub union FltParameters {
     /// `AcquireForSectionSynchronization`, the arm
     /// `IRP_MJ_ACQUIRE_FOR_SECTION_SYNCHRONIZATION` reads.
     pub acquire_for_section: FltSectionParameters,
+    /// `SetFileInformation`, the arm `IRP_MJ_SET_INFORMATION` reads for renames
+    /// and deletions.
+    pub set_file_information: FltSetFileInformationParameters,
     _span: [usize; 32],
+}
+
+/// The `SetFileInformation` arm, from `fltKernel.h` 402-416.
+///
+/// ```c
+/// struct {
+///     ULONG Length;
+///     FILE_INFORMATION_CLASS POINTER_ALIGNMENT FileInformationClass;
+///     PFILE_OBJECT ParentOfTarget;
+///     union {
+///         struct { BOOLEAN ReplaceIfExists; BOOLEAN AdvanceOnly; };
+///         ULONG ClusterCount;
+///         HANDLE DeleteHandle;
+///     };
+///     PVOID InfoBuffer;       //Not in IO_STACK_LOCATION parameters list
+/// } SetFileInformation;
+/// ```
+///
+/// The buffer is `InfoBuffer` here and **not** `FileInformation`: the filter
+/// manager's copy of the parameters is not the I/O manager's, and the header
+/// says so in a comment on that very line. A wrong name would have put the
+/// driver one pointer away from the rename data.
+///
+/// `FileInformationClass` carries `POINTER_ALIGNMENT`, which on x64 means the
+/// eight-byte boundary; the offsets are asserted at the bottom of this file.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FltSetFileInformationParameters {
+    /// `ULONG Length`: the size of the buffer `info_buffer` points at.
+    pub length: u32,
+    _pad0: u32,
+    /// `FILE_INFORMATION_CLASS`, eight-byte aligned.
+    pub file_information_class: u32,
+    _pad1: u32,
+    /// `PFILE_OBJECT ParentOfTarget`. Not read here.
+    pub parent_of_target: *mut c_void,
+    /// The union: `ReplaceIfExists`/`AdvanceOnly`, `ClusterCount` or
+    /// `DeleteHandle`. Not read here; the buffer says what the operation is.
+    pub union_word: usize,
+    /// The information buffer itself.
+    pub info_buffer: *mut c_void,
+}
+
+/// The fixed part of `FILE_RENAME_INFORMATION`, from `ntifs.h` 7210.
+///
+/// ```c
+/// typedef struct _FILE_RENAME_INFORMATION {
+///     union { BOOLEAN ReplaceIfExists; ULONG Flags; };
+///     HANDLE RootDirectory;
+///     ULONG FileNameLength;
+///     WCHAR FileName[1];
+/// } FILE_RENAME_INFORMATION;
+/// ```
+///
+/// The name follows the header **at offset 20** -- not at the offset
+/// `size_of` gives, which is 24 after the trailing alignment. `file_name` is a
+/// pointer into the buffer rather than an array here, because the caller owns
+/// the buffer and the header arithmetic is the whole point.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FileRenameInformation {
+    /// `BOOLEAN ReplaceIfExists` (`FileRenameInformation`) or `ULONG Flags`
+    /// (`FileRenameInformationEx`). Not read here.
+    pub flags: u32,
+    _pad: u32,
+    /// `HANDLE RootDirectory`: null when `file_name` is a fully qualified path.
+    pub root_directory: *mut c_void,
+    /// `ULONG FileNameLength`, in bytes.
+    pub file_name_length: u32,
+    // The `FileName` array follows at FILE_RENAME_NAME_OFFSET.
+}
+
+/// Offset of `FileName` within `FILE_RENAME_INFORMATION`
+/// (`ntifs.h` 7221), which is the sum of a four-byte union, four bytes of
+/// padding, a pointer and a `ULONG`.
+pub const FILE_RENAME_NAME_OFFSET: usize = 20;
+
+/// `FILE_DISPOSITION_INFORMATION`, from `ntddk.h` 4994.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FileDispositionInformation {
+    /// True requests the delete.
+    pub delete_file: u8,
+}
+
+/// `FILE_DISPOSITION_INFORMATION_EX`, from `ntddk.h` 5008.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FileDispositionInformationEx {
+    /// A mask of `FILE_DISPOSITION_*`; [`FILE_DISPOSITION_DELETE`] is the one
+    /// that asks for a delete.
+    pub flags: u32,
 }
 
 /// The `Create` arm's leading field.
@@ -879,6 +1012,106 @@ pub const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
 /// `OBJ_KERNEL_HANDLE`, from `wdm.h`. Required: a port name created with a
 /// user-mode handle would be openable by anything that guessed it.
 pub const OBJ_KERNEL_HANDLE: u32 = 0x0000_0200;
+
+// ---------------------------------------------------------------------------
+// Registry callbacks (`CmRegisterCallbackEx`)
+// ---------------------------------------------------------------------------
+
+/// `REG_NOTIFY_CLASS` values, from `wdm.h` 28426-28480.
+///
+/// The enum is full of aliases -- `RegNtPreSetValueKey` is `RegNtSetValueKey`,
+/// and for the delete classes there is no separate "pre" enumerator at all --
+/// so these are written against the first enumeration and named after the
+/// notification the callback actually receives. The numbers are asserted in the
+/// block at the bottom of this file, where a header change shows up as a failed
+/// build rather than as a callback that silently never fires.
+///
+/// `RegNtPreCreateKeyEx` is 26 rather than 20 because the twelve `.Net only`
+/// post-notifications sit between the two groups in the enumeration; the count
+/// is not guessable and was read from the header.
+pub const REG_NT_DELETE_KEY: i32 = 0;
+/// A value is being written. `RegNtPreSetValueKey`, the first class that
+/// matters for autostart persistence.
+pub const REG_NT_SET_VALUE_KEY: i32 = 1;
+/// A value is being deleted. Same alias relationship as above.
+pub const REG_NT_DELETE_VALUE_KEY: i32 = 2;
+/// A key is being renamed. `RegNtPreRenameKey`.
+pub const REG_NT_RENAME_KEY: i32 = 4;
+/// A key is being created, with the complete name in the information block.
+pub const REG_NT_PRE_CREATE_KEY_EX: i32 = 26;
+
+/// `REG_DELETE_KEY_INFORMATION`, from `wdm.h` 28520. Only `Object` is read.
+#[repr(C)]
+pub struct RegDeleteKeyInformation {
+    /// The key object, passed to [`CmCallbackGetKeyObjectIDEx`].
+    pub object: *mut c_void,
+    /// `CallContext`, `ObjectContext`, `Reserved`. Not read.
+    _rest: [usize; 3],
+}
+
+/// `REG_SET_VALUE_KEY_INFORMATION`, from `wdm.h` 28531.
+#[repr(C)]
+pub struct RegSetValueKeyInformation {
+    /// The key object the value is being written under.
+    pub object: *mut c_void,
+    /// The value's name, as a counted string.
+    pub value_name: *mut UnicodeString,
+    /// `TitleIndex`, `Type`, `Data`, `DataSize`, `CallContext`,
+    /// `ObjectContext`, `Reserved` -- eight bytes of scalars, then five
+    /// pointers. Not read.
+    _rest: [usize; 6],
+}
+
+/// `REG_DELETE_VALUE_KEY_INFORMATION`, from `wdm.h` 28543.
+#[repr(C)]
+pub struct RegDeleteValueKeyInformation {
+    /// The key object.
+    pub object: *mut c_void,
+    /// The value's name.
+    pub value_name: *mut UnicodeString,
+    /// `CallContext`, `ObjectContext`, `Reserved`. Not read.
+    _rest: [usize; 3],
+}
+
+/// `REG_RENAME_KEY_INFORMATION`, from `wdm.h` 28620.
+#[repr(C)]
+pub struct RegRenameKeyInformation {
+    /// The key being renamed.
+    pub object: *mut c_void,
+    /// `NewName`: the new name **relative to the parent**, which is why the
+    /// event carries the object's own path rather than this.
+    pub new_name: *mut UnicodeString,
+    /// `CallContext`, `ObjectContext`, `Reserved`. Not read.
+    _rest: [usize; 3],
+}
+
+/// The leading member of `REG_CREATE_KEY_INFORMATION`, from `wdm.h` 28637.
+///
+/// Only `CompleteName` is read, and it is at offset zero in both this structure
+/// and `REG_CREATE_KEY_INFORMATION_V1` -- the two differ from the fifth field
+/// on -- so the same reader serves whichever one the kernel passes to a
+/// `RegNtPreCreateKeyEx` callback.
+#[repr(C)]
+pub struct RegCreateKeyInformation {
+    /// The full path of the key being created, in the registry namespace
+    /// (`\REGISTRY\MACHINE\...`). Not a relative name.
+    pub complete_name: *mut UnicodeString,
+    /// The fourteen members after it. Not read.
+    _rest: [usize; 14],
+}
+
+/// `EX_CALLBACK_FUNCTION`, from `wdm.h` 28338.
+///
+/// `Argument1` is the `REG_NOTIFY_CLASS` as a value cast to a pointer, and
+/// `Argument2` is the information block for that class, or null where the class
+/// has none. This one never returns a status other than success: a registry
+/// callback may refuse an operation by returning a failure, and this driver
+/// does not -- the same boundary the rename and delete telemetry draws.
+pub type RegistryNotifyCallback = unsafe extern "system" fn(
+    callback_context: *mut c_void,
+    argument1: *mut c_void,
+    argument2: *mut c_void,
+) -> NtStatus;
 
 #[link(name = "fltMgr")]
 extern "system" {
@@ -1054,6 +1287,52 @@ extern "system" {
     /// was allocated with; freeing with a different one corrupts the pool
     /// accounting rather than failing.
     pub fn ExFreePoolWithTag(base: *mut c_void, tag: u32);
+
+    /// `CmRegisterCallbackEx`, from `wdm.h` 28827.
+    ///
+    /// `altitude` is a counted string of decimal digits and is an ordering hint
+    /// between registry callbacks, not a security boundary. `driver` is the
+    /// `PDRIVER_OBJECT` the loader passed to `DriverEntry`; the kernel keeps the
+    /// association. `cookie` is an out-parameter the unregister call needs, and
+    /// `reserved` must be null.
+    ///
+    /// `_IRQL_requires_max_(APC_LEVEL)`: called from `DriverEntry`, which is
+    /// passive.
+    pub fn CmRegisterCallbackEx(
+        function: RegistryNotifyCallback,
+        altitude: *const UnicodeString,
+        driver: *mut c_void,
+        context: *mut c_void,
+        cookie: *mut i64,
+        reserved: *mut c_void,
+    ) -> NtStatus;
+
+    /// `CmUnRegisterCallback`, from `wdm.h` 28819. Waits for callbacks already
+    /// running on other threads, so nothing of ours can be inside one when it
+    /// returns.
+    pub fn CmUnRegisterCallback(cookie: i64) -> NtStatus;
+
+    /// `CmCallbackGetKeyObjectIDEx`, from `wdm.h` 28892.
+    ///
+    /// Answers the full path of a key object as a counted string in the registry
+    /// namespace, and is the only way to name a key from inside a callback: the
+    /// object is opaque and the information blocks carry no path (except
+    /// create-key, which has `CompleteName`). The string is allocated by this
+    /// call and released by [`CmCallbackReleaseKeyObjectIDEx`]; `flags` must be
+    /// zero.
+    ///
+    /// `_IRQL_requires_max_(APC_LEVEL)`, which a registry callback satisfies:
+    /// the kernel calls them at passive level.
+    pub fn CmCallbackGetKeyObjectIDEx(
+        cookie: *const i64,
+        object: *mut c_void,
+        object_id: *mut usize,
+        object_name: *mut *mut UnicodeString,
+        flags: u32,
+    ) -> NtStatus;
+
+    /// `CmCallbackReleaseKeyObjectIDEx`, from `wdm.h` 28903.
+    pub fn CmCallbackReleaseKeyObjectIDEx(object_name: *mut UnicodeString);
 
     /// `PsGetProcessImageFileName`, declared here because **no header declares
     /// it**.
@@ -1487,6 +1766,71 @@ const _: () = {
     assert!(core::mem::offset_of!(FltSectionParameters, sync_type) == 0);
     assert!(core::mem::offset_of!(FltSectionParameters, page_protection) == 4);
     assert!(core::mem::size_of::<FltSectionParameters>() == 8);
+
+    // `SetFileInformation` (`fltKernel.h` 402-416): `Length`, the
+    // pointer-aligned class, `ParentOfTarget`, the union word and `InfoBuffer`.
+    // The buffer is `InfoBuffer` and not `FileInformation`, and it is the last
+    // field: reading it one word early would hand the rename parser a pointer
+    // to the union instead of to the rename data.
+    assert!(core::mem::offset_of!(FltSetFileInformationParameters, length) == 0);
+    assert!(
+        core::mem::offset_of!(FltSetFileInformationParameters, file_information_class) == 8
+    );
+    assert!(
+        core::mem::offset_of!(FltSetFileInformationParameters, parent_of_target) == 16
+    );
+    assert!(core::mem::offset_of!(FltSetFileInformationParameters, union_word) == 24);
+    assert!(core::mem::offset_of!(FltSetFileInformationParameters, info_buffer) == 32);
+    assert!(core::mem::size_of::<FltSetFileInformationParameters>() == 40);
+
+    // `FILE_RENAME_INFORMATION` (`ntifs.h` 7210): the four-byte union, four
+    // bytes of padding, the root handle, the length, and then the name at 20.
+    // The offset is the assertion that matters -- `size_of` rounds the header to
+    // 24, and reading `FileName` there would drop the first two characters of
+    // every renamed file.
+    assert!(core::mem::offset_of!(FileRenameInformation, root_directory) == 8);
+    assert!(core::mem::offset_of!(FileRenameInformation, file_name_length) == 16);
+    assert!(FILE_RENAME_NAME_OFFSET == 20);
+
+    // The two disposition structures: one byte, and a flags word.
+    assert!(core::mem::size_of::<FileDispositionInformation>() == 1);
+    assert!(core::mem::offset_of!(FileDispositionInformationEx, flags) == 0);
+    assert!(core::mem::size_of::<FileDispositionInformationEx>() == 4);
+
+    // `wdm.h` 7833-7902. Spelled out because the callback compares these
+    // numbers against what the I/O manager put in the parameter block, and a
+    // wrong one silently reports the wrong operations.
+    assert!(FILE_RENAME_INFORMATION_CLASS == 10);
+    assert!(FILE_DISPOSITION_INFORMATION_CLASS == 13);
+    assert!(FILE_DISPOSITION_INFORMATION_EX_CLASS == 64);
+    assert!(FILE_RENAME_INFORMATION_EX_CLASS == 65);
+
+    // `REG_NOTIFY_CLASS` (`wdm.h` 28426-28480). The four that are not zero are
+    // spelled out because a wrong number here is a callback that never matches
+    // -- the registry monitor would register correctly, load correctly, and
+    // report nothing, which is the same symptom as a driver that was never
+    // asked to.
+    assert!(REG_NT_DELETE_KEY == 0);
+    assert!(REG_NT_SET_VALUE_KEY == 1);
+    assert!(REG_NT_DELETE_VALUE_KEY == 2);
+    assert!(REG_NT_RENAME_KEY == 4);
+    assert!(REG_NT_PRE_CREATE_KEY_EX == 26);
+
+    // The registry information blocks (`wdm.h` 28518-28662). Every member the
+    // callback reads is the first one, so offset zero is the whole of what has
+    // to be right -- and the sizes are asserted so that the opaque spans behind
+    // them cannot drift into overlapping the members that follow.
+    assert!(core::mem::offset_of!(RegDeleteKeyInformation, object) == 0);
+    assert!(core::mem::size_of::<RegDeleteKeyInformation>() == 32);
+    assert!(core::mem::offset_of!(RegSetValueKeyInformation, object) == 0);
+    assert!(core::mem::offset_of!(RegSetValueKeyInformation, value_name) == 8);
+    assert!(core::mem::size_of::<RegSetValueKeyInformation>() == 64);
+    assert!(core::mem::offset_of!(RegDeleteValueKeyInformation, value_name) == 8);
+    assert!(core::mem::size_of::<RegDeleteValueKeyInformation>() == 40);
+    assert!(core::mem::offset_of!(RegRenameKeyInformation, new_name) == 8);
+    assert!(core::mem::size_of::<RegRenameKeyInformation>() == 40);
+    assert!(core::mem::offset_of!(RegCreateKeyInformation, complete_name) == 0);
+    assert!(core::mem::size_of::<RegCreateKeyInformation>() == 120);
 
     // `ntifs.h` 19808-19810. `SyncTypeOther` first, so the value a zeroed
     // structure carries is "not a creation" -- which is the answer that asks

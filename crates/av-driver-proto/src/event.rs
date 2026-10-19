@@ -45,6 +45,15 @@ pub enum SubjectKind {
     /// status rather than through this: the driver's port carries this driver's
     /// registrations, and nothing about a user-mode DACL travels on it.
     Protection,
+    /// A registry key or value, reported since 2026-10-18.
+    ///
+    /// Distinct from [`SubjectKind::File`] because the `path` field carries a
+    /// different namespace: `\REGISTRY\MACHINE\...` rather than a DOS path, and
+    /// a rule that matched one against the other would be matching against a
+    /// string that cannot exist. For the two value classes the path is the key
+    /// path with `\` and the value name appended, which is how the registry's
+    /// own tools spell one.
+    Registry,
 }
 
 impl SubjectKind {
@@ -58,6 +67,8 @@ impl SubjectKind {
     pub const WIRE_DRIVER: u32 = 4;
     /// The kernel-side self-protection registrations.
     pub const WIRE_PROTECTION: u32 = 5;
+    /// A registry key or value.
+    pub const WIRE_REGISTRY: u32 = 6;
 
     /// The value that goes on the wire. Zero is never a valid subject, so a
     /// zeroed field is a bug rather than `File`.
@@ -68,6 +79,7 @@ impl SubjectKind {
             SubjectKind::Image => Self::WIRE_IMAGE,
             SubjectKind::Driver => Self::WIRE_DRIVER,
             SubjectKind::Protection => Self::WIRE_PROTECTION,
+            SubjectKind::Registry => Self::WIRE_REGISTRY,
         }
     }
 
@@ -79,6 +91,7 @@ impl SubjectKind {
             Self::WIRE_IMAGE => Some(SubjectKind::Image),
             Self::WIRE_DRIVER => Some(SubjectKind::Driver),
             Self::WIRE_PROTECTION => Some(SubjectKind::Protection),
+            Self::WIRE_REGISTRY => Some(SubjectKind::Registry),
             _ => None,
         }
     }
@@ -91,6 +104,7 @@ impl SubjectKind {
             SubjectKind::Image => "image",
             SubjectKind::Driver => "driver",
             SubjectKind::Protection => "protection",
+            SubjectKind::Registry => "registry",
         }
     }
 }
@@ -145,6 +159,35 @@ pub enum EventAction {
     /// a thousand events sees a quiet machine. The count of what was lost goes
     /// in `detail`.
     EventsDropped,
+    /// A file was renamed or moved, reported since 2026-10-18.
+    ///
+    /// `path` is the **new** name when the driver could resolve it, because
+    /// that is the name a ransomware-shaped rule looks at (a document becoming
+    /// `7f3a91c2.locked`), and the creating file is the same one the delete and
+    /// write events name. `detail` is 1 when the target was relative to a
+    /// directory handle and could not be resolved with the information
+    /// available in a pre-operation; in that case `path` is the old name and the
+    /// reader knows the target is unknown rather than unchanged.
+    FileRenamed,
+    /// A delete was requested on a file, reported since 2026-10-18.
+    ///
+    /// The disposition is set here and the file goes when the last handle
+    /// closes, so this is "a delete was asked for", not "the file is gone".
+    /// `path` is the file.
+    FileDeleted,
+    /// A registry key or value changed, reported since 2026-10-18.
+    ///
+    /// The driver registers for five `REG_NOTIFY_CLASS`es — key created, key
+    /// deleted, value set, value deleted, key renamed — and `detail` says which
+    /// one this is (1 to 5; see [`Self::REGISTRY_KEY_CREATED`] and its
+    /// siblings). `path` is the key's full object path
+    /// (`\REGISTRY\MACHINE\SOFTWARE\...`) with `\` and the value name appended
+    /// for the two value classes.
+    ///
+    /// Never refused: `CmRegisterCallbackEx`'s callback may only fail a create
+    /// with an elevated privilege, and refusing a registry write from a
+    /// security product is how a machine stops booting.
+    RegistryChanged,
 }
 
 impl EventAction {
@@ -164,6 +207,23 @@ impl EventAction {
     pub const WIRE_STATE_CHANGED: u32 = 6;
     /// Events were discarded.
     pub const WIRE_EVENTS_DROPPED: u32 = 7;
+    /// A file was renamed or moved.
+    pub const WIRE_FILE_RENAMED: u32 = 9;
+    /// A delete was requested on a file.
+    pub const WIRE_FILE_DELETED: u32 = 10;
+    /// A registry key or value changed.
+    pub const WIRE_REGISTRY_CHANGED: u32 = 11;
+
+    /// The `detail` of [`EventAction::RegistryChanged`] for a key being created.
+    pub const REGISTRY_KEY_CREATED: u32 = 1;
+    /// The `detail` for a key being deleted.
+    pub const REGISTRY_KEY_DELETED: u32 = 2;
+    /// The `detail` for a value being set.
+    pub const REGISTRY_VALUE_SET: u32 = 3;
+    /// The `detail` for a value being deleted.
+    pub const REGISTRY_VALUE_DELETED: u32 = 4;
+    /// The `detail` for a key being renamed.
+    pub const REGISTRY_KEY_RENAMED: u32 = 5;
 
     /// The value that goes on the wire. Zero is never valid, so a zeroed field
     /// is a bug rather than a heartbeat.
@@ -177,6 +237,9 @@ impl EventAction {
             EventAction::Heartbeat => Self::WIRE_HEARTBEAT,
             EventAction::StateChanged => Self::WIRE_STATE_CHANGED,
             EventAction::EventsDropped => Self::WIRE_EVENTS_DROPPED,
+            EventAction::FileRenamed => Self::WIRE_FILE_RENAMED,
+            EventAction::FileDeleted => Self::WIRE_FILE_DELETED,
+            EventAction::RegistryChanged => Self::WIRE_REGISTRY_CHANGED,
         }
     }
 
@@ -191,6 +254,9 @@ impl EventAction {
             Self::WIRE_HEARTBEAT => Some(EventAction::Heartbeat),
             Self::WIRE_STATE_CHANGED => Some(EventAction::StateChanged),
             Self::WIRE_EVENTS_DROPPED => Some(EventAction::EventsDropped),
+            Self::WIRE_FILE_RENAMED => Some(EventAction::FileRenamed),
+            Self::WIRE_FILE_DELETED => Some(EventAction::FileDeleted),
+            Self::WIRE_REGISTRY_CHANGED => Some(EventAction::RegistryChanged),
             _ => None,
         }
     }
@@ -211,7 +277,7 @@ impl EventAction {
 
     /// Whether the driver may refuse the operation this action describes.
     ///
-    /// Two of the eight, and the test below pins the other six as not-refusable.
+    /// Two of the ten, and the test below pins the other eight as not-refusable.
     /// Most of them cannot be refused at all: they describe something that has
     /// already happened by the time the driver sees it.
     /// [`EventAction::ImageLoaded`] is a post-callback by construction —
@@ -242,16 +308,22 @@ impl EventAction {
 
     /// Whether `detail` carries a meaning for this action.
     ///
-    /// The three that do: `StateChanged` puts the new [`DriverState`] there,
-    /// `EventsDropped` puts the number lost, and `FileWritten` puts the number
-    /// of bytes written, saturated at `u32::MAX`. A reader that trusted this
-    /// for the wrong action would print a byte count as an error code, which is
-    /// why the predicate exists rather than the field being documented as
+    /// The five that do: `StateChanged` puts the new [`DriverState`] there,
+    /// `EventsDropped` puts the number lost, `FileWritten` puts the number of
+    /// bytes written (saturated at `u32::MAX`), `FileRenamed` puts 1 there when
+    /// the target name could not be resolved, and `RegistryChanged` puts one of
+    /// the `REGISTRY_*` codes there. A reader that trusted this for the wrong
+    /// action would print a byte count as an error code, which is why the
+    /// predicate exists rather than the field being documented as
     /// sometimes-meaningful.
     pub const fn has_detail(self) -> bool {
         matches!(
             self,
-            EventAction::StateChanged | EventAction::EventsDropped | EventAction::FileWritten
+            EventAction::StateChanged
+                | EventAction::EventsDropped
+                | EventAction::FileWritten
+                | EventAction::FileRenamed
+                | EventAction::RegistryChanged
         )
     }
 }
@@ -646,6 +718,7 @@ mod tests {
             SubjectKind::Image,
             SubjectKind::Driver,
             SubjectKind::Protection,
+            SubjectKind::Registry,
         ];
         let actions = [
             EventAction::ExecutionBlocked,
@@ -656,6 +729,9 @@ mod tests {
             EventAction::Heartbeat,
             EventAction::StateChanged,
             EventAction::EventsDropped,
+            EventAction::FileRenamed,
+            EventAction::FileDeleted,
+            EventAction::RegistryChanged,
         ];
         let severities = [
             SeverityCode::Info,
@@ -721,6 +797,9 @@ mod tests {
             EventAction::Heartbeat,
             EventAction::StateChanged,
             EventAction::EventsDropped,
+            EventAction::FileRenamed,
+            EventAction::FileDeleted,
+            EventAction::RegistryChanged,
         ];
         for (i, a) in actions.iter().enumerate() {
             for b in &actions[i + 1..] {
@@ -820,6 +899,11 @@ mod tests {
         assert!(!EventAction::Heartbeat.is_blockable());
         assert!(!EventAction::StateChanged.is_blockable());
         assert!(!EventAction::EventsDropped.is_blockable());
+        assert!(!EventAction::FileRenamed.is_blockable());
+        assert!(!EventAction::FileDeleted.is_blockable());
+        // `CmRegisterCallbackEx`'s callback may only fail a create with an
+        // elevated privilege, and this driver does not, so this is report-only.
+        assert!(!EventAction::RegistryChanged.is_blockable());
 
         // The two sets agree: whatever is blockable is worth notifying about.
         for action in [
@@ -831,6 +915,9 @@ mod tests {
             EventAction::Heartbeat,
             EventAction::StateChanged,
             EventAction::EventsDropped,
+            EventAction::FileRenamed,
+            EventAction::FileDeleted,
+            EventAction::RegistryChanged,
         ] {
             if action.is_blockable() {
                 assert!(action.is_blocking_event(), "{action:?}");
@@ -986,6 +1073,11 @@ mod tests {
         assert!(EventAction::StateChanged.has_detail());
         assert!(EventAction::EventsDropped.has_detail());
         assert!(EventAction::FileWritten.has_detail());
+        assert!(EventAction::FileRenamed.has_detail());
+        assert!(EventAction::RegistryChanged.has_detail());
+        // A delete request carries nothing in `detail`, and a reader printing it
+        // would be printing a zero as though it were a code.
+        assert!(!EventAction::FileDeleted.has_detail());
         // A heartbeat carries no detail; its `detail` field is zero and means
         // nothing.
         assert!(!EventAction::Heartbeat.has_detail());
@@ -993,6 +1085,28 @@ mod tests {
         // A process start carries its process id in `process_id`, not in
         // `detail`, which is zero and means nothing for this action.
         assert!(!EventAction::ProcessStarted.has_detail());
+    }
+
+    /// The `REGISTRY_*` detail codes are the five `REG_NOTIFY_CLASS`es this
+    /// driver registers for, numbered 1 to 5 in the order the classes are
+    /// declared. Zero is not one of them, because a zeroed `detail` must not read
+    /// as "a key was created".
+    #[test]
+    fn the_registry_detail_codes_are_distinct_and_start_at_one() {
+        let codes = [
+            EventAction::REGISTRY_KEY_CREATED,
+            EventAction::REGISTRY_KEY_DELETED,
+            EventAction::REGISTRY_VALUE_SET,
+            EventAction::REGISTRY_VALUE_DELETED,
+            EventAction::REGISTRY_KEY_RENAMED,
+        ];
+        for (i, a) in codes.iter().enumerate() {
+            assert_ne!(*a, 0, "a registry detail code is zero");
+            for b in &codes[i + 1..] {
+                assert_ne!(a, b, "two registry detail codes collide");
+            }
+        }
+        assert_eq!(codes.iter().copied().max(), Some(codes.len() as u32));
     }
 
     /// The `as_str` renderings must be distinct per enum, since they are what
@@ -1005,6 +1119,7 @@ mod tests {
             SubjectKind::Image,
             SubjectKind::Driver,
             SubjectKind::Protection,
+            SubjectKind::Registry,
         ];
         for (i, a) in subjects.iter().enumerate() {
             for b in &subjects[i + 1..] {

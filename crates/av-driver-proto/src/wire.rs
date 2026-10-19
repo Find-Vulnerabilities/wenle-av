@@ -719,6 +719,20 @@ pub struct EventMessage {
     pub verdict: u32,
     /// The process responsible, when there is one.
     pub process_id: u32,
+    /// The process that created [`EventMessage::process_id`], for events about
+    /// a process creation.
+    ///
+    /// Taken from `PS_CREATE_NOTIFY_INFO::ParentProcessId` (`ntddk.h` 11206),
+    /// which the kernel hands to the notify routine — it costs nothing and it is
+    /// the only place the creator is known for certain. Zero for every other
+    /// action, and for a creation whose parent has already exited.
+    ///
+    /// The value is the *launcher's* identifier, which for a program started
+    /// from Explorer is Explorer, for one started by a script is the script
+    /// host. That is what makes a lineage rule possible: a browser that starts
+    /// `powershell.exe` is a different fact from `powershell.exe` running on its
+    /// own.
+    pub parent_process_id: u32,
     /// The thread responsible, when there is one.
     pub thread_id: u32,
     /// Meaningful length of [`EventMessage::path`]. Not an allocation size.
@@ -726,17 +740,21 @@ pub struct EventMessage {
     /// Action-specific detail: an `NTSTATUS`, a dropped-event count, a driver
     /// state. Meaningless without [`EventMessage::action`].
     pub detail: u32,
+    /// Reserved. A sender writes zero and a receiver does not act on a bit it
+    /// finds set. Present so that the sizes stay whole words; see
+    /// [`EventMessage::SIZE`].
+    pub _reserved: u32,
     /// The path as UTF-16 code units, no terminating NUL.
     pub path: [u16; MAX_PATH_UNITS],
 }
 
 impl EventMessage {
-    /// 24 + 8 + 8 + 4 * 8 = 72, then [`MAX_PATH_BYTES`]. 72 + 2048 = 2120,
+    /// 24 + 8 + 8 + 4 * 10 = 80, then [`MAX_PATH_BYTES`]. 80 + 2048 = 2128,
     /// which is a multiple of 8.
-    pub const SIZE: usize = 72 + MAX_PATH_BYTES;
+    pub const SIZE: usize = 80 + MAX_PATH_BYTES;
 
     /// Offset of [`EventMessage::path`].
-    pub const PATH_OFFSET: usize = 72;
+    pub const PATH_OFFSET: usize = 80;
 
     /// Create an event with `sequence` and `now_100ns`, which the caller stamps
     /// so that a test can produce identical messages.
@@ -756,9 +774,11 @@ impl EventMessage {
             severity: 0,
             verdict: crate::event::VERDICT_NONE,
             process_id: 0,
+            parent_process_id: 0,
             thread_id: 0,
             path_units: 0,
             detail: 0,
+            _reserved: 0,
             path: [0; MAX_PATH_UNITS],
         }
     }
@@ -810,6 +830,7 @@ impl fmt::Debug for EventMessage {
             )
             .field("verdict", &crate::event::verdict_name(self.verdict))
             .field("process_id", &self.process_id)
+            .field("parent_process_id", &self.parent_process_id)
             .field("path_units", &self.path_units)
             .field("detail", &self.detail)
             .field("path", &crate::path::display_u16(self.path()))
@@ -1350,13 +1371,13 @@ mod tests {
         assert_eq!(size_of::<MessagePrefix>(), 24);
         assert_eq!(size_of::<DecisionRequestMessage>(), 2104);
         assert_eq!(size_of::<DecisionReplyMessage>(), 48);
-        assert_eq!(size_of::<EventMessage>(), 2120);
+        assert_eq!(size_of::<EventMessage>(), 2128);
         assert_eq!(size_of::<StatusMessage>(), 80);
         assert_eq!(size_of::<DriverStatus>(), 56);
         assert_eq!(size_of::<DriverStats>(), 64);
         assert_eq!(size_of::<SetModeRequest>(), 16);
         assert_eq!(size_of::<ConfigMessage>(), 2080);
-        assert_eq!(size_of::<EventBatch>(), 16_968);
+        assert_eq!(size_of::<EventBatch>(), 17_032);
 
         // The associated constants must agree with `size_of`, or a driver using
         // them for its `FltSendMessage` lengths is sending a wrong number.
@@ -1454,10 +1475,12 @@ mod tests {
         assert_eq!(offset_of!(EventMessage, severity), 48);
         assert_eq!(offset_of!(EventMessage, verdict), 52);
         assert_eq!(offset_of!(EventMessage, process_id), 56);
-        assert_eq!(offset_of!(EventMessage, thread_id), 60);
-        assert_eq!(offset_of!(EventMessage, path_units), 64);
-        assert_eq!(offset_of!(EventMessage, detail), 68);
-        assert_eq!(offset_of!(EventMessage, path), 72);
+        assert_eq!(offset_of!(EventMessage, parent_process_id), 60);
+        assert_eq!(offset_of!(EventMessage, thread_id), 64);
+        assert_eq!(offset_of!(EventMessage, path_units), 68);
+        assert_eq!(offset_of!(EventMessage, detail), 72);
+        assert_eq!(offset_of!(EventMessage, _reserved), 76);
+        assert_eq!(offset_of!(EventMessage, path), 80);
         assert_eq!(offset_of!(EventMessage, path), EventMessage::PATH_OFFSET);
 
         assert_eq!(offset_of!(DecisionReplyMessage, reply), 0);
@@ -1741,8 +1764,10 @@ mod tests {
         assert!(!is_compatible(0));
         assert!(!is_compatible(crate::ioctl::PROTOCOL_VERSION + 1));
         // Same major, different minor — the case a compatibility rule would
-        // most plausibly allow, and the case that is refused.
-        assert!(!is_compatible(crate::ioctl::PROTOCOL_VERSION | 1));
+        // most plausibly allow, and the case that is refused. The low bit is
+        // *flipped* rather than set: since `0x0001_0001` the current minor is
+        // already odd, and `| 1` would compare the version with itself.
+        assert!(!is_compatible(crate::ioctl::PROTOCOL_VERSION ^ 1));
     }
 
     /// The path accessor is clamped by the array, so a hostile `path_units`

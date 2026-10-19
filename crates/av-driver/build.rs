@@ -184,6 +184,10 @@ const IMPORTS: &[Import] = &[
     Import { name: "ObDereferenceObject", prototype: Some("ObfDereferenceObject"), source: "src/flt.rs", header: "wdm.h" },
     Import { name: "ExAllocatePool2", prototype: None, source: "src/flt.rs", header: "wdm.h" },
     Import { name: "ExFreePoolWithTag", prototype: None, source: "src/flt.rs", header: "wdm.h" },
+    Import { name: "CmRegisterCallbackEx", prototype: None, source: "src/flt.rs", header: "wdm.h" },
+    Import { name: "CmUnRegisterCallback", prototype: None, source: "src/flt.rs", header: "wdm.h" },
+    Import { name: "CmCallbackGetKeyObjectIDEx", prototype: None, source: "src/flt.rs", header: "wdm.h" },
+    Import { name: "CmCallbackReleaseKeyObjectIDEx", prototype: None, source: "src/flt.rs", header: "wdm.h" },
     Import { name: "KeQueryInterruptTimePrecise", prototype: None, source: "src/lib.rs", header: "wdm.h" },
 ];
 

@@ -1,0 +1,29 @@
+[package]
+name = "av-behaviour"
+description = "Behaviour rules: a TOML rule language over kernel events, evaluated on a sliding window"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+av-core.workspace = true
+# The engine consumes the driver's own vocabulary rather than a parallel copy of
+# it: an action this crate could not name is an action the compiler makes
+# somebody look at, which is the same property `av-service::driver` relies on.
+av-ipc.workspace = true
+# The `detail` codes are the driver's constants, not numbers copied into a rule
+# file: a rule that named `registry_value_set` and a driver that renumbered the
+# codes should be a compile error, not a rule that quietly stops matching.
+av-driver-proto.workspace = true
+
+serde.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+[dev-dependencies]

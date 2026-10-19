@@ -319,20 +319,12 @@ pub fn unhonoured() -> Vec<SettingDisclosure> {
         // — it writes a file, always, and `main.rs`'s own module doc says the
         // event log "is not taken". The two numbers claimed no log of this
         // service's own is rotated — one is, at a size fixed in the program.
-        // And `logging.level` was not merely wrong but unreachable: it sat in
+        // `logging.level` was the fourth and the worst: it sat in
         // `needs_restart` promising that a restart would make it work, while
-        // nothing in the workspace reads the key at all. A disclosure that
-        // names a remedy which cannot exist is worse than no disclosure,
-        // because the user's next move is to restart the service and watch
-        // nothing change — the same failure as the `ui.*` keys. See
-        // `the_logging_keys_are_disclosed_as_unread` for what holds this in
-        // place.
-        (
-            "logging.level",
-            "this key is not read, and restarting will not change that: the log level is fixed \
-             in the service when the log opens (debug), so that the control loop's per-request \
-             line is always there to read",
-        ),
+        // nothing in the workspace read the key at all. It left this list on
+        // 2026-10-18, when `main.rs`'s `logging::set_level` began applying it
+        // at start-up; it is now in `needs_restart`, which is the truth for a
+        // level read once when the log opens.
         (
             "logging.to_file",
             "this key is not read: the service opens its log file at startup whether this is \
@@ -454,6 +446,14 @@ pub fn needs_restart() -> Vec<SettingDisclosure> {
             "takes effect at the next service start",
         ),
         ("scanning.trust", "takes effect at the next service start"),
+        (
+            "logging.level",
+            "the level is applied when the service reads the configuration at start-up, so a \
+             change waits for a restart. `info` (the default) hides the `debug` lines -- the \
+             control loop's per-request line and the `process <pid> started` line -- and the \
+             high-volume driver telemetry (every write, rename, delete and registry change) is \
+             `trace`, so a behaviour-test pass needs `trace`",
+        ),
         (
             "scanning.archives",
             "takes effect at the next service start",
@@ -699,29 +699,27 @@ mod tests {
 
     #[test]
     fn the_logging_keys_are_disclosed_as_unread() {
-        // Found false on 2026-10-10, all five of them. `logging.to_file` claimed
-        // the service logs to the Windows event log — it has always written
-        // `%ProgramData%\WenleAV\logs\service.log` and `main.rs`'s own module
-        // doc says the event log "is not taken". The two numbers claimed no log
-        // of this service's own is rotated — `logging::rotate` renames
-        // `service.log` to `service.log.old` at 4 MiB. And `logging.level` was
-        // the worst: it sat in `needs_restart` saying a restart makes it work,
-        // while no code anywhere reads the key, so the remedy it named could
-        // not exist. That is the same failure as the `ui.*` keys one table
-        // down, and it is why this list is asserted rather than trusted.
+        // Found false on 2026-10-10, four of the five. `logging.to_file`
+        // claimed the service logs to the Windows event log — it has always
+        // written `%ProgramData%\WenleAV\logs\service.log` and `main.rs`'s own
+        // module doc says the event log "is not taken". The two numbers claimed
+        // no log of this service's own is rotated — `logging::rotate` renames
+        // `service.log` to `service.log.old` at 4 MiB.
         //
-        // No test in this crate can see whether a key is read — the readers
-        // would live in `main.rs`'s `logging` module and in `av-core` — so what
-        // this pins is that the classification is deliberate. The reading half
-        // is a fact about the workspace, and the way to check it is to grep for
-        // the key: `logging.level` appears in this file and nowhere else.
+        // `logging.level` was the fifth and it left this list on 2026-10-18:
+        // `main.rs`'s `logging::set_level` reads it after the configuration is
+        // loaded, so it is now in `needs_restart` — a level read once when the
+        // log opens is exactly what that list means. See the assertion below.
+        //
+        // No test in this crate can see whether a key is read, so what this
+        // pins is that the classification is deliberate. The reading half is a
+        // fact about the workspace; the way to check it is to grep for the key.
         let stored: Vec<String> = unhonoured()
             .into_iter()
             .map(|disclosure| disclosure.setting)
             .collect();
 
         for unread in [
-            "logging.level",
             "logging.to_file",
             "logging.max_file_size_bytes",
             "logging.max_files",
@@ -731,9 +729,6 @@ mod tests {
                 stored.iter().any(|key| key == unread),
                 "{unread} is not read by anything, so it must be disclosed as unhonoured"
             );
-            // The specific regression: `logging.level` was here, promising that
-            // a restart would make it take effect. A key nothing reads cannot
-            // be waiting for a restart — it is waiting for an implementation.
             assert!(
                 !needs_restart()
                     .iter()
@@ -741,19 +736,31 @@ mod tests {
                 "{unread} is not read even after a restart, so it cannot be disclosed as one"
             );
         }
+    }
 
-        // The one piece of prose a reader acts on: the level this service
-        // actually runs at. It is the reason the key cannot be honoured
-        // (honouring the default `Info` would silence the control loop's
-        // per-request line), and a reason that named the wrong level would send
-        // the user looking for output that is not there. If the level in
-        // `main.rs`'s `logging::init` changes, this reason changes with it.
+    #[test]
+    fn logging_level_is_read_and_disclosed_as_waiting_for_a_restart() {
+        // The key this crate previously disclosed as unhonoured while nothing
+        // read it. `main.rs` reads `loaded.config.logging.level` in both the
+        // service and the console path and calls `logging::set_level`; the
+        // level is then fixed for the life of the process, which is what
+        // `needs_restart` describes.
+        //
+        // The reason names `trace` because that is the level the behaviour
+        // telemetry is logged at — a reason that told a user to set `debug` and
+        // look for write lines would send them after output that never comes.
         assert!(
-            unhonoured()
+            !unhonoured()
                 .iter()
-                .any(|disclosure| disclosure.setting == "logging.level"
-                    && disclosure.reason.contains("debug")),
-            "the reason for logging.level must name the level the service really runs at"
+                .any(|disclosure| disclosure.setting == "logging.level"),
+            "the level is read at start-up, so it must not be disclosed as unhonoured"
+        );
+        assert!(
+            needs_restart().iter().any(|disclosure| {
+                disclosure.setting == "logging.level" && disclosure.reason.contains("trace")
+            }),
+            "a level read once at start-up waits for a restart, and the reason must name the \
+             level the telemetry actually needs"
         );
     }
 

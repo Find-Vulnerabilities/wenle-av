@@ -279,6 +279,10 @@ fn run_service() -> Result<u8, ServiceError> {
     // Only now: see the order note above, and `logging::rotate`.
     logging::rotate(&paths.log_dir);
     let loaded = config::load(&paths);
+    // Before `announce`, so that the start-up report obeys the level the file
+    // asked for -- and because a `trace` level has to be in force before the
+    // host starts feeding it anything.
+    logging::set_level(loaded.config.logging.level);
     announce(&loaded);
 
     match scm::run(paths, loaded) {
@@ -301,6 +305,10 @@ fn run_console() -> Result<u8, ServiceError> {
     // the process that would otherwise rotate a running service's log away.
     logging::rotate(&paths.log_dir);
     let loaded = config::load(&paths);
+    // Before `announce`, so that the start-up report obeys the level the file
+    // asked for -- and because a `trace` level has to be in force before the
+    // host starts feeding it anything.
+    logging::set_level(loaded.config.logging.level);
     announce(&loaded);
 
     let host = av_service::host::Host::open(paths, loaded)?;
@@ -573,8 +581,23 @@ mod logging {
     }
 
     impl log::Log for Logger {
+        /// Whether a record at this level would be written.
+        ///
+        /// **The global maximum, not a value fixed here.** It used to be
+        /// `<= Debug`, and because [`Logger::log`] asks this before it writes,
+        /// that ceiling was a second filter narrower than the one the `log`
+        /// macros apply: `logging.level = "trace"` raised the macro filter to
+        /// `Trace` and `log` dropped the record on the way to the file anyway.
+        /// Every `log::trace!` line in the product is behaviour telemetry —
+        /// the write, rename/delete and registry streams — so the whole of it
+        /// went into a log that could not contain it. Measured in the test VM
+        /// on 2026-10-18: `level = "trace"` in `config.toml`, 13,149 `[DEBUG]`
+        /// lines in `service.log`, and not one `[TRACE]`.
+        ///
+        /// Reading the global maximum also makes [`log::log_enabled!`] tell
+        /// the truth, which the old comparison did not.
         fn enabled(&self, metadata: &log::Metadata) -> bool {
-            metadata.level() <= log::Level::Debug
+            metadata.level() <= log::max_level()
         }
 
         fn log(&self, record: &log::Record) {
@@ -634,8 +657,11 @@ mod logging {
         // process; the first one wins. Not an error: the alternative is a
         // second copy of every line, or none.
         if log::set_logger(logger).is_ok() {
-            // Debug, because the control loop's per-request line is the one a
-            // support conversation actually needs.
+            // Debug until the configuration has been read, and only then:
+            // everything logged between here and `config::load` -- a second
+            // instance's refusal, a log that would not open -- has to be
+            // visible, and the configured level is not known yet. `set_level`
+            // replaces this as soon as the file has been read.
             log::set_max_level(log::LevelFilter::Debug);
         }
         // Remembered so [`rotate`] can move this handle. Set even when
@@ -643,6 +669,36 @@ mod logging {
         // process opened, and that is this one either way.
         let _ = LOGGER.set(logger);
         Ok(())
+    }
+
+    /// Apply `[logging] level` to the log, once the configuration has been read.
+    ///
+    /// This key used to be disclosed as unhonoured, because nothing read it and
+    /// the service ran at a level fixed in `init`. It is read here, which makes
+    /// `trace` reachable — and `trace` is what the driver's high-volume feeds
+    /// (writes, renames, registry changes) are logged at, so without this the
+    /// behaviour telemetry could be sent and never seen.
+    ///
+    /// A bad level cannot reach this: [`crate::config`] parses the file into
+    /// [`av_core::config::LogLevel`], and an unreadable or invalid file falls
+    /// back to the defaults, whose level is `Info`.
+    pub fn set_level(level: av_core::config::LogLevel) {
+        log::set_max_level(filter_for(level));
+    }
+
+    /// The `log` filter a configuration level means, one arm each.
+    ///
+    /// Separate from [`set_level`] so that the mapping is testable: the setter
+    /// is a process-wide call, and the thing that can be wrong is a mapping
+    /// that sends `trace` to `debug` or `error` to `off`.
+    fn filter_for(level: av_core::config::LogLevel) -> log::LevelFilter {
+        match level {
+            av_core::config::LogLevel::Error => log::LevelFilter::Error,
+            av_core::config::LogLevel::Warn => log::LevelFilter::Warn,
+            av_core::config::LogLevel::Info => log::LevelFilter::Info,
+            av_core::config::LogLevel::Debug => log::LevelFilter::Debug,
+            av_core::config::LogLevel::Trace => log::LevelFilter::Trace,
+        }
     }
 
     /// Move an oversized log aside, once this process owns the installation.
@@ -743,6 +799,72 @@ mod logging {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn every_configured_level_maps_to_the_same_named_filter() {
+            use av_core::config::LogLevel;
+            // The failure this pins is an arm that is right for four levels and
+            // wrong for the fifth -- above all `Trace`, which is the level the
+            // behaviour telemetry is logged at, and which reaching `Debug`
+            // means "the test ran, the service saw the events, and the log
+            // says nothing".
+            for (level, expected) in [
+                (LogLevel::Error, log::LevelFilter::Error),
+                (LogLevel::Warn, log::LevelFilter::Warn),
+                (LogLevel::Info, log::LevelFilter::Info),
+                (LogLevel::Debug, log::LevelFilter::Debug),
+                (LogLevel::Trace, log::LevelFilter::Trace),
+            ] {
+                assert_eq!(filter_for(level), expected, "{level:?}");
+            }
+            assert_eq!(
+                filter_for(LogLevel::Trace),
+                log::LevelFilter::Trace,
+                "trace must not be clamped to debug; the driver's high-volume feeds are trace"
+            );
+        }
+
+        /// The whole path a configured level takes: `init`, then `set_level`,
+        /// then a `log::trace!`, then the file.
+        ///
+        /// Written because the VM pass could not tell "the level is trace and
+        /// no event arrived" from "the level never became trace": the log had
+        /// `debug` lines and no `trace` lines, which is exactly what a service
+        /// still sitting at `init`'s hardcoded `Debug` looks like. The mapping
+        /// test above ([`every_configured_level_maps_to_the_same_named_filter`])
+        /// cannot catch that — it never installs a logger.
+        ///
+        /// This is the only test in this binary that calls [`init`], which
+        /// matters: `log::set_logger` succeeds once per process, so a second
+        /// caller would silently keep the first one's file and this assertion
+        /// would read a log the line never went to.
+        #[test]
+        fn a_trace_line_reaches_the_file_once_the_level_says_trace() {
+            let dir = tempfile::tempdir().unwrap();
+            init(dir.path(), false).unwrap();
+            let path = dir.path().join(LOG_FILE_NAME);
+
+            set_level(av_core::config::LogLevel::Trace);
+            log::trace!("a trace line the configured level allows");
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                text.contains("a trace line the configured level allows"),
+                "trace was configured and the line is not in the log: {text}"
+            );
+            assert!(text.contains("[TRACE]"), "{text}");
+
+            // The other half, so that what is proved is that the level is
+            // *applied* rather than that the writer works: the same line at a
+            // level that excludes it must not arrive.
+            set_level(av_core::config::LogLevel::Error);
+            log::trace!("a second trace line, which this level refuses");
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                !text.contains("which this level refuses"),
+                "an error level let a trace line through: {text}"
+            );
+            assert!(text.contains("a trace line the configured level allows"), "{text}");
+        }
 
         #[test]
         fn a_line_says_when_what_and_where() {

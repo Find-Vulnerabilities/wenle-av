@@ -199,11 +199,27 @@ pub const ALL_CONTROL_CODES: [u32; 6] = [
 /// A version and not a hash of the layout: the driver has to compare this
 /// against a constant compiled into the service, and the service needs to be
 /// able to say *which* version it wanted in an error message a human reads.
-/// `0x0001_0000` — major in the high half, minor in the low — so that a service
+/// `0x0001_0001` — major in the high half, minor in the low — so that a service
 /// can require "same major, any minor" once the protocol has a compatibility
 /// story worth having. It does not have one yet, and [`crate::wire::is_compatible`]
 /// refuses anything but an exact match until it does.
-pub const PROTOCOL_VERSION: u32 = 0x0001_0000;
+///
+/// `0x0001_0001` (2026-10-18) added `EventMessage::parent_process_id` and
+/// `_reserved`: every event grew by 8 bytes and every field after
+/// `process_id` moved. A driver and a service of different minor versions
+/// would read each other's events at the wrong offsets, so the exact-match
+/// rule is what keeps this safe — deploy both halves together.
+///
+/// `0x0001_0002` (2026-10-18) added vocabulary rather than layout:
+/// [`crate::event::EventAction::FileRenamed`],
+/// [`crate::event::EventAction::FileDeleted`] and
+/// [`crate::event::EventAction::RegistryChanged`] (wire codes 9, 10 and 11), and
+/// [`crate::event::SubjectKind::Registry`] (wire code 6). No offset moved, so an old service
+/// *could* survive this pair — it would report those events as `Unrecognised`.
+/// It is bumped anyway because the exact-match rule refuses that pairing
+/// outright, and "the two halves are from the same build" is a stronger
+/// statement than "the offsets happen to agree".
+pub const PROTOCOL_VERSION: u32 = 0x0001_0002;
 
 #[cfg(test)]
 mod tests {

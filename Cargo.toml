@@ -19,6 +19,7 @@ members = [
     "crates/av-driver-proto",
     "crates/av-ipc",
     "crates/av-service",
+    "crates/av-behaviour",
     "crates/av-guard",
     "crates/av-integration",
     "crates/av-amsi",
@@ -50,6 +51,7 @@ default-members = [
     "crates/av-gui",
     "crates/av-ipc",
     "crates/av-service",
+    "crates/av-behaviour",
     "crates/av-guard",
     "crates/av-integration",
     "crates/av-amsi",
@@ -196,6 +198,10 @@ av-scan = { path = "crates/av-scan" }
 av-quarantine = { path = "crates/av-quarantine" }
 av-memory = { path = "crates/av-memory" }
 av-realtime = { path = "crates/av-realtime" }
+# The behaviour rules. Beside `av-realtime` because both read what is happening
+# rather than what a file is, and above `av-ipc`, whose `DriverEvent` is the
+# input. It had no entry here while nothing called it; `av-service` does now.
+av-behaviour = { path = "crates/av-behaviour" }
 av-sandbox = { path = "crates/av-sandbox" }
 av-ipc = { path = "crates/av-ipc" }
 av-service = { path = "crates/av-service" }
