@@ -111,6 +111,28 @@ pub const MAX_PATH_UNITS: usize = 1024;
 /// driver's buffer arithmetic.
 pub const MAX_PATH_BYTES: usize = MAX_PATH_UNITS * 2;
 
+/// Longest registry value this protocol carries, in UTF-16 code units.
+///
+/// Added 2026-10-19 with the value field itself. A registry value has no
+/// length limit the driver could rely on — an `ImagePath` or a `shell\open`
+/// command can be megabytes — so the field is a **prefix** and says so with
+/// [`EVENT_VALUE_TRUNCATED`]. Truncation is the right answer here where it is
+/// the wrong one for a path: a path is an identity, and half of one names a
+/// different file, while a value is evidence, and the prefix of a value that
+/// starts with `%TEMP%\` is exactly the fact the rules are written against.
+///
+/// 512 units holds every autostart value measured on the host and leaves the
+/// message at 3168 bytes, which the filter manager's port handles as
+/// comfortably as the 2128 it carried before.
+pub const MAX_VALUE_UNITS: usize = 512;
+
+/// Bytes in a full-size value field.
+pub const MAX_VALUE_BYTES: usize = MAX_VALUE_UNITS * 2;
+
+/// [`EventMessage::value_flags`]: the value was longer than
+/// [`MAX_VALUE_UNITS`] and only its prefix is carried.
+pub const EVENT_VALUE_TRUNCATED: u32 = 0x0000_0001;
+
 /// Events returned by one [`IOCTL_READ_EVENTS`](crate::ioctl::IOCTL_READ_EVENTS)
 /// call.
 ///
@@ -744,17 +766,48 @@ pub struct EventMessage {
     /// finds set. Present so that the sizes stay whole words; see
     /// [`EventMessage::SIZE`].
     pub _reserved: u32,
+    /// Meaningful length of [`EventMessage::value`]. Zero for every event that
+    /// carries no value, which is every event except a registry value write.
+    pub value_units: u32,
+    /// The registry type of the value — a `REG_*` code such as `REG_SZ` (1) or
+    /// `REG_EXPAND_SZ` (2) — or zero when the event carries none.
+    ///
+    /// Carried so that a reader can tell "this was a string" from "this was
+    /// binary and is not represented here": the value array is text, and a
+    /// `REG_BINARY` value arrives with zero units rather than as mojibake.
+    pub value_type: u32,
+    /// [`EVENT_VALUE_TRUNCATED`] when [`EventMessage::value`] holds a prefix of
+    /// a longer value. Zero otherwise.
+    pub value_flags: u32,
+    /// Reserved, for the reason [`EventMessage::_reserved`] gives.
+    pub _reserved2: u32,
     /// The path as UTF-16 code units, no terminating NUL.
     pub path: [u16; MAX_PATH_UNITS],
+    /// The data written to a registry value, when the value was a string and
+    /// the event is the write that set it.
+    ///
+    /// Added 2026-10-19. Until then a `Run` value's *name* travelled and its
+    /// contents did not, so `Run\Zoom = "C:\Program Files\Zoom\..."` and
+    /// `Run\Zoom = "%TEMP%\evil.exe"` were the same event, and every ordinary
+    /// installer produced the same warning as a piece of malware.
+    ///
+    /// For `REG_MULTI_SZ` the strings are separated by `;` rather than by the
+    /// NULs they have in the registry: a NUL inside a Rust string would end the
+    /// text at the first entry and the rules match text.
+    pub value: [u16; MAX_VALUE_UNITS],
 }
 
 impl EventMessage {
-    /// 24 + 8 + 8 + 4 * 10 = 80, then [`MAX_PATH_BYTES`]. 80 + 2048 = 2128,
+    /// 24 + 8 + 8 + 4 * 13 = 92, rounded to 96 by `_reserved2`, then
+    /// [`MAX_PATH_BYTES`] and [`MAX_VALUE_BYTES`]. 96 + 2048 + 1024 = 3168,
     /// which is a multiple of 8.
-    pub const SIZE: usize = 80 + MAX_PATH_BYTES;
+    pub const SIZE: usize = 96 + MAX_PATH_BYTES + MAX_VALUE_BYTES;
 
     /// Offset of [`EventMessage::path`].
-    pub const PATH_OFFSET: usize = 80;
+    pub const PATH_OFFSET: usize = 96;
+
+    /// Offset of [`EventMessage::value`].
+    pub const VALUE_OFFSET: usize = 96 + MAX_PATH_BYTES;
 
     /// Create an event with `sequence` and `now_100ns`, which the caller stamps
     /// so that a test can produce identical messages.
@@ -779,7 +832,12 @@ impl EventMessage {
             path_units: 0,
             detail: 0,
             _reserved: 0,
+            value_units: 0,
+            value_type: 0,
+            value_flags: 0,
+            _reserved2: 0,
             path: [0; MAX_PATH_UNITS],
+            value: [0; MAX_VALUE_UNITS],
         }
     }
 
@@ -800,6 +858,33 @@ impl EventMessage {
         self.path[..path.len()].copy_from_slice(path);
         self.path_units = path.len() as u32;
         Ok(())
+    }
+
+    /// The meaningful part of the value, clamped by the array's own length.
+    pub fn value(&self) -> &[u16] {
+        let units = (self.value_units as usize).min(MAX_VALUE_UNITS);
+        &self.value[..units]
+    }
+
+    /// Set the value, **truncating** if it is longer than
+    /// [`MAX_VALUE_UNITS`], and say in [`EventMessage::value_flags`] that it
+    /// did. See that constant's documentation for why a prefix is the right
+    /// answer for a value and the wrong one for a path.
+    pub fn set_value(&mut self, value: &[u16], value_type: u32) {
+        let used = value.len().min(MAX_VALUE_UNITS);
+        self.value[..used].copy_from_slice(&value[..used]);
+        self.value_units = used as u32;
+        self.value_type = value_type;
+        if used < value.len() {
+            self.value_flags |= EVENT_VALUE_TRUNCATED;
+        } else {
+            self.value_flags &= !EVENT_VALUE_TRUNCATED;
+        }
+    }
+
+    /// Whether the value that was sent was longer than the field.
+    pub fn value_truncated(&self) -> bool {
+        self.value_flags & EVENT_VALUE_TRUNCATED != 0
     }
 }
 
@@ -834,6 +919,9 @@ impl fmt::Debug for EventMessage {
             .field("path_units", &self.path_units)
             .field("detail", &self.detail)
             .field("path", &crate::path::display_u16(self.path()))
+            .field("value_type", &self.value_type)
+            .field("value_truncated", &self.value_truncated())
+            .field("value", &crate::path::display_u16(self.value()))
             .finish()
     }
 }
@@ -1371,13 +1459,13 @@ mod tests {
         assert_eq!(size_of::<MessagePrefix>(), 24);
         assert_eq!(size_of::<DecisionRequestMessage>(), 2104);
         assert_eq!(size_of::<DecisionReplyMessage>(), 48);
-        assert_eq!(size_of::<EventMessage>(), 2128);
+        assert_eq!(size_of::<EventMessage>(), 3168);
         assert_eq!(size_of::<StatusMessage>(), 80);
         assert_eq!(size_of::<DriverStatus>(), 56);
         assert_eq!(size_of::<DriverStats>(), 64);
         assert_eq!(size_of::<SetModeRequest>(), 16);
         assert_eq!(size_of::<ConfigMessage>(), 2080);
-        assert_eq!(size_of::<EventBatch>(), 17_032);
+        assert_eq!(size_of::<EventBatch>(), 25_352);
 
         // The associated constants must agree with `size_of`, or a driver using
         // them for its `FltSendMessage` lengths is sending a wrong number.
@@ -1480,8 +1568,15 @@ mod tests {
         assert_eq!(offset_of!(EventMessage, path_units), 68);
         assert_eq!(offset_of!(EventMessage, detail), 72);
         assert_eq!(offset_of!(EventMessage, _reserved), 76);
-        assert_eq!(offset_of!(EventMessage, path), 80);
+        assert_eq!(offset_of!(EventMessage, value_units), 80);
+        assert_eq!(offset_of!(EventMessage, value_type), 84);
+        assert_eq!(offset_of!(EventMessage, value_flags), 88);
+        assert_eq!(offset_of!(EventMessage, _reserved2), 92);
+        assert_eq!(offset_of!(EventMessage, path), 96);
         assert_eq!(offset_of!(EventMessage, path), EventMessage::PATH_OFFSET);
+        assert_eq!(offset_of!(EventMessage, value), 96 + MAX_PATH_BYTES);
+        assert_eq!(offset_of!(EventMessage, value), EventMessage::VALUE_OFFSET);
+        assert_eq!(core::mem::size_of::<EventMessage>(), EventMessage::SIZE);
 
         assert_eq!(offset_of!(DecisionReplyMessage, reply), 0);
         assert_eq!(offset_of!(DecisionReplyMessage, request_id), 16);
@@ -1792,6 +1887,49 @@ mod tests {
         );
         event.path_units = u32::MAX;
         assert_eq!(event.path().len(), MAX_PATH_UNITS);
+
+        // The same for the value, which is the other length-valued field.
+        event.value_units = u32::MAX;
+        assert_eq!(event.value().len(), MAX_VALUE_UNITS);
+    }
+
+    /// An oversize value is **truncated and labelled**, not refused — the
+    /// opposite of the path rule, on purpose.
+    ///
+    /// The two tests sit next to each other because the difference is the point:
+    /// half a path names a different file, and half a value still says
+    /// `%TEMP%\something`. A rule written against a prefix is satisfied by the
+    /// prefix, and a reader that wants to know the rest was not carried has
+    /// [`EVENT_VALUE_TRUNCATED`].
+    #[test]
+    fn an_oversize_value_is_truncated_and_says_so() {
+        let mut event = EventMessage::new(
+            1,
+            0,
+            crate::event::SubjectKind::Registry,
+            crate::event::EventAction::RegistryChanged,
+        );
+        let exact = vec![0x41u16; MAX_VALUE_UNITS];
+        event.set_value(&exact, 1);
+        assert_eq!(event.value().len(), MAX_VALUE_UNITS);
+        assert!(!event.value_truncated());
+        assert_eq!(event.value_type, 1);
+
+        let over = vec![0x41u16; MAX_VALUE_UNITS + 1];
+        event.set_value(&over, 2);
+        assert_eq!(event.value().len(), MAX_VALUE_UNITS);
+        assert!(
+            event.value_truncated(),
+            "a prefix that does not say it is a prefix is a lie about what was written"
+        );
+        assert_eq!(event.value_type, 2, "the type survives the truncation");
+
+        // Setting a short value afterwards clears the flag, or a reader would
+        // believe every later value had been cut.
+        event.set_value(&[0x42, 0x43], 1);
+        assert!(!event.value_truncated());
+        assert_eq!(event.value(), &[0x42, 0x43]);
+        assert_eq!(event.value_type, 1);
     }
 
     /// A path that does not fit is refused, not truncated. Truncation is the

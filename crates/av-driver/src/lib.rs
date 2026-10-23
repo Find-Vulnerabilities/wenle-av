@@ -310,7 +310,7 @@ use av_driver_proto::exclusions::{
 use av_driver_proto::path::device_to_dos_path;
 use av_driver_proto::wire::{
     ConfigMessage, DecisionReplyMessage, DecisionRequestMessage, DriverStats, EventMessage,
-    MessageKind, PortMessageHeader, MAX_PATH_UNITS,
+    MessageKind, PortMessageHeader, EVENT_VALUE_TRUNCATED, MAX_PATH_UNITS, MAX_VALUE_UNITS,
 };
 use av_driver_proto::{
     gate_update, is_our_image, is_protected_file, strip_process, strip_thread, GateUpdate,
@@ -1008,7 +1008,7 @@ unsafe extern "system" fn registry_notify(
     let class = argument1 as usize as i32;
     let mut path = [0u16; MAX_PATH_UNITS];
 
-    let (detail, units) = match class {
+    let (detail, units, value) = match class {
         flt::REG_NT_PRE_CREATE_KEY_EX => {
             let info = argument2.cast::<flt::RegCreateKeyInformation>();
             if info.is_null() {
@@ -1022,7 +1022,7 @@ unsafe extern "system" fn registry_notify(
             // object lookup -- and does not have one: the key does not exist
             // yet, so there is no object to ask about.
             match unsafe { copy_counted_string(name, &mut path) } {
-                Some(units) => (EventAction::REGISTRY_KEY_CREATED, units),
+                Some(units) => (EventAction::REGISTRY_KEY_CREATED, units, None),
                 None => return STATUS_SUCCESS,
             }
         }
@@ -1034,7 +1034,7 @@ unsafe extern "system" fn registry_notify(
             // SAFETY: as above, for this class's structure.
             let object = unsafe { (*info).object };
             match unsafe { key_object_path(object, &mut path) } {
-                Some(units) => (EventAction::REGISTRY_KEY_DELETED, units),
+                Some(units) => (EventAction::REGISTRY_KEY_DELETED, units, None),
                 None => return STATUS_SUCCESS,
             }
         }
@@ -1049,7 +1049,7 @@ unsafe extern "system" fn registry_notify(
             // though it were a path is a path to something else. The key that
             // is being renamed is the fact this event can state exactly.
             match unsafe { key_object_path(object, &mut path) } {
-                Some(units) => (EventAction::REGISTRY_KEY_RENAMED, units),
+                Some(units) => (EventAction::REGISTRY_KEY_RENAMED, units, None),
                 None => return STATUS_SUCCESS,
             }
         }
@@ -1059,11 +1059,37 @@ unsafe extern "system" fn registry_notify(
                 return STATUS_SUCCESS;
             }
             // SAFETY: `argument2` is this class's structure.
-            let (object, value_name) = unsafe { ((*info).object, (*info).value_name) };
-            match unsafe { named_value_path(object, value_name, &mut path) } {
-                Some(units) => (EventAction::REGISTRY_VALUE_SET, units),
+            let (object, value_name, kind, data, bytes) = unsafe {
+                (
+                    (*info).object,
+                    (*info).value_name,
+                    (*info).value_type,
+                    (*info).data,
+                    (*info).data_size,
+                )
+            };
+            let units = match unsafe { named_value_path(object, value_name, &mut path) } {
+                Some(units) => units,
                 None => return STATUS_SUCCESS,
-            }
+            };
+            // Only the string types are carried. A `REG_BINARY` or `REG_DWORD`
+            // value has no text, and rendering its bytes as text would be a
+            // rule matching against a representation this driver invented. The
+            // event still says the value was written; it says nothing about
+            // what was written.
+            let value = if matches!(kind, flt::REG_SZ | flt::REG_EXPAND_SZ | flt::REG_MULTI_SZ)
+                && !data.is_null()
+                && bytes != 0
+            {
+                Some(RegistryValue {
+                    kind,
+                    data: data.cast::<u16>(),
+                    bytes,
+                })
+            } else {
+                None
+            };
+            (EventAction::REGISTRY_VALUE_SET, units, value)
         }
         flt::REG_NT_DELETE_VALUE_KEY => {
             let info = argument2.cast::<flt::RegDeleteValueKeyInformation>();
@@ -1073,7 +1099,7 @@ unsafe extern "system" fn registry_notify(
             // SAFETY: as above.
             let (object, value_name) = unsafe { ((*info).object, (*info).value_name) };
             match unsafe { named_value_path(object, value_name, &mut path) } {
-                Some(units) => (EventAction::REGISTRY_VALUE_DELETED, units),
+                Some(units) => (EventAction::REGISTRY_VALUE_DELETED, units, None),
                 None => return STATUS_SUCCESS,
             }
         }
@@ -1089,8 +1115,28 @@ unsafe extern "system" fn registry_notify(
     // is `HANDLE` and the value is the identifier, so it is widened the way the
     // write path widens it.
     let process_id = unsafe { flt::PsGetCurrentProcessId() } as usize as u32;
-    defer_registry_event(detail, process_id, &path[..units]);
+    // `value` borrows the caller's buffer, which is valid only while this
+    // callback runs. `defer_registry_event` copies it before returning, which
+    // is what makes the report possible at all: by the time a worker thread
+    // runs, the configuration manager has finished with the buffer.
+    defer_registry_event(detail, process_id, &path[..units], value);
     STATUS_SUCCESS
+}
+
+/// Where a registry value's data is, and what type it is.
+///
+/// Live only for the duration of the callback that supplied it. The type is
+/// kept because `REG_MULTI_SZ`'s data is a different shape from `REG_SZ`'s —
+/// NUL-separated strings rather than one — and the conversion happens in
+/// [`defer_registry_event`], which reads the data the way its type says.
+#[derive(Clone, Copy)]
+struct RegistryValue {
+    /// One of `flt::REG_SZ`, `REG_EXPAND_SZ`, `REG_MULTI_SZ`.
+    kind: u32,
+    /// The data, in UTF-16 for every type that reaches here.
+    data: *const u16,
+    /// The length in **bytes**, as the caller stated it.
+    bytes: u32,
 }
 
 /// Copy a counted string the kernel handed over into `out`.
@@ -1182,6 +1228,60 @@ unsafe fn named_value_path(
     out[used] = u16::from(b'\\');
     out[used + 1..used + 1 + value.len()].copy_from_slice(value);
     Some(used + 1 + value.len())
+}
+
+/// Copy a registry value's data into `out` as text, and say whether it fit.
+///
+/// Truncation rather than refusal, which is the opposite of what
+/// [`copy_counted_string`] does with a path: half a path names a different key,
+/// while half a value still begins with the `%TEMP%` a rule is looking for.
+/// The caller records that the prefix is a prefix; see
+/// [`av_driver_proto::wire::EVENT_VALUE_TRUNCATED`].
+///
+/// The three string types are the only ones that reach here — the caller has
+/// already refused the binary ones — and `REG_MULTI_SZ` is converted from
+/// NUL-separated strings to `;`-separated ones so that the whole list survives
+/// into a field that cannot hold a NUL.
+///
+/// # Safety
+///
+/// `value.data` must be valid for `value.bytes` bytes and this must run while
+/// the callback that supplied it is still on the stack.
+unsafe fn copy_registry_value(value: RegistryValue, out: &mut [u16]) -> (usize, bool) {
+    // Bytes to units, rounded down: an odd length cannot be a whole UTF-16
+    // unit, and reading the half one would be reading past the caller's
+    // buffer's meaningful part.
+    let available = (value.bytes as usize) / 2;
+    let used = available.min(out.len());
+    if used == 0 {
+        return (0, false);
+    }
+    // SAFETY: the caller's contract, and `used <= available` by the line above.
+    unsafe {
+        core::ptr::copy_nonoverlapping(value.data, out.as_mut_ptr(), used);
+    }
+    // `REG_MULTI_SZ`'s separators become `;`, and its terminator disappears
+    // with the other trailing zeros below.
+    let mut units = used;
+    if value.kind == flt::REG_MULTI_SZ {
+        for unit in &mut out[..units] {
+            if *unit == 0 {
+                *unit = u16::from(b';');
+            }
+        }
+    }
+    // The registry's strings end with a NUL that is not part of the value; the
+    // protocol's field is a counted string and does not carry one.
+    while units > 0 && out[units - 1] == 0 {
+        units -= 1;
+    }
+    // A `REG_MULTI_SZ`'s last separator is where its terminator was.
+    if value.kind == flt::REG_MULTI_SZ {
+        while units > 0 && out[units - 1] == u16::from(b';') {
+            units -= 1;
+        }
+    }
+    (units, available > out.len())
 }
 
 /// Register the object callbacks that protect this product's own processes.
@@ -3164,9 +3264,9 @@ fn pending_counter(action: EventAction) -> &'static AtomicUsize {
 /// One event with no payload on its way to the service.
 ///
 /// The fields are what [`EventMessage::new`] needs plus the two it does not
-/// take, and no more: the message itself is 2120 bytes, and building it on the
-/// worker thread rather than on the path that saw the event is part of what
-/// deferring buys.
+/// take, and no more: the message itself is 3168 bytes (2128 before the
+/// registry value buffer, 2026-10-19), and building it on the worker thread
+/// rather than on the path that saw the event is part of what deferring buys.
 ///
 /// `repr(C)` since 2026-10-09, when [`PendingProcessEvent`] began holding one of
 /// these as its first member. It never crosses into C — the filter manager
@@ -3232,6 +3332,33 @@ struct PendingFileEvent {
     units: u32,
     /// The file, in UTF-16 code units, no terminating NUL.
     path: [u16; MAX_PATH_UNITS],
+}
+
+/// A registry notification on its way to the service, with the value's data.
+///
+/// A separate structure from [`PendingFileEvent`] since 2026-10-19, when the
+/// value buffer was added. It is separate because only one class of registry
+/// event has a value and every file event would otherwise pay a kilobyte of
+/// non-paged pool for a field it would leave zero.
+///
+/// `#[repr(C)]` for the same reason [`PendingProcessEvent`] is: the worker
+/// receives a pointer to it and reads the header out of it at offset zero.
+#[repr(C)]
+struct PendingRegistryEvent {
+    event: PendingEvent,
+    /// Meaningful length of `path`. Not an allocation size.
+    units: u32,
+    /// Meaningful length of `value`. Zero when the event carried none.
+    value_units: u32,
+    /// The `REG_*` type, zero when there is no value.
+    value_type: u32,
+    /// [`EVENT_VALUE_TRUNCATED`] when the value did not fit.
+    value_flags: u32,
+    /// The key's path, with `\` and the value name appended for a value.
+    path: [u16; MAX_PATH_UNITS],
+    /// The value's data as text, no terminating NUL. `;` separates the strings
+    /// of a `REG_MULTI_SZ`.
+    value: [u16; MAX_VALUE_UNITS],
 }
 
 /// Hand a filled block to a worker thread, or free it and return.
@@ -3484,15 +3611,24 @@ fn defer_file_event(action: EventAction, process_id: u32, detail: u32, path: &[u
 /// callback out of a string `CmCallbackGetKeyObjectIDEx` allocated, which is
 /// released before the callback returns. Nothing of it can be left for later.
 ///
-/// The block is a [`PendingFileEvent`]: the shape (a header and one path) is the
-/// same, the allocation is tagged [`flt::REGISTRY_EVENT_TAG`] so that the two
-/// are still distinguishable in a pool dump, and the counter is
-/// [`PENDING_REGISTRY_EVENTS`] so that neither kind can starve the other.
+/// The block is a [`PendingRegistryEvent`]. It was a [`PendingFileEvent`] until
+/// 2026-10-19: the shapes agreed until a value's data had to travel too, and
+/// widening the shared structure would have charged every file event a
+/// kilobyte of non-paged pool for a buffer it would leave zero.
 ///
 /// `detail` is one of the `EventAction::REGISTRY_*` codes — what kind of change
 /// this is — because a registry event's path alone does not say whether a key
 /// was created, a value written, or a key deleted.
-fn defer_registry_event(detail: u32, process_id: u32, path: &[u16]) {
+///
+/// `value` is the data of a value that is being set, and it is **copied here**
+/// rather than on the worker: the caller's buffer belongs to the configuration
+/// manager and is valid only while the callback runs.
+fn defer_registry_event(
+    detail: u32,
+    process_id: u32,
+    path: &[u16],
+    value: Option<RegistryValue>,
+) {
     if !flt::may_defer_for_the_service() {
         return;
     }
@@ -3510,17 +3646,17 @@ fn defer_registry_event(detail: u32, process_id: u32, path: &[u16]) {
     let block = unsafe {
         flt::ExAllocatePool2(
             flt::POOL_FLAG_NON_PAGED,
-            core::mem::size_of::<PendingFileEvent>(),
+            core::mem::size_of::<PendingRegistryEvent>(),
             flt::REGISTRY_EVENT_TAG,
         )
     }
-    .cast::<PendingFileEvent>();
+    .cast::<PendingRegistryEvent>();
     if block.is_null() {
         return;
     }
 
     // SAFETY: `block` came from the non-paged pool just above, is
-    // `size_of::<PendingFileEvent>()` bytes, and nothing else can reach it
+    // `size_of::<PendingRegistryEvent>()` bytes, and nothing else can reach it
     // until it is queued.
     let pending = unsafe { &mut *block };
     pending.event.sequence = NEXT_EVENT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -3533,6 +3669,31 @@ fn defer_registry_event(detail: u32, process_id: u32, path: &[u16]) {
     pending.event.action = EventAction::RegistryChanged;
     pending.units = path.len() as u32;
     pending.path[..path.len()].copy_from_slice(path);
+    // The value's data is read here for the same reason and a harder one: the
+    // buffer is the caller's, and after this callback returns it is not this
+    // driver's to read.
+    match value {
+        Some(value) => {
+            // SAFETY: `value.data` is that caller-owned buffer, `value.bytes`
+            // its stated length, and this call is inside the callback that
+            // supplied it. `copy_registry_value` reads no further than the
+            // length it is given.
+            let (units, truncated) =
+                unsafe { copy_registry_value(value, &mut pending.value) };
+            pending.value_units = units as u32;
+            pending.value_type = value.kind;
+            pending.value_flags = if truncated {
+                EVENT_VALUE_TRUNCATED
+            } else {
+                0
+            };
+        }
+        None => {
+            pending.value_units = 0;
+            pending.value_type = 0;
+            pending.value_flags = 0;
+        }
+    }
 
     // SAFETY: as documented on `queue_pending`; `block` was allocated with
     // `REGISTRY_EVENT_TAG` and `filter` was checked above.
@@ -3665,6 +3826,9 @@ extern "system" fn event_worker(
             0,
             pending.detail,
             &[],
+            &[],
+            0,
+            false,
         );
         pending.action
     };
@@ -3754,6 +3918,9 @@ extern "system" fn file_event_worker(
             0,
             pending.event.detail,
             &pending.path[..units],
+            &[],
+            0,
+            false,
         );
         pending.event.action
     };
@@ -3771,13 +3938,15 @@ extern "system" fn file_event_worker(
 ///
 /// It only sends: the path in the block is already the registry namespace form,
 /// resolved in the callback while the configuration manager's object was still
-/// valid, and `detail` was read there from the `REG_NOTIFY_CLASS`.
+/// valid, and `detail` was read there from the `REG_NOTIFY_CLASS`. The value's
+/// data, when there was one, was copied in the same callback for the same
+/// reason.
 ///
 /// # Safety
 ///
 /// Called by the filter manager with the work item and the `context` that
-/// [`defer_registry_event`] queued, which is always a [`PendingFileEvent`] it
-/// allocated with [`flt::REGISTRY_EVENT_TAG`].
+/// [`defer_registry_event`] queued, which is always a [`PendingRegistryEvent`]
+/// it allocated with [`flt::REGISTRY_EVENT_TAG`].
 extern "system" fn registry_event_worker(
     work_item: flt::FltGenericWorkItem,
     _filter: *mut c_void,
@@ -3786,8 +3955,9 @@ extern "system" fn registry_event_worker(
     // SAFETY: `context` is that block. Every field read here is read once, and
     // nothing else holds a reference to it.
     let action = unsafe {
-        let pending = &*context.cast::<PendingFileEvent>();
+        let pending = &*context.cast::<PendingRegistryEvent>();
         let units = (pending.units as usize).min(MAX_PATH_UNITS);
+        let value_units = (pending.value_units as usize).min(MAX_VALUE_UNITS);
         send_event(
             pending.event.sequence,
             pending.event.now_100ns,
@@ -3798,6 +3968,9 @@ extern "system" fn registry_event_worker(
             0,
             pending.event.detail,
             &pending.path[..units],
+            &pending.value[..value_units],
+            pending.value_type,
+            pending.value_flags & EVENT_VALUE_TRUNCATED != 0,
         );
         pending.event.action
     };
@@ -3862,8 +4035,10 @@ fn send_process_event(
 ) {
     // SAFETY: this is a worker thread at `PASSIVE_LEVEL`; `send_event`'s own
     // documentation is the precondition, and it states it there. `send_event`
-    // builds a 2120-byte `EventMessage` in its own frame, which the write path
-    // has been doing on this same kind of thread since 10-01.
+    // builds a 3168-byte `EventMessage` in its own frame — 2128 until the
+    // registry value buffer was added on 2026-10-19 — which the write path has
+    // been doing on this same kind of thread since 10-01, and which still fits
+    // a worker thread's 12 KiB stack.
     unsafe {
         send_event(
             sequence,
@@ -3874,6 +4049,9 @@ fn send_process_event(
             parent_process_id,
             0,
             path,
+            &[],
+            0,
+            false,
         );
     }
 }
@@ -3891,8 +4069,9 @@ fn send_process_event(
 /// Sending them anyway is what made the service connect and immediately drop
 /// the connection, once a second, forever. The arithmetic that identifies it
 /// uses only this workspace: the largest message this driver can send is
-/// [`EventMessage`] at 2120 bytes, the service's receive buffer is
-/// `EventMessage::SIZE` -- the same 2120 -- and the filter manager answered
+/// [`EventMessage`] at 2120 bytes (its size in October 2026, before the
+/// registry value buffer; 3168 since), the service's receive buffer is
+/// `EventMessage::SIZE` -- the same number -- and the filter manager answered
 /// `STATUS_BUFFER_TOO_SMALL` (which `fltlib` reports as
 /// `ERROR_INSUFFICIENT_BUFFER`) for it. **A message that is not larger than the
 /// buffer cannot make the buffer too small**, so what reaches user mode is
@@ -3944,10 +4123,16 @@ const _: () = assert!(core::mem::size_of::<EventMessage>() >= PortMessageHeader:
 /// fit the protocol's buffer means **no event is sent**: `set_path` refuses
 /// rather than truncating, and a truncated path is a different file.
 ///
+/// `value` is empty for every event but a registry value write. It is
+/// **truncated** rather than refused when it does not fit, and
+/// `value_truncated` says so — the opposite rule, for the reason
+/// `EVENT_VALUE_TRUNCATED` gives: a value is evidence rather than identity.
+///
 /// # Safety
 ///
 /// Must be called at `APC_LEVEL` or below, which for this driver means only
 /// from a worker routine.
+#[allow(clippy::too_many_arguments)]
 unsafe fn send_event(
     sequence: u64,
     now_100ns: u64,
@@ -3957,6 +4142,9 @@ unsafe fn send_event(
     parent_process_id: u32,
     detail: u32,
     path: &[u16],
+    value: &[u16],
+    value_type: u32,
+    value_truncated: bool,
 ) {
     // True for both callers, and kept anyway. The claim "a worker thread runs
     // at `PASSIVE_LEVEL`" is the entire reason these events are deferred rather
@@ -3986,6 +4174,15 @@ unsafe fn send_event(
         // gap in the service's sequence check mean "an event was dropped"
         // whether it was dropped here or by a full queue.
         return;
+    }
+    if !value.is_empty() {
+        event.set_value(value, value_type);
+        // `set_value` sets this by itself only when it is given more than fits;
+        // the worker hands it the already-truncated prefix, so the fact has to
+        // come from the block that did the cutting.
+        if value_truncated {
+            event.value_flags |= EVENT_VALUE_TRUNCATED;
+        }
     }
 
     // A state report waits two seconds; an ordinary event waits a hundred

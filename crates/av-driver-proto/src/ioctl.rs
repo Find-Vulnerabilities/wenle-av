@@ -219,7 +219,15 @@ pub const ALL_CONTROL_CODES: [u32; 6] = [
 /// It is bumped anyway because the exact-match rule refuses that pairing
 /// outright, and "the two halves are from the same build" is a stronger
 /// statement than "the offsets happen to agree".
-pub const PROTOCOL_VERSION: u32 = 0x0001_0002;
+///
+/// `0x0001_0003` (2026-10-19) is layout: [`crate::wire::EventMessage`] gained
+/// `value_units`, `value_type`, `value_flags`, `_reserved2` and the
+/// `[u16; 512]` value buffer, so `path` moved from offset 80 to 96 and the
+/// message grew from 2128 to 3168 bytes. A service of the previous version
+/// would read a registry value's bytes as a path and a path's tail as a value —
+/// the exact-match rule is what prevents it, and both halves have to be
+/// deployed together.
+pub const PROTOCOL_VERSION: u32 = 0x0001_0003;
 
 #[cfg(test)]
 mod tests {

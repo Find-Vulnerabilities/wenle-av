@@ -1050,17 +1050,53 @@ pub struct RegDeleteKeyInformation {
 }
 
 /// `REG_SET_VALUE_KEY_INFORMATION`, from `wdm.h` 28531.
+///
+/// Every member is named since 2026-10-19, when the driver began reading
+/// `Type`, `Data` and `DataSize`. Before that the block behind `ValueName` was
+/// a single opaque span, and an opaque span is how a field that was there all
+/// along goes unnoticed: the value's *contents* are what separates an
+/// installer's `Run` entry from a persistence mechanism's, and the driver was
+/// reporting only the value's name.
+///
+/// The layout is C's, and the two `_padding` members are C's too — Rust's
+/// `#[repr(C)]` computes the same offsets from the same declarations, so the
+/// names say where the four bytes come from rather than being read by this
+/// driver.
 #[repr(C)]
 pub struct RegSetValueKeyInformation {
     /// The key object the value is being written under.
     pub object: *mut c_void,
     /// The value's name, as a counted string.
     pub value_name: *mut UnicodeString,
-    /// `TitleIndex`, `Type`, `Data`, `DataSize`, `CallContext`,
-    /// `ObjectContext`, `Reserved` -- eight bytes of scalars, then five
-    /// pointers. Not read.
-    _rest: [usize; 6],
+    /// The index the value name was assigned in the key's value list. Not read.
+    pub title_index: u32,
+    /// The value's type: one of the `REG_*` codes below.
+    pub value_type: u32,
+    /// The value's data, in the caller's buffer, valid for the duration of the
+    /// callback and no longer.
+    pub data: *mut c_void,
+    /// The data's length in **bytes**, not units.
+    pub data_size: u32,
+    /// C's alignment between `DataSize` and the next pointer.
+    pub _padding: u32,
+    /// Per-operation context. Not read.
+    pub call_context: *mut c_void,
+    /// The key's context. Not read.
+    pub object_context: *mut c_void,
+    /// Reserved. Not read.
+    pub reserved: *mut c_void,
 }
+
+/// `REG_SZ` (`winnt.h` `_WINNT_` registry value types).
+pub const REG_SZ: u32 = 1;
+/// `REG_EXPAND_SZ`.
+pub const REG_EXPAND_SZ: u32 = 2;
+/// `REG_BINARY`.
+pub const REG_BINARY: u32 = 3;
+/// `REG_DWORD`.
+pub const REG_DWORD: u32 = 4;
+/// `REG_MULTI_SZ`: a sequence of NUL-terminated strings ending in a second NUL.
+pub const REG_MULTI_SZ: u32 = 7;
 
 /// `REG_DELETE_VALUE_KEY_INFORMATION`, from `wdm.h` 28543.
 #[repr(C)]
@@ -1824,7 +1860,20 @@ const _: () = {
     assert!(core::mem::size_of::<RegDeleteKeyInformation>() == 32);
     assert!(core::mem::offset_of!(RegSetValueKeyInformation, object) == 0);
     assert!(core::mem::offset_of!(RegSetValueKeyInformation, value_name) == 8);
+    assert!(core::mem::offset_of!(RegSetValueKeyInformation, title_index) == 16);
+    assert!(core::mem::offset_of!(RegSetValueKeyInformation, value_type) == 20);
+    assert!(core::mem::offset_of!(RegSetValueKeyInformation, data) == 24);
+    // 32, not 28: `DataSize` follows a pointer, and C pads the four bytes
+    // between `Type`-sized scalars and an 8-byte-aligned member. Reading it at
+    // 28 would read the top half of `Data`'s address.
+    assert!(core::mem::offset_of!(RegSetValueKeyInformation, data_size) == 32);
+    assert!(core::mem::offset_of!(RegSetValueKeyInformation, call_context) == 40);
     assert!(core::mem::size_of::<RegSetValueKeyInformation>() == 64);
+    assert!(REG_SZ == 1);
+    assert!(REG_EXPAND_SZ == 2);
+    assert!(REG_BINARY == 3);
+    assert!(REG_DWORD == 4);
+    assert!(REG_MULTI_SZ == 7);
     assert!(core::mem::offset_of!(RegDeleteValueKeyInformation, value_name) == 8);
     assert!(core::mem::size_of::<RegDeleteValueKeyInformation>() == 40);
     assert!(core::mem::offset_of!(RegRenameKeyInformation, new_name) == 8);

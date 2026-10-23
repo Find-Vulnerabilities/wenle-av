@@ -73,7 +73,11 @@ pub const MAGIC: [u8; 8] = *b"WENLEIPC";
 /// `0x0001_0005` (2026-10-18) added `DriverEventAction::RegistryChanged` and
 /// `DriverSubject::Registry`, each before its enum's `Unrecognised`, so the
 /// indices after them moved again.
-pub const PROTOCOL_VERSION: u32 = 0x0001_0005;
+///
+/// `0x0001_0006` (2026-10-19) added `DriverEvent::value`. It is an `Option` and
+/// therefore two words on the wire, so every field after it moves: an older
+/// client would read `process_id` out of the middle of the option's payload.
+pub const PROTOCOL_VERSION: u32 = 0x0001_0006;
 
 /// Bytes of length prefix in front of every frame.
 pub const FRAME_PREFIX_BYTES: usize = 4;
