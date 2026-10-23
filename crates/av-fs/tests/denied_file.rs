@@ -122,8 +122,33 @@ fn icacls(path: &Path, args: &[&str]) {
     );
 }
 
+/// SeBackupPrivilege is a property of the **process**, and cargo runs the
+/// tests in this file on separate threads of one process. Two of them disagree
+/// about what that privilege is: this lock makes them take turns, so one of
+/// them cannot turn the privilege on halfway through the other. Measured
+/// 2026-10-23: without it the guard below could pass and the read two lines
+/// later still succeed.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn an_ordinary_reader_is_refused_and_says_why() {
+    let _serial = SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // The premise is a file *this process* is denied, and `SeBackupPrivilege` is
+    // process-wide: the test below enables it through `Reader::privileged`, and
+    // which of the two runs first is the scheduler's business. Measured
+    // 2026-10-23: with the privilege already on, this read succeeds and the
+    // `expect_err` below panics -- a red suite that says nothing about the
+    // product. Saying the premise could not be built is the honest answer.
+    if matches!(
+        av_fs::privilege::query(av_fs::privilege::Privilege::Backup),
+        Ok(presence) if presence.is_enabled()
+    ) {
+        eprintln!(
+            "skipped: this process already holds SeBackupPrivilege, so a file it is denied \
+             cannot be built"
+        );
+        return;
+    }
     let denied = Denied::new("secret.txt", b"the bytes a scan must still see");
 
     let refused = Reader::ordinary()
@@ -163,6 +188,7 @@ fn an_ordinary_reader_is_refused_and_says_why() {
 
 #[test]
 fn a_privileged_reader_reads_it_when_this_process_holds_the_privilege() {
+    let _serial = SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let payload = b"the bytes a scan must still see";
     let denied = Denied::new("secret.txt", payload);
 

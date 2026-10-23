@@ -244,27 +244,60 @@ impl Reader {
         // That still bounds the read itself; the scan path, which also holds the
         // prefilter's copy, goes through `read_capped` and keeps the
         // reservation. See `Held`.
-        let (data, _held) = self.read_limited(path, None)?;
+        let (data, _, _held) = self.read_limited(path, None, None)?;
         Ok(data)
+    }
+
+    /// The first `limit` bytes, with every byte of the file fed to `sink`.
+    ///
+    /// The sink sees the head as well as the tail, in file order, so a caller
+    /// that hashes what it is given has the digest of the whole file when this
+    /// returns — which is the reason the signature exists. See [`Head`] for why
+    /// the bytes are split, and [`Reader::read_limited`] for what the split
+    /// does to the ceiling and to the memory budget.
+    pub fn read_head(
+        &self,
+        path: &Path,
+        limit: u64,
+        sink: &mut dyn FnMut(&[u8]),
+    ) -> io::Result<Head> {
+        debug_assert!(
+            limit <= self.ceiling,
+            "read_head({limit}) is larger than this reader's own ceiling ({})",
+            self.ceiling
+        );
+        let limit = limit.min(self.ceiling);
+        let (data, size, _held) = self
+            .read_limited(path, Some(limit), Some(sink))
+            .map_err(io::Error::from)?;
+        Ok(Head { data, size })
     }
 
     /// The body of both reads, with an optional caller-set limit.
     ///
-    /// `limit` is `Some` only from [`Reader::read_capped`], where it means "the
-    /// walk measured this file as fitting" — which is why exceeding it is
-    /// [`Why::Grew`] rather than [`Why::TooLarge`]. See that variant.
+    /// `limit` is `Some` from [`Reader::read_capped`], where it means "the walk
+    /// measured this file as fitting" — which is why exceeding it is
+    /// [`Why::Grew`] rather than [`Why::TooLarge`] — and from
+    /// [`Reader::read_head`], where it means "keep at most this much": the file
+    /// may be larger, and the bytes past the limit are handed to `sink` instead
+    /// of being held.
     ///
-    /// Returns the scan-memory reservation alongside the bytes rather than
-    /// releasing it, because the caller that reads a file in order to scan it
-    /// goes on to hold a second copy of it. See [`Held`].
+    /// Returns the file's size and the scan-memory reservation alongside the
+    /// bytes rather than releasing either, because the caller that reads a file
+    /// in order to scan it goes on to hold a second copy of it. See [`Held`].
     #[cfg(windows)]
-    fn read_limited(&self, path: &Path, limit: Option<u64>) -> Result<(Vec<u8>, Reservation<'static>), Refused> {
+    fn read_limited(
+        &self,
+        path: &Path,
+        limit: Option<u64>,
+        sink: Option<&mut dyn FnMut(&[u8])>,
+    ) -> Result<(Vec<u8>, u64, Reservation<'static>), Refused> {
         let name = verbatim(path).map_err(|reason| Refused::new(path, Why::Unrepresentable { reason }))?;
 
         let mut last: Why = Why::Gone;
         for attempt in 1..=self.attempts {
             match self.open_with(path, &name) {
-                Ok(handle) => return self.read_handle(path, handle, limit),
+                Ok(handle) => return self.read_handle(path, handle, limit, sink),
                 Err(why @ Why::InUse { .. }) => {
                     last = why;
                     if attempt < self.attempts {
@@ -297,7 +330,7 @@ impl Reader {
     pub fn try_read(&self, path: &Path) -> Result<Vec<u8>, Refused> {
         // See the Windows one: this shape releases the reservation at the end of
         // the read, which is all this signature can offer.
-        let (data, _held) = self.read_limited(path, None)?;
+        let (data, _, _held) = self.read_limited(path, None, None)?;
         Ok(data)
     }
 
@@ -308,7 +341,8 @@ impl Reader {
         &self,
         path: &Path,
         limit: Option<u64>,
-    ) -> Result<(Vec<u8>, Reservation<'static>), Refused> {
+        sink: Option<&mut dyn FnMut(&[u8])>,
+    ) -> Result<(Vec<u8>, u64, Reservation<'static>), Refused> {
         let ceiling = limit.map_or(self.ceiling, |l| l.min(self.ceiling));
         let metadata = std::fs::metadata(path).map_err(|e| {
             Refused::new(
@@ -329,36 +363,40 @@ impl Reader {
                 Why::NotAFile { attributes: 0x10 },
             ));
         }
-        if metadata.len() > ceiling {
-            return Err(Refused::new(
-                path,
-                over_reason(metadata.len(), limit, self.ceiling),
-            ));
+        let size = metadata.len();
+        // What will be held. Everything, unless a sink is taking the bytes past
+        // the limit — then only the head is allocated and the ceiling applies
+        // to the head, because that is all this read is going to keep.
+        let keep = match sink {
+            Some(_) => size.min(limit.unwrap_or(size)),
+            None => size,
+        };
+        if keep > ceiling {
+            return Err(Refused::new(path, over_reason(keep, limit, self.ceiling)));
         }
         // As on Windows: the machine is asked first, so that a file it cannot
         // afford is refused rather than attempted. See [`affordable`].
-        affordable(metadata.len()).map_err(|why| Refused::new(path, why))?;
+        affordable(keep).map_err(|why| Refused::new(path, why))?;
         // Reserved before the read rather than after it, because the read is
         // the allocation: a reservation taken once the bytes are in hand has
         // nothing left to prevent.
-        let held = budget::shared().reserve(metadata.len());
+        let held = budget::shared().reserve(keep);
         // Read into a buffer whose capacity is reserved fallibly, and bounded by
         // `take` so that a file which grew since it was measured cannot make the
         // buffer grow again — `std::fs::read` would do both infallibly and abort
         // the process on a full machine. See the Windows path for the full
         // argument.
-        let size = metadata.len();
         let mut data = Vec::new();
-        if size > usize::MAX as u64 || data.try_reserve_exact(size as usize).is_err() {
+        if keep > usize::MAX as u64 || data.try_reserve_exact(keep as usize).is_err() {
             return Err(Refused::new(
                 path,
                 Why::OutOfMemory {
-                    size,
+                    size: keep,
                     available: budget::available_commit_bytes(),
                 },
             ));
         }
-        let file = std::fs::File::open(path).map_err(|e| {
+        let mut file = std::fs::File::open(path).map_err(|e| {
             Refused::new(
                 path,
                 Why::Os {
@@ -370,8 +408,9 @@ impl Reader {
         // Fully qualified rather than a `use` of the trait: this whole function
         // is `cfg(not(windows))`, and an import that only it needs would be an
         // unused import on the platform the product ships on.
-        let mut bounded = io::Read::take(file, size);
-        io::Read::read_to_end(&mut bounded, &mut data).map_err(|e| {
+        {
+            let mut bounded = io::Read::take(&file, keep);
+            io::Read::read_to_end(&mut bounded, &mut data).map_err(|e| {
                 Refused::new(
                     path,
                     Why::Os {
@@ -380,7 +419,34 @@ impl Reader {
                     },
                 )
             })?;
-        Ok((data, held))
+        }
+        if let Some(sink) = sink {
+            // The head first, then the rest as it goes past. The sink sees the
+            // file in order, which is what makes a digest fed from it the
+            // file's digest.
+            sink(&data);
+            let mut left = size.saturating_sub(data.len() as u64);
+            let mut buf = [0u8; 64 * 1024];
+            while left > 0 {
+                let want = left.min(buf.len() as u64) as usize;
+                let mut chunk = &mut buf[..want];
+                let got = io::Read::read(&mut file, chunk).map_err(|e| {
+                    Refused::new(
+                        path,
+                        Why::Os {
+                            code: e.raw_os_error().unwrap_or(0) as u32,
+                            message: e.to_string(),
+                        },
+                    )
+                })?;
+                if got == 0 {
+                    break;
+                }
+                sink(&chunk[..got]);
+                left -= got as u64;
+            }
+        }
+        Ok((data, size, held))
     }
 
     /// Read a file, or return an [`io::Error`] carrying the reason as its
@@ -437,14 +503,14 @@ impl Reader {
     /// caller that only wants the bytes gets them through `Deref` and notices
     /// nothing.
     pub fn read_capped(&self, path: &Path, cap: Option<u64>) -> io::Result<Held> {
-        let (data, held) = match cap {
-            None => self.read_limited(path, None),
+        let (data, _, held) = match cap {
+            None => self.read_limited(path, None, None),
             Some(cap) => {
                 let tighter = Self {
                     ceiling: cap.min(self.ceiling),
                     ..*self
                 };
-                tighter.read_limited(path, Some(cap))
+                tighter.read_limited(path, Some(cap), None)
             }
         }
         .map_err(io::Error::from)?;
@@ -684,14 +750,15 @@ impl Reader {
         path: &Path,
         handle: RawHandle,
         limit: Option<u64>,
-    ) -> Result<(Vec<u8>, Reservation<'static>), Refused> {
+        sink: Option<&mut dyn FnMut(&[u8])>,
+    ) -> Result<(Vec<u8>, u64, Reservation<'static>), Refused> {
         use windows::Win32::Foundation::CloseHandle;
         use windows::Win32::Storage::FileSystem::{
             GetFileInformationByHandle, GetFileSizeEx, ReadFile, BY_HANDLE_FILE_INFORMATION,
             FILE_ATTRIBUTE_DIRECTORY,
         };
 
-        let outcome = (|| -> Result<(Vec<u8>, Reservation<'static>), Refused> {
+        let outcome = (|| -> Result<(Vec<u8>, u64, Reservation<'static>), Refused> {
             // What is it? A directory opens successfully under backup
             // semantics, so this is not a theoretical check: without it,
             // `wenle scan C:\Users` would read a directory's metadata as if it
@@ -733,32 +800,41 @@ impl Reader {
                 )
             })?;
             let size = size.max(0) as u64;
+            // What will be held. Everything, unless a sink is taking the bytes
+            // past the limit — then only the head is allocated, and both the
+            // ceiling and the budget apply to the head, because that is all
+            // this read is going to keep. See [`Head`] for why that matters:
+            // a 1.5 GB installer examined to 256 MiB used to occupy 1.5 GB.
+            let keep = match sink {
+                Some(_) => size.min(limit.unwrap_or(size)),
+                None => size,
+            };
             let ceiling = limit.map_or(self.ceiling, |l| l.min(self.ceiling));
-            if size > ceiling {
-                return Err(Refused::new(path, over_reason(size, limit, self.ceiling)));
+            if keep > ceiling {
+                return Err(Refused::new(path, over_reason(keep, limit, self.ceiling)));
             }
             // A `Vec<u8>` of this length has to be addressable, which is not
             // implied by the ceiling: on a 32-bit build the ceiling above is
             // larger than `usize` can express, and `vec![0; n]` would truncate
             // the length rather than fail.
-            if size > usize::MAX as u64 {
+            if keep > usize::MAX as u64 {
                 return Err(Refused::new(
                     path,
                     Why::TooLarge {
-                        size,
+                        size: keep,
                         ceiling: usize::MAX as u64,
                     },
                 ));
             }
-            if size == 0 {
-                return Ok((Vec::new(), budget::shared().reserve(0)));
+            if keep == 0 && sink.is_none() {
+                return Ok((Vec::new(), size, budget::shared().reserve(0)));
             }
 
             // Asked before the budget is, and refused before either the
             // reservation or the allocation happens. See [`affordable`]: the
             // budget bounds a scan's share of what the machine had, and this
             // asks what it has now.
-            affordable(size).map_err(|why| Refused::new(path, why))?;
+            affordable(keep).map_err(|why| Refused::new(path, why))?;
 
             // Reserved before the allocation, never after: the allocation is
             // the thing being bounded, and this is the line that stops twelve
@@ -766,7 +842,7 @@ impl Reader {
             // instant. Charged for the prefilter's copy as well as this one —
             // see `COPIES_PER_FILE` — because both are resident while this file
             // is being scanned.
-            let held = budget::shared().reserve(size);
+            let held = budget::shared().reserve(keep);
 
             // Read until the handle is exhausted or the measured size is
             // reached. Reading exactly the measured size rather than to EOF
@@ -785,16 +861,16 @@ impl Reader {
             // scan. A file that cannot be afforded is refused, with a sentence
             // the user can act on, and the scan carries on.
             let mut data = Vec::new();
-            if data.try_reserve_exact(size as usize).is_err() {
+            if data.try_reserve_exact(keep as usize).is_err() {
                 return Err(Refused::new(path, Why::OutOfMemory {
-                    size,
+                    size: keep,
                     available: budget::available_commit_bytes(),
                 }));
             }
             // Cannot allocate: the capacity is reserved, and `resize` only
             // writes zeroes into it. The memset is the price of not handing the
             // reader a slice of uninitialised memory.
-            data.resize(size as usize, 0);
+            data.resize(keep as usize, 0);
             let mut filled = 0usize;
             while filled < data.len() {
                 let mut got = 0u32;
@@ -823,7 +899,44 @@ impl Reader {
                 filled += got as usize;
             }
             data.truncate(filled);
-            Ok((data, held))
+
+            // The rest of the file, for a caller that wants to see it without
+            // keeping it. The head is fed first, so the sink sees the file in
+            // order even when nothing past the limit has to be read.
+            if let Some(sink) = sink {
+                sink(&data);
+                let mut left = size.saturating_sub(data.len() as u64);
+                let mut buf = [0u8; 64 * 1024];
+                while left > 0 {
+                    let want = left.min(buf.len() as u64) as usize;
+                    let mut got = 0u32;
+                    // SAFETY: `handle` is open for reading, the slice is inside
+                    // `buf`, and `got` is a valid output.
+                    let result = unsafe {
+                        ReadFile(
+                            handle,
+                            Some(&mut buf[..want]),
+                            Some(&mut got),
+                            None,
+                        )
+                    };
+                    if let Err(e) = result {
+                        return Err(Refused::new(
+                            path,
+                            Why::Os {
+                                code: code_of(&e),
+                                message: e.to_string(),
+                            },
+                        ));
+                    }
+                    if got == 0 {
+                        break;
+                    }
+                    sink(&buf[..got as usize]);
+                    left -= got as u64;
+                }
+            }
+            Ok((data, size, held))
         })();
 
         // SAFETY: `handle` came from `CreateFileW`, is still open, and is not
@@ -1043,6 +1156,36 @@ pub fn read_capped(path: &Path, cap: Option<u64>) -> io::Result<Held> {
     default_reader().read_capped(path, cap)
 }
 
+/// Read the first `limit` bytes with the process-wide reader, feeding every
+/// byte of the file to `sink` in order.
+///
+/// See [`Reader::read_head`]. This is the scan engine's path for a file larger
+/// than its size cap: the head is what the rules examine, the sink is how the
+/// whole-file digest is still computed, and the rest is never held.
+pub fn read_head(
+    path: &Path,
+    limit: u64,
+    sink: &mut dyn FnMut(&[u8]),
+) -> io::Result<Head> {
+    default_reader().read_head(path, limit, sink)
+}
+
+/// The first bytes of a file, with the file's real size beside them.
+///
+/// Returned by [`Reader::read_head`]. The distinction from [`Held`] is that
+/// `data` is deliberately shorter than the file: a scan examines at most
+/// `max_file_size` bytes, and holding the rest of a multi-gigabyte installer in
+/// memory to examine a quarter of a gigabyte of it is the waste this type
+/// exists to end.
+#[derive(Debug)]
+pub struct Head {
+    /// The first `limit` bytes, or all of them when the file is shorter.
+    pub data: Vec<u8>,
+    /// The size the handle reported. Not `data.len()` when the file is longer
+    /// than the limit, and the report must say what was really there.
+    pub size: u64,
+}
+
 /// Whether a path can be handed to the operating system at all.
 ///
 /// Exposed because the file walk can use it to *skip* a name it could never
@@ -1210,6 +1353,62 @@ mod tests {
             matches!(refused.why, Why::NotAFile { .. }),
             "{refused}"
         );
+    }
+
+    #[test]
+    fn the_head_of_a_file_is_kept_and_the_rest_is_passed_through() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("long.bin");
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &data).expect("write");
+
+        let mut seen = Vec::new();
+        let head = Reader::ordinary()
+            .read_head(&path, 4096, &mut |chunk| seen.extend_from_slice(chunk))
+            .expect("read");
+        assert_eq!(head.data, data[..4096], "the head is the first bytes");
+        assert_eq!(head.size, data.len() as u64, "the size is the file's");
+        assert_eq!(
+            seen, data,
+            "the sink must see every byte, in file order, or a digest fed \
+             from it is not the file's digest"
+        );
+    }
+
+    #[test]
+    fn a_head_larger_than_the_file_is_the_whole_file() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("short.bin");
+        std::fs::write(&path, b"the quick brown fox").expect("write");
+
+        let mut seen = Vec::new();
+        let head = Reader::ordinary()
+            .read_head(&path, 1_000_000, &mut |chunk| seen.extend_from_slice(chunk))
+            .expect("read");
+        assert_eq!(head.data, b"the quick brown fox");
+        assert_eq!(head.size, 19);
+        assert_eq!(seen, b"the quick brown fox");
+    }
+
+    #[test]
+    fn a_head_read_keeps_a_file_whose_whole_size_is_over_the_ceiling() {
+        // The ceiling exists to stop this product holding a file in memory.
+        // A head read does not hold the file, so the ceiling must apply to
+        // what is kept rather than to what is there — otherwise the fix for
+        // the oversized read would refuse exactly the files it is for.
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("big.bin");
+        let data: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &data).expect("write");
+
+        let mut seen = Vec::new();
+        let head = Reader::ordinary()
+            .with_ceiling(1024)
+            .read_head(&path, 1024, &mut |chunk| seen.extend_from_slice(chunk))
+            .expect("the head fits, so the file is readable");
+        assert_eq!(head.data, data[..1024]);
+        assert_eq!(head.size, 8192);
+        assert_eq!(seen, data);
     }
 
     #[test]

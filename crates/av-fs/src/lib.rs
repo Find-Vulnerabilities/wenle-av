@@ -104,7 +104,8 @@ pub mod walk;
 pub use budget::{Budget, Reservation};
 pub use privilege::{Privilege, Privileges, Presence};
 pub use read::{
-    default_reader, is_representable, read, read_capped, represented_path, try_read, Held, Reader,
+    default_reader, is_representable, read, read_capped, read_head, represented_path, try_read,
+    Head, Held, Reader,
 };
 pub use refusal::{Refused, Why};
 pub use walk::{

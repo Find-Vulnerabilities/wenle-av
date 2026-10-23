@@ -36,7 +36,7 @@ pub use alloc::{crash_log_installed, set_crash_log, MemoryStatus, Reporting};
 pub use archive::{ArchiveSkip, ArchiveSummary, SkipReason};
 pub use config::{AvConfig, Theme};
 pub use error::{AvError, AvResult};
-pub use hash::HashKind;
+pub use hash::{HashKind, Hasher};
 pub use paths::AvPaths;
 pub use scan::{
     Digests, FileKind, FileScanReport, ScanFailure, ScanOptions, ScanProgress, ScanReport,

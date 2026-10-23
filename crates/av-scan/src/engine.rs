@@ -62,7 +62,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use av_core::{
-    Assessment, Detection, DetectionSource, Digests, FileScanReport, HashKind, ScanFailure,
+    Assessment, Detection, DetectionSource, Digests, FileScanReport, HashKind, Hasher, ScanFailure,
     ScanOptions, Severity, VerdictThresholds,
 };
 use av_rules::database::RuleDatabase;
@@ -103,26 +103,53 @@ pub enum DigestPolicy {
 }
 
 impl DigestPolicy {
-    /// Compute the digests this policy asks for.
+    /// Compute the digests this policy asks for, in one pass over `data`.
     fn compute(self, data: &[u8], blocklist: &Blocklist) -> Digests {
+        let mut hashers = self.hashers(blocklist);
+        for (_, hasher) in &mut hashers {
+            hasher.update(data);
+        }
+        finish_digests(hashers)
+    }
+
+    /// The hashers this policy asks for, before any bytes are fed.
+    ///
+    /// The scan of a file larger than its size cap reads the head and hands the
+    /// rest to these as it goes past, so the digest covers the whole file while
+    /// only the head is held. See [`av_fs::Reader::read_head`]. One list, used
+    /// by both the whole-buffer and the streaming path, so the two cannot
+    /// disagree about which digests a policy produces.
+    fn hashers(self, blocklist: &Blocklist) -> Vec<(HashKind, Hasher)> {
+        let mut kinds = Vec::with_capacity(3);
         match self {
-            DigestPolicy::None => Digests::default(),
-            DigestPolicy::All => Digests {
-                md5: Some(HashKind::Md5.digest(data)),
-                sha1: Some(HashKind::Sha1.digest(data)),
-                sha256: Some(HashKind::Sha256.digest(data)),
-            },
-            DigestPolicy::Needed => Digests {
-                sha256: Some(HashKind::Sha256.digest(data)),
-                sha1: blocklist
-                    .needs(HashKind::Sha1)
-                    .then(|| HashKind::Sha1.digest(data)),
-                md5: blocklist
-                    .needs(HashKind::Md5)
-                    .then(|| HashKind::Md5.digest(data)),
-            },
+            DigestPolicy::None => {}
+            DigestPolicy::All => kinds.extend([HashKind::Md5, HashKind::Sha1, HashKind::Sha256]),
+            DigestPolicy::Needed => {
+                kinds.push(HashKind::Sha256);
+                if blocklist.needs(HashKind::Sha1) {
+                    kinds.push(HashKind::Sha1);
+                }
+                if blocklist.needs(HashKind::Md5) {
+                    kinds.push(HashKind::Md5);
+                }
+            }
+        }
+        kinds.into_iter().map(|kind| (kind, kind.hasher())).collect()
+    }
+}
+
+/// Turn finished hashers into the report's digests.
+fn finish_digests(hashers: Vec<(HashKind, Hasher)>) -> Digests {
+    let mut digests = Digests::default();
+    for (kind, hasher) in hashers {
+        let value = Some(hasher.finish());
+        match kind {
+            HashKind::Md5 => digests.md5 = value,
+            HashKind::Sha1 => digests.sha1 = value,
+            HashKind::Sha256 => digests.sha256 = value,
         }
     }
+    digests
 }
 
 /// Everything a scan needs that is not the file.
@@ -292,12 +319,31 @@ impl ScanEngine {
         options: &ScanOptions,
     ) -> FileScanReport {
         let started = Instant::now();
-        let size = data.len() as u64;
-
         // Digests are taken over the whole file, before any size cap applies. A
         // blocklist hash names a file, and a digest of the first 256 MiB of a
         // 300 MiB file is a digest of nothing.
         let digests = self.digests.compute(data, &self.blocklist);
+        self.scan_prepared(scanner, path, data, data.len() as u64, digests, options, started)
+    }
+
+    /// The body of a scan, once the bytes and their digests are in hand.
+    ///
+    /// `size` is the file's real size, which is not `data.len()` when only the
+    /// head of a file larger than `max_file_size` was kept: the truncation
+    /// note, the per-file time budget and the report's `size` all speak about
+    /// the file, not about the part of it this scan could see. `started` is
+    /// passed in because the reading path computes the digest as it reads, and
+    /// that time belongs to the file.
+    fn scan_prepared(
+        &self,
+        scanner: &mut Scanner<'_>,
+        path: &Path,
+        data: &[u8],
+        size: u64,
+        digests: Digests,
+        options: &ScanOptions,
+        started: Instant,
+    ) -> FileScanReport {
 
         // -- the product's own data ------------------------------------------
         //
@@ -319,7 +365,7 @@ impl ScanEngine {
             Some(cap) => &data[..data.len().min(usize::try_from(cap).unwrap_or(usize::MAX))],
             None => data,
         };
-        let truncated = examined.len() < data.len();
+        let truncated = (examined.len() as u64) < size;
 
         // Parsed once and shared. `PeInput` reads every table the `pe` module
         // exposes, so the rules, the heuristics and the trust layer all ask the
@@ -771,12 +817,43 @@ impl ScanEngine {
         // user reads is different, and the sentence is the whole point, because
         // it is the difference between "your scanner is broken" and "run this
         // elevated".
-        match av_fs::read(path) {
-            Ok(data) => self.scan_with(scanner, path, &data, options),
+        let started = Instant::now();
+        // A scan that examines at most `max_file_size` bytes reads at most that
+        // many. The digest still covers the whole file — `read_head` feeds
+        // every byte past the cap to these hashers as it goes past — so a
+        // 1.5 GB installer this product will look at 256 MiB of costs 256 MiB
+        // of memory rather than 1.5 GB. Before this, the whole file was read
+        // and then truncated to the cap. See [`av_fs::Reader::read_head`].
+        let read = match options.max_file_size {
+            Some(limit) => {
+                let mut hashers = self.digests.hashers(&self.blocklist);
+                let head = {
+                    let mut feed = |chunk: &[u8]| {
+                        for (_, hasher) in &mut hashers {
+                            hasher.update(chunk);
+                        }
+                    };
+                    av_fs::read_head(path, limit, &mut feed)
+                };
+                head.map(|head| (head.data, head.size, finish_digests(hashers)))
+            }
+            None => av_fs::read(path).map(|data| {
+                let size = data.len() as u64;
+                let digests = self.digests.compute(&data, &self.blocklist);
+                (data, size, digests)
+            }),
+        };
+
+        match read {
+            Ok((data, size, digests)) => {
+                self.scan_prepared(scanner, path, &data, size, digests, options, started)
+            }
             Err(e) => {
                 let failure = ScanFailure::from_error(path, &av_core::AvError::io_at(path, e));
                 log::debug!("{}: {failure:?}", path.display());
-                let mut report = self.scan_with(scanner, path, &[], options);
+                let digests = self.digests.compute(&[], &self.blocklist);
+                let mut report =
+                    self.scan_prepared(scanner, path, &[], 0, digests, options, started);
                 report.assessment = Assessment::unknown(failure.reason.clone());
                 report.error = Some(failure.reason);
                 report.size = 0;
@@ -1407,6 +1484,47 @@ rule SIGNATURE_BASE_KEYLOGGER {
             from_disk.assessment.detections.len(),
             from_memory.assessment.detections.len()
         );
+    }
+
+    #[test]
+    fn a_file_over_the_size_cap_keeps_its_head_and_the_digest_of_the_whole_file() {
+        // The read used to hold the whole file and then examine the first
+        // `max_file_size` bytes of it; a 1.5 GB installer cost 1.5 GB of
+        // memory to scan 256 MiB. Now the head is kept and the rest is fed
+        // past the hashers, so the three facts a report carries about a
+        // truncated file have to stay true: the size is the file's, the
+        // digest is the file's, and the examined part is the cap.
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let file = dir.path().join("large.bin");
+        let mut data = MARKER.to_vec();
+        data.resize(64 * 1024, 0x90);
+        std::fs::write(&file, &data).expect("writing the fixture");
+
+        let mut options = rules_only();
+        options.max_file_size = Some(MARKER.len() as u64);
+
+        let report = engine().scan_file(&file, &options);
+        assert_eq!(
+            report.size,
+            data.len() as u64,
+            "the report must name the file, not the head it kept"
+        );
+        assert_eq!(report.scanned_bytes, MARKER.len() as u64);
+        assert!(
+            report.is_detection(),
+            "the head is still the part the rules examine: {:?}",
+            report.assessment.detections
+        );
+        assert_eq!(
+            report.digests.sha256,
+            Some(HashKind::Sha256.digest(&data)),
+            "a digest of the head is a digest of nothing"
+        );
+        assert!(report
+            .assessment
+            .detections
+            .iter()
+            .any(|d| d.rule_id == "scan/truncated"));
     }
 
     #[test]

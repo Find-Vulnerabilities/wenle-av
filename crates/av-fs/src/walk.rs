@@ -1413,6 +1413,25 @@ mod tests {
         let dir = tree();
         let locked = dir.path().join("b");
         let locked_file = locked.join("four.txt");
+        // This test needs a denial that applies to *this process*, and
+        // SeBackupPrivilege is process-wide: `crate::read` turns it on the
+        // first time it reads a file, and every test in this binary shares the
+        // process. Once it is on, the DACL below grants nothing and the walk
+        // lists the directory anyway -- measured 2026-10-23, when the whole
+        // suite failed here with /four.txt in the output while the same test
+        // passed alone. Saying the premise could not be built is the honest
+        // answer; asserting either way would make this test depend on thread
+        // order.
+        if matches!(
+            crate::privilege::query(crate::privilege::Privilege::Backup),
+            Ok(presence) if presence.is_enabled()
+        ) {
+            eprintln!(
+                "skipped: this process already holds SeBackupPrivilege, so a directory it is \
+                 denied cannot be built"
+            );
+            return;
+        }
         let output = std::process::Command::new("icacls")
             .arg(&locked)
             .args(["/deny", "*S-1-1-0:(RD)"])

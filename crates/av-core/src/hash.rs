@@ -83,6 +83,52 @@ impl HashKind {
     pub fn is_well_formed(self, text: &str) -> bool {
         text.len() == self.hex_len() && text.bytes().all(|b| b.is_ascii_hexdigit())
     }
+
+    /// A hasher for this algorithm, for a digest of bytes that are read in
+    /// pieces rather than held at once.
+    ///
+    /// This exists for one caller: a scan reads the first `max_file_size`
+    /// bytes of a large file but must still identify the *whole* file, because
+    /// a blocklist entry names every byte and a digest of the first 256 MiB of
+    /// a 1.5 GB file is a digest of nothing. Feeding the remainder through a
+    /// hasher as it goes past costs no memory and produces the same value as
+    /// [`HashKind::digest`] over the whole file — a property the tests pin.
+    pub fn hasher(self) -> Hasher {
+        match self {
+            HashKind::Md5 => Hasher::Md5(Md5::new()),
+            HashKind::Sha1 => Hasher::Sha1(Sha1::new()),
+            HashKind::Sha256 => Hasher::Sha256(Sha256::new()),
+        }
+    }
+}
+
+/// A digest computed in pieces. See [`HashKind::hasher`].
+#[derive(Debug)]
+pub enum Hasher {
+    Md5(Md5),
+    Sha1(Sha1),
+    Sha256(Sha256),
+}
+
+impl Hasher {
+    /// Feed the next piece of the file.
+    pub fn update(&mut self, data: &[u8]) {
+        match self {
+            Hasher::Md5(hasher) => Digest::update(hasher, data),
+            Hasher::Sha1(hasher) => Digest::update(hasher, data),
+            Hasher::Sha256(hasher) => Digest::update(hasher, data),
+        }
+    }
+
+    /// The lowercase hexadecimal digest of everything fed so far, spelled the
+    /// same way [`HashKind::digest`] spells it.
+    pub fn finish(self) -> String {
+        match self {
+            Hasher::Md5(hasher) => hex(&Digest::finalize(hasher)),
+            Hasher::Sha1(hasher) => hex(&Digest::finalize(hasher)),
+            Hasher::Sha256(hasher) => hex(&Digest::finalize(hasher)),
+        }
+    }
 }
 
 /// A byte slice as lowercase hexadecimal.
@@ -138,6 +184,26 @@ mod tests {
             assert_eq!(digest.len(), kind.hex_len(), "{kind:?}");
             assert_eq!(digest, digest.to_lowercase(), "{kind:?}");
             assert!(kind.is_well_formed(&digest), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn a_digest_fed_in_pieces_is_the_digest_of_the_whole() {
+        // The whole point of the streaming form: the scan holds the first
+        // `max_file_size` bytes and feeds the rest past a hasher, and the
+        // value it reports has to be the file's own digest. Fed in uneven
+        // pieces, including an empty one, because a read loop produces both.
+        let data: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        for kind in [HashKind::Md5, HashKind::Sha1, HashKind::Sha256] {
+            let mut hasher = kind.hasher();
+            let mut at = 0;
+            for step in [0usize, 1, 4095, 65_536, 30_368] {
+                let end = (at + step).min(data.len());
+                hasher.update(&data[at..end]);
+                at = end;
+            }
+            hasher.update(&data[at..]);
+            assert_eq!(hasher.finish(), kind.digest(&data), "{kind:?}");
         }
     }
 
