@@ -276,6 +276,84 @@ pub struct Rule {
     /// An entry made only of `*` is refused at load: it would silence its rule.
     #[serde(default)]
     pub path_excludes: Vec<String>,
+    /// Image file names that **disqualify** an event: when the acting process's
+    /// image name matches one of these, the rule does not match, whatever else
+    /// it satisfies. The match is the same as [`Self::path_excludes`]'s — a
+    /// case-insensitive substring, or a `*` wildcard — but against the image's
+    /// file name rather than the event's path.
+    ///
+    /// It exists because an uninstaller deleting the installation it is
+    /// removing produces exactly the shape of a sweep, and no path exclusion can
+    /// separate it from one: the measurement is the round of 2026-10-19, when
+    /// twenty-two winget install/uninstall pairs were driven on the host and
+    /// Windows Installer's `msiexec.exe`, Inno Setup's `unins000.exe` and
+    /// `_iu*.tmp`, and NSIS's `Un_A.exe`/`Un_B.exe` each deleted or renamed
+    /// their own product's tree in bulk — Audacity, Zoom, LibreOffice,
+    /// Thunderbird, GIMP, Joplin, qBittorrent. The actor is the only part of
+    /// those events that says "this is the removal of the thing being removed",
+    /// so the exclusion is written against it.
+    ///
+    /// An unknown image (the engine never saw the process start) is **not** a
+    /// match, so an exclusion can never be satisfied by a missing fact.
+    #[serde(default)]
+    pub process_image_excludes: Vec<String>,
+    /// Case-insensitive substrings the registry value's **data** must contain.
+    ///
+    /// Added 2026-10-19, the day the driver began sending a value's contents.
+    /// Until then every persistence rule matched on the key and the value's
+    /// name alone, and `Run\Zoom = "C:\Program Files\Zoom\Zoom.exe"` was
+    /// indistinguishable from `Run\Zoom = "%TEMP%\evil.exe"` — so each ordinary
+    /// installer produced the same warning a persistence mechanism does, and
+    /// the useful signal was buried under them.
+    ///
+    /// A rule that states a `value_*` condition is **not** satisfied by an
+    /// event that carries no value, for the same reason a path condition is not
+    /// satisfied by an event with no path: unknown is not a match. That is what
+    /// keeps these conditions narrow — they cannot fire on a key change, and
+    /// they cannot fire on a binary value, which the driver does not render as
+    /// text.
+    #[serde(default)]
+    pub value_contains: Vec<String>,
+    /// Case-insensitive prefixes the value's data must start with.
+    #[serde(default)]
+    pub value_prefix: Vec<String>,
+    /// Case-insensitive suffixes the value's data must end with.
+    #[serde(default)]
+    pub value_suffix: Vec<String>,
+    /// Case-insensitive substrings that **disqualify** a value, with the same
+    /// substring-or-`*`-wildcard form as [`Self::path_excludes`]. Applied after
+    /// the positive conditions, and only when there is a value to refuse.
+    #[serde(default)]
+    pub value_excludes: Vec<String>,
+    /// Case-insensitive substrings the started process's **command line** must
+    /// contain, **any one** of which satisfies it — the same "within a field is
+    /// a choice" rule every other list here follows.
+    ///
+    /// Added 2026-10-22. Until then a rule could name the program and not what
+    /// it was asked to do, so `vssadmin.exe` deleting shadow copies and
+    /// `vssadmin.exe` listing them were the same event. The driver cannot
+    /// supply this -- `PS_CREATE_NOTIFY_INFO` carries no arguments -- so the
+    /// service reads it from the started process and fills
+    /// [`crate::Record::command_line`]; an event whose command line could not be
+    /// read does **not** satisfy a condition written here. The same rule as
+    /// [`Self::value_contains`]: unknown is not a match.
+    ///
+    /// Only a `process_started` rule may name one, and [`RuleSet::validate`]
+    /// refuses a rule that pairs it with another action.
+    #[serde(default)]
+    pub command_line_contains: Vec<String>,
+    /// Case-insensitive substrings the command line must **all** contain.
+    ///
+    /// This is the one list in the language that is a conjunction, and it is
+    /// one because a command line is read as a sentence: "this program, asked
+    /// this" is a fact made of parts. `vssadmin delete shadows` needs both
+    /// words, and the other two spellings of the same idea -- a different order,
+    /// a different switch -- would be separate rules if `delete` and `shadows`
+    /// had to be adjacent. Writing it as two entries of
+    /// [`Self::command_line_contains`] would instead match `vssadmin list
+    /// shadows`, which is an administrator looking.
+    #[serde(default)]
+    pub command_line_requires: Vec<String>,
     /// File names (not paths) the acting process's image must be, any one of.
     #[serde(default)]
     pub process_image: Vec<String>,
@@ -379,50 +457,138 @@ impl Rule {
         if !self.parent_image.is_empty() && !names_any(&self.parent_image, parent_image) {
             return Verdict::NoMatch;
         }
-        let Some(path) = record.folded() else {
-            // A rule that names a path condition cannot be satisfied by an
-            // event that has no path.
-            return if self.path_suffix.is_empty()
-                && self.path_contains.is_empty()
-                && self.path_prefix.is_empty()
-            {
-                Verdict::Matches
-            } else {
-                Verdict::NoMatch
+        // The path conditions. An event with no path cannot satisfy a rule
+        // that names one; a rule that names none is not affected by the
+        // absence, which is what lets the value conditions below speak about a
+        // registry event that has no path.
+        let path = record.folded();
+        let names_a_path = !self.path_suffix.is_empty()
+            || !self.path_contains.is_empty()
+            || !self.path_prefix.is_empty();
+        match path {
+            Some(path) => {
+                if !self.path_suffix.is_empty()
+                    && !self
+                        .path_suffix
+                        .iter()
+                        .any(|suffix| ends_with_ascii(path, suffix))
+                {
+                    return Verdict::NoMatch;
+                }
+                if !self.path_contains.is_empty()
+                    && !self
+                        .path_contains
+                        .iter()
+                        .any(|needle| contains_ascii(path, needle))
+                {
+                    return Verdict::NoMatch;
+                }
+                if !self.path_prefix.is_empty()
+                    && !self
+                        .path_prefix
+                        .iter()
+                        .any(|prefix| starts_with_ascii(path, prefix))
+                {
+                    return Verdict::NoMatch;
+                }
+            }
+            None if names_a_path => return Verdict::NoMatch,
+            None => {}
+        }
+
+        // The value conditions, the same three forms against the value's data.
+        // A rule that names one cannot be satisfied by an event that carries
+        // no value — the same rule as for a path, and the reason a registry
+        // rule written against a value cannot fire on a binary one.
+        let names_a_value = !self.value_contains.is_empty()
+            || !self.value_prefix.is_empty()
+            || !self.value_suffix.is_empty();
+        match record.folded_value() {
+            Some(value) => {
+                if !self.value_contains.is_empty()
+                    && !self
+                        .value_contains
+                        .iter()
+                        .any(|needle| contains_ascii(value, needle))
+                {
+                    return Verdict::NoMatch;
+                }
+                if !self.value_prefix.is_empty()
+                    && !self
+                        .value_prefix
+                        .iter()
+                        .any(|prefix| starts_with_ascii(value, prefix))
+                {
+                    return Verdict::NoMatch;
+                }
+                if !self.value_suffix.is_empty()
+                    && !self
+                        .value_suffix
+                        .iter()
+                        .any(|suffix| ends_with_ascii(value, suffix))
+                {
+                    return Verdict::NoMatch;
+                }
+                if let Some(pattern) = self
+                    .value_excludes
+                    .iter()
+                    .find(|pattern| excluded(value, pattern))
+                {
+                    return Verdict::ExcludedByValue(pattern);
+                }
+            }
+            None if names_a_value => return Verdict::NoMatch,
+            None => {}
+        }
+
+        // The command line, the same discipline again: a rule that names a
+        // substring of it is not satisfied by a process start whose command line
+        // nobody could read, and no other kind of event carries one at all.
+        if !self.command_line_contains.is_empty() || !self.command_line_requires.is_empty() {
+            let Some(line) = record.command_line.as_deref() else {
+                return Verdict::NoMatch;
             };
-        };
-        if !self.path_suffix.is_empty()
-            && !self
-                .path_suffix
+            // Folded here rather than stored folded on the record: only a rule
+            // that names a command line ever pays for it, and those are few.
+            let folded = line.to_ascii_lowercase();
+            if !self.command_line_contains.is_empty()
+                && !self
+                    .command_line_contains
+                    .iter()
+                    .any(|needle| contains_ascii(&folded, needle))
+            {
+                return Verdict::NoMatch;
+            }
+            if !self
+                .command_line_requires
                 .iter()
-                .any(|suffix| ends_with_ascii(path, suffix))
-        {
-            return Verdict::NoMatch;
+                .all(|needle| contains_ascii(&folded, needle))
+            {
+                return Verdict::NoMatch;
+            }
         }
-        if !self.path_contains.is_empty()
-            && !self
-                .path_contains
-                .iter()
-                .any(|needle| contains_ascii(path, needle))
-        {
-            return Verdict::NoMatch;
-        }
-        if !self.path_prefix.is_empty()
-            && !self
-                .path_prefix
-                .iter()
-                .any(|prefix| starts_with_ascii(path, prefix))
-        {
-            return Verdict::NoMatch;
-        }
+
         // Last, and only ever a refusal: an exclusion cannot make a rule match
         // something it would not otherwise have matched.
-        if let Some(pattern) = self
-            .path_excludes
-            .iter()
-            .find(|pattern| excluded(path, pattern))
-        {
-            return Verdict::Excluded(pattern);
+        if let Some(path) = path {
+            if let Some(pattern) = self
+                .path_excludes
+                .iter()
+                .find(|pattern| excluded(path, pattern))
+            {
+                return Verdict::Excluded(pattern);
+            }
+        }
+        // The same refusal, made against the actor rather than the path. An
+        // image the engine does not know cannot satisfy it.
+        if let Some(image) = process_image {
+            if let Some(pattern) = self
+                .process_image_excludes
+                .iter()
+                .find(|pattern| excluded(image, pattern))
+            {
+                return Verdict::ExcludedByImage(pattern);
+            }
         }
         Verdict::Matches
     }
@@ -430,17 +596,24 @@ impl Rule {
 
 /// What one rule made of one event.
 ///
-/// [`Verdict::Excluded`] exists for observability rather than for matching:
-/// the event cleared every predicate the rule states and was then refused by
-/// one of its [`Rule::path_excludes`] entries. The engine logs that — at
-/// `trace`, with the rule, the path and the entry — so that an exclusion which
-/// is doing its job leaves a record instead of a hole.
+/// The three `Excluded*` variants exist for observability rather than for
+/// matching: the event cleared every predicate the rule states and was then
+/// refused, by one of its [`Rule::path_excludes`], [`Rule::value_excludes`] or
+/// [`Rule::process_image_excludes`] entries. The engine logs that — at `trace`,
+/// with the rule, the text and the entry — so that an exclusion which is doing
+/// its job leaves a record instead of a hole.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Verdict<'a> {
     /// Every predicate passed.
     Matches,
     /// Every predicate passed, but this exclusion entry refused the path.
     Excluded(&'a str),
+    /// Every predicate and the path exclusions passed, but this entry refused
+    /// the acting process's image.
+    ExcludedByImage(&'a str),
+    /// Every predicate passed, but this [`Rule::value_excludes`] entry refused
+    /// the registry value's data.
+    ExcludedByValue(&'a str),
     /// Some predicate other than an exclusion failed.
     NoMatch,
 }
@@ -482,16 +655,18 @@ fn contains_ascii(haystack: &str, needle: &str) -> bool {
             .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
-/// Whether one `path_excludes` entry refuses `path`.
+/// Whether one exclusion entry — a `path_excludes` entry against a path, or a
+/// `process_image_excludes` entry against an image's file name — refuses the
+/// text.
 ///
 /// A plain entry is a substring; an entry with a `*` is a wildcard that must
-/// match somewhere in the path. Matching ignores ASCII case, like every other
+/// match somewhere in the text. Matching ignores ASCII case, like every other
 /// path condition here.
-fn excluded(path: &str, pattern: &str) -> bool {
+fn excluded(text: &str, pattern: &str) -> bool {
     if pattern.contains('*') {
-        wildcard_contains(path, pattern)
+        wildcard_contains(text, pattern)
     } else {
-        contains_ascii(path, pattern)
+        contains_ascii(text, pattern)
     }
 }
 
@@ -608,6 +783,19 @@ impl RuleSet {
                     });
                 }
             }
+            // A command line belongs to a process start and to nothing else, so
+            // a rule that names one and also names another action would be half
+            // mute -- the other action could never satisfy it.
+            if !rule.command_line_contains.is_empty() || !rule.command_line_requires.is_empty() {
+                if rule.action.iter().any(|action| *action != Action::ProcessStarted) {
+                    return Err(LoadError::Invalid {
+                        id: rule.id.clone(),
+                        reason: "a command-line condition is written for `process_started`, and \
+                                 this rule names another action"
+                            .to_string(),
+                    });
+                }
+            }
             // An uppercase suffix is not an error — the match is case
             // insensitive — but an empty one matches everything, which is a
             // rule that says less than its author meant.
@@ -616,8 +804,15 @@ impl RuleSet {
                 ("path_contains", &rule.path_contains),
                 ("path_prefix", &rule.path_prefix),
                 ("path_excludes", &rule.path_excludes),
+                ("process_image_excludes", &rule.process_image_excludes),
                 ("process_image", &rule.process_image),
                 ("parent_image", &rule.parent_image),
+                ("value_contains", &rule.value_contains),
+                ("value_prefix", &rule.value_prefix),
+                ("value_suffix", &rule.value_suffix),
+                ("value_excludes", &rule.value_excludes),
+                ("command_line_contains", &rule.command_line_contains),
+                ("command_line_requires", &rule.command_line_requires),
             ] {
                 if list.iter().any(|item| item.trim().is_empty()) {
                     return Err(LoadError::Invalid {
@@ -637,6 +832,26 @@ impl RuleSet {
                 return Err(LoadError::Invalid {
                     id: rule.id.clone(),
                     reason: format!("path_excludes entry `{pattern}` matches every path"),
+                });
+            }
+            if let Some(pattern) = rule
+                .process_image_excludes
+                .iter()
+                .find(|pattern| pattern.trim().chars().all(|character| character == '*'))
+            {
+                return Err(LoadError::Invalid {
+                    id: rule.id.clone(),
+                    reason: format!("process_image_excludes entry `{pattern}` matches every image"),
+                });
+            }
+            if let Some(pattern) = rule
+                .value_excludes
+                .iter()
+                .find(|pattern| pattern.trim().chars().all(|character| character == '*'))
+            {
+                return Err(LoadError::Invalid {
+                    id: rule.id.clone(),
+                    reason: format!("value_excludes entry `{pattern}` matches every value"),
                 });
             }
         }

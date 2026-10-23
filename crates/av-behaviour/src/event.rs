@@ -38,6 +38,27 @@ pub struct Record {
     /// the paths that matter here; a non-ASCII name is folded only where it is
     /// ASCII, which can make a match miss but never makes one appear.
     pub folded_path: Option<String>,
+    /// The data written to a registry value, in its original case, when the
+    /// driver sent one. `None` for every event that names no value — including
+    /// a registry key change and a value write whose data was not a string.
+    /// Kept because it is what a finding shows a person, exactly like the path.
+    pub value: Option<String>,
+    /// The value folded for matching, the same way as the path.
+    pub folded_value: Option<String>,
+    /// The command line of a process start, when the caller could read one.
+    ///
+    /// **Not from the driver.** `PS_CREATE_NOTIFY_INFO` carries the image and
+    /// the parent, not the arguments, and by the time the service looks the
+    /// process may be gone. So this is filled by whoever builds the record --
+    /// `av-service` reads it from the started process and leaves `None` when it
+    /// cannot -- and a rule with a command-line condition is simply not
+    /// satisfied by an event that carries none. Same rule as for a value:
+    /// unknown is not a match.
+    ///
+    /// It is here rather than on `av_ipc::DriverEvent` because the driver has
+    /// nothing to add to it, and a field the driver always leaves empty is a
+    /// field that invites a reader to believe it was measured there.
+    pub command_line: Option<String>,
     /// The process responsible.
     pub process_id: u32,
     /// The process that created it, for a process start.
@@ -58,6 +79,7 @@ impl Record {
             .path
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned());
+        let value = event.value.clone();
         Some(Record {
             timestamp: event.timestamp_100ns,
             subject,
@@ -65,14 +87,32 @@ impl Record {
             detail: event.detail,
             folded_path: path.as_deref().map(fold),
             path,
+            folded_value: value.as_deref().map(fold),
+            value,
+            command_line: event.command_line.clone(),
             process_id: event.process_id,
             parent_process_id: event.parent_process_id,
         })
     }
 
+    /// Attach a command line the caller read from the started process.
+    ///
+    /// The engine matches on it folded, so the caller does not fold it here.
+    pub fn set_command_line(&mut self, command_line: impl Into<String>) {
+        let command_line = command_line.into();
+        if !command_line.is_empty() {
+            self.command_line = Some(command_line);
+        }
+    }
+
     /// The path folded for matching.
     pub fn folded(&self) -> Option<&str> {
         self.folded_path.as_deref()
+    }
+
+    /// The value folded for matching.
+    pub fn folded_value(&self) -> Option<&str> {
+        self.folded_value.as_deref()
     }
 
     /// The file name of a path, folded. `None` when there is no path or it ends
@@ -116,6 +156,8 @@ mod tests {
             parent_process_id: 5678,
             thread_id: 0,
             detail: 0,
+            value: None,
+command_line: None,
             driver_state: None,
         }
     }
@@ -140,6 +182,43 @@ mod tests {
             Some(r"c:\users\someone\documents\report.docx")
         );
         assert_eq!(record.image_name().as_deref(), Some("report.docx"));
+    }
+
+    #[test]
+    fn a_registry_value_becomes_a_record_with_both_cases_of_the_value() {
+        let mut raw = event(
+            DriverEventAction::RegistryChanged,
+            DriverSubject::Registry,
+            Some(
+                r"\REGISTRY\MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Run\Zoom",
+            ),
+        );
+        raw.value = Some(r"C:\Program Files\Zoom\Zoom.exe".to_string());
+        let record = Record::from_driver(&raw).expect("a value write is a record");
+        assert_eq!(
+            record.value.as_deref(),
+            Some(r"C:\Program Files\Zoom\Zoom.exe"),
+            "the original case is what a finding shows"
+        );
+        assert_eq!(
+            record.folded_value(),
+            Some(r"c:\program files\zoom\zoom.exe")
+        );
+        assert!(
+            record.folded().is_some(),
+            "the key path is still there as well; the value is an addition"
+        );
+
+        // An event that carried no value has none — not an empty string, which
+        // a `value_contains` condition would be satisfied by.
+        let key_only = event(
+            DriverEventAction::RegistryChanged,
+            DriverSubject::Registry,
+            Some(r"\REGISTRY\MACHINE\SOFTWARE\Vendor"),
+        );
+        let record = Record::from_driver(&key_only).expect("a key change is a record");
+        assert!(record.value.is_none());
+        assert!(record.folded_value().is_none());
     }
 
     #[test]

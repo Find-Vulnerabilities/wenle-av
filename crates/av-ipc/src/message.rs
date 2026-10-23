@@ -706,9 +706,9 @@ pub struct ScanFinished {
 ///
 /// A translated form of `av_driver_proto::wire::EventMessage`, and translated
 /// rather than passed through as bytes for two reasons: the kernel structure is
-/// a fixed 2120-byte layout with a `[u16; 1024]` path array that no
-/// serialisation format can carry directly, and a client should not have to
-/// know what `path_units` means to read a path.
+/// a fixed 3168-byte layout with a `[u16; 1024]` path array and a
+/// `[u16; 512]` value array that no serialisation format can carry directly,
+/// and a client should not have to know what `path_units` means to read a path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DriverEvent {
     /// Monotonic within one driver load. A gap means the service missed events.
@@ -738,6 +738,39 @@ pub struct DriverEvent {
     /// which is what says whether it is a lost-event count, a driver state or a
     /// byte count.
     pub detail: u32,
+    /// The data written to a registry value, for a
+    /// [`DriverEventAction::RegistryChanged`] event whose detail is
+    /// `REGISTRY_VALUE_SET` and whose value was a string.
+    ///
+    /// `None` for every other event, and for a value whose type was not one of
+    /// the registry's string types — a `REG_BINARY` value has no text to carry,
+    /// and inventing one would be a rule matching on a rendering of bytes.
+    ///
+    /// Added 2026-10-19. The driver's registry event used to carry the key path
+    /// and the value's *name* only, which made `Run\Zoom` pointing at
+    /// `C:\Program Files\Zoom\zoom.exe` indistinguishable from the same value
+    /// pointing at `%TEMP%\evil.exe`: every ordinary installer produced the
+    /// same warning a persistence mechanism does. A value longer than the
+    /// protocol's 512 units arrives as its prefix, which is the part the rules
+    /// are written against; nothing says otherwise because the prefix's own
+    /// shape is what is matched.
+    pub value: Option<String>,
+    /// The command line of a started process, read by the service from the
+    /// process itself.
+    ///
+    /// **Not from the driver.** `PS_CREATE_NOTIFY_INFO` carries the image and
+    /// the parent and no arguments, so this is the one field in this structure
+    /// the driver did not report. It is filled in `driver::translate`, which
+    /// runs on the port thread the moment the message arrives, because that is
+    /// the only moment the process is reliably still alive: measured in the test
+    /// VM on 2026-10-23, `vssadmin delete shadows` lives for a few hundred
+    /// milliseconds, and by the time the event reached the host loop the process
+    /// was gone and every command-line rule stayed quiet.
+    ///
+    /// `None` means "not known", never "empty": a rule with a command-line
+    /// condition is not satisfied by a start whose command line could not be
+    /// read.
+    pub command_line: Option<String>,
     /// The driver's own status picture, for the events that carry one.
     pub driver_state: Option<DriverStatus>,
 }
@@ -964,6 +997,8 @@ mod tests {
                 parent_process_id: 1200,
                 thread_id: 5678,
                 detail: 0,
+                value: None,
+command_line: None,
                 driver_state: None,
             }),
         ]

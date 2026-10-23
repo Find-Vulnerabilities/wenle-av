@@ -142,7 +142,7 @@ pub fn check() -> DriverStatus {
 /// `Unrecognised { code }` — carried rather than dropped, so that a client can
 /// show it and a log can record the number that would have to be added.
 pub fn translate(message: &av_driver_proto::wire::EventMessage) -> DriverEvent {
-    DriverEvent {
+    let mut event = DriverEvent {
         sequence: message.sequence,
         timestamp_100ns: message.timestamp_100ns,
         action: action_from_wire(message.action),
@@ -152,13 +152,32 @@ pub fn translate(message: &av_driver_proto::wire::EventMessage) -> DriverEvent {
         parent_process_id: message.parent_process_id,
         thread_id: message.thread_id,
         detail: message.detail,
+        value: value_of(message),
+        command_line: None,
         // The driver's own status picture travels in a `Status` message of its
         // own rather than inside an event, and `crate::filter_port` is where it
         // is recorded. An `EventMessage` carries none, so `None` says "this
         // event carried none", which is true, rather than a status invented
         // here from an event that had nothing to do with one.
         driver_state: None,
+    };
+    // The one fact this function adds that the driver did not send. It happens
+    // here, on the port thread, and not in the host loop, because the process
+    // has to be alive for the question to be answerable: measured in the test
+    // VM on 2026-10-23, `vssadmin delete shadows` finished in a few hundred
+    // milliseconds and the host loop reached the event long after that.
+    //
+    // The cost is one `OpenProcess` plus one `NtQueryInformationProcess` per
+    // process start -- both microseconds, and a process start is not a hot
+    // event. Nothing here can block: the driver does not wait for an event's
+    // acknowledgement (`reply_length` is zero for one).
+    if event.action == DriverEventAction::ProcessStarted {
+        #[cfg(windows)]
+        {
+            event.command_line = crate::win32::command_line(event.process_id);
+        }
     }
+    event
 }
 
 /// The action half of [`translate`].
@@ -191,6 +210,34 @@ fn subject_from_wire(code: u32) -> DriverSubject {
         Some(SubjectKind::Protection) => DriverSubject::Protection,
         Some(SubjectKind::Registry) => DriverSubject::Registry,
         None => DriverSubject::Unrecognised { code },
+    }
+}
+
+/// The value an event carries, if it carries one.
+///
+/// Same discipline as [`path_of`], and the same reason: the field is a fixed
+/// array with a *used length*, so a hostile or stale `value_units` is clamped
+/// by the array rather than trusted. An event that names no value yields
+/// `None` rather than an empty string, because "this key has a value whose data
+/// is empty" and "this event carried no value" are different facts and a rule
+/// already treats them differently: a `value_*` condition is not satisfied by
+/// an event with no value.
+///
+/// A truncated value (the driver's `EVENT_VALUE_TRUNCATED`) arrives as the
+/// prefix it is. That is deliberate and is not flagged further: every rule
+/// written against a value matches a prefix of it, and the alternative —
+/// refusing the event — would lose the very fact the field was added to carry.
+fn value_of(message: &av_driver_proto::wire::EventMessage) -> Option<String> {
+    let units = message.value_units as usize;
+    if units == 0 {
+        return None;
+    }
+    let used = units.min(message.value.len());
+    let text = String::from_utf16_lossy(&message.value[..used]);
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
     }
 }
 
@@ -322,6 +369,59 @@ mod tests {
         let heartbeat = translate(&message(EventAction::Heartbeat, SubjectKind::Driver, ""));
         assert!(heartbeat.path.is_none());
         assert_eq!(heartbeat.detail, 0);
+        // And no value, for the same reason: this event carried none.
+        assert!(translated.value.is_none());
+    }
+
+    #[test]
+    fn a_registry_value_write_carries_what_was_written() {
+        // The whole point of the field: two `Run` writes that a rule must tell
+        // apart arrive as two different strings, where before they arrived as
+        // the same key path and nothing else.
+        let mut raw = message(
+            EventAction::RegistryChanged,
+            SubjectKind::Registry,
+            r"\REGISTRY\MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Run\Zoom",
+        );
+        raw.detail = EventAction::REGISTRY_VALUE_SET;
+        // Type 1 is `REG_SZ`; the service does not interpret it, but it is
+        // what the driver puts in the field and a test should not pretend
+        // otherwise.
+        raw.set_value(
+            &r"C:\Program Files\Zoom\bin\Zoom.exe".encode_utf16().collect::<Vec<_>>(),
+            1,
+        );
+        assert_eq!(
+            translate(&raw).value.as_deref(),
+            Some(r"C:\Program Files\Zoom\bin\Zoom.exe")
+        );
+
+        raw.set_value(
+            &r"%TEMP%\evil.exe".encode_utf16().collect::<Vec<_>>(),
+            2,
+        );
+        assert_eq!(translate(&raw).value.as_deref(), Some(r"%TEMP%\evil.exe"));
+
+        // A value is not a path: neither of those moved the path field.
+        assert!(translate(&raw)
+            .path
+            .expect("a path")
+            .to_string_lossy()
+            .ends_with(r"Run\Zoom"));
+
+        // A blocked key event carries no value at all, and `None` is the
+        // honest answer rather than an empty string a rule could match.
+        let key_only = message(
+            EventAction::RegistryChanged,
+            SubjectKind::Registry,
+            r"\REGISTRY\MACHINE\SOFTWARE\Vendor",
+        );
+        assert!(translate(&key_only).value.is_none());
+
+        // A length longer than the array is clamped, exactly as for a path.
+        let mut lying = raw;
+        lying.value_units = u32::MAX;
+        assert!(translate(&lying).value.is_some());
     }
 
     #[test]

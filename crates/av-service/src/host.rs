@@ -1805,7 +1805,33 @@ impl Host {
     /// else would be the kind of overloading that ends up rendered as a path.
     fn observe_behaviour(&mut self, event: &av_ipc::DriverEvent, out: &mut Vec<Event>) {
         let thresholds = av_core::VerdictThresholds::default();
-        for finding in self.behaviour.observe_driver(event) {
+        // A process start is the one event whose command line can be read, and
+        // only while the process is still alive. The driver cannot supply it --
+        // `PS_CREATE_NOTIFY_INFO` carries no arguments -- so this is the one
+        // place the service adds a fact the driver did not report. It is filled
+        // before the engine sees the record and never after: a rule that names a
+        // command line must decide on the same record the lineage was learned
+        // from, and a record built twice would teach the engine the same start
+        // twice.
+        let findings = match av_behaviour::Record::from_driver(event) {
+            Some(mut record) => {
+                if event.action == DriverEventAction::ProcessStarted {
+                    match event.command_line.as_deref() {
+                        Some(command_line) => record.set_command_line(command_line),
+                        // The port thread reads this the moment the event arrives;
+                        // a miss means the process was already gone by then, which
+                        // is the documented limit and is worth a line in the log.
+                        None => log::debug!(
+                            "pid {} started with no readable command line; command-line rules cannot fire for it",
+                            event.process_id
+                        ),
+                    }
+                }
+                self.behaviour.observe(&record)
+            }
+            None => Vec::new(),
+        };
+        for finding in findings {
             let verdict = thresholds.classify(finding.score);
             if verdict != Verdict::Suspicious {
                 log::error!(
@@ -1825,14 +1851,22 @@ impl Host {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(format!("pid {}", finding.process_id)));
             log::warn!(
-                "behaviour: {} {} (pid {}, {} event{} in {} s): {}",
+                "behaviour: {} {} (pid {}, {} event{} in {} s): {}{}",
                 finding.rule_id,
                 finding.name,
                 finding.process_id,
                 finding.count,
                 if finding.count == 1 { "" } else { "s" },
                 finding.window_seconds,
-                path.display()
+                path.display(),
+                // A registry value is the evidence, not an annotation: `Run\Zoom`
+                // alone says a name was written, and the reason the rule fired
+                // is in what was written. Empty for every other event.
+                finding
+                    .value
+                    .as_deref()
+                    .map(|value| format!(" = `{value}`"))
+                    .unwrap_or_default()
             );
             out.push(Event::Detection(Detection {
                 file_name: file_name_of(&path),
@@ -4236,6 +4270,8 @@ mod tests {
             parent_process_id,
             thread_id: 0,
             detail,
+            value: None,
+command_line: None,
             driver_state: None,
         }
     }
@@ -4512,6 +4548,8 @@ mod tests {
             parent_process_id: 0,
             thread_id: 0,
             detail,
+            value: None,
+command_line: None,
             driver_state: None,
         }
     }
@@ -6335,6 +6373,8 @@ mod tests {
             parent_process_id: 0,
             thread_id: 0,
             detail: 0,
+            value: None,
+command_line: None,
             driver_state: None,
         })
     }

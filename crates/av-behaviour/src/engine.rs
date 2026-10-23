@@ -67,6 +67,13 @@ pub struct Finding {
     pub score: u16,
     /// The path the event named, in its original case.
     pub path: Option<String>,
+    /// The registry value's data, when the event carried one and a rule
+    /// matched on it.
+    ///
+    /// Carried into the finding for the same reason the path is: a warning that
+    /// says only `Run\Zoom` is a warning about a name, and the reason this rule
+    /// fired is in the data it names.
+    pub value: Option<String>,
     /// The process responsible.
     pub process_id: u32,
     /// The process that created it, when the event says.
@@ -165,6 +172,32 @@ impl Engine {
                     );
                     continue;
                 }
+                Verdict::ExcludedByValue(pattern) => {
+                    // The third refusal, named against the same event the other
+                    // two name. A registry value is the only event that has
+                    // one, and a rule written against a value that refuses it
+                    // is the narrowest statement in the file — the trace line
+                    // is how the exclusion can be shown to be doing its job.
+                    log::trace!(
+                        "behaviour: {} excluded {} by value_excludes entry `{pattern}` (the value was `{}`)",
+                        self.rules[index].id,
+                        record.path.as_deref().unwrap_or(""),
+                        record.value.as_deref().unwrap_or("")
+                    );
+                    continue;
+                }
+                Verdict::ExcludedByImage(pattern) => {
+                    // Same reasoning, and the image is named in the line because
+                    // the path alone cannot explain why the event was refused:
+                    // the same delete by any other process is still reported.
+                    log::trace!(
+                        "behaviour: {} excluded {} by process_image_excludes entry `{pattern}` (the acting image was {})",
+                        self.rules[index].id,
+                        record.path.as_deref().unwrap_or(""),
+                        image.as_deref().unwrap_or("unknown")
+                    );
+                    continue;
+                }
                 Verdict::Matches => {}
             }
             let (count, window, dedupe) = {
@@ -189,6 +222,7 @@ impl Engine {
                 severity: rule.severity,
                 score: rule.score(),
                 path: record.path.clone(),
+                value: record.value.clone(),
                 process_id: record.process_id,
                 parent_process_id: record.parent_process_id,
                 process_image: image.clone(),
@@ -339,6 +373,9 @@ mod tests {
             detail: 0,
             path: Some(path.to_string()),
             folded_path: Some(path.to_ascii_lowercase()),
+            value: None,
+            folded_value: None,
+            command_line: None,
             process_id: pid,
             parent_process_id: 0,
         }
@@ -748,6 +785,8 @@ mod tests {
             parent_process_id: 0,
             thread_id: 0,
             detail: 0,
+            value: None,
+            command_line: None,
             driver_state: None,
         };
         assert!(engine.observe_driver(&event).is_empty());

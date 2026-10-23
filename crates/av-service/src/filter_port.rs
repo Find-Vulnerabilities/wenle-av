@@ -283,6 +283,13 @@ pub enum Received {
     Unreadable {
         /// One sentence for the log.
         reason: String,
+        /// The two versions, when the reason is that they disagree.
+        ///
+        /// Carried as data and not parsed back out of `reason` because the
+        /// caller acts on it: a mismatch is the one refusal that means the
+        /// product is running blind, and it is raised to a warning rather than
+        /// left at debug. None for every other refusal.
+        mismatch: Option<(u32, u32)>,
     },
 }
 
@@ -310,9 +317,11 @@ impl core::fmt::Debug for Received {
                 .field("state", &status.status.state)
                 .field("mode", &status.status.mode)
                 .finish(),
-            Received::Unreadable { reason } => {
-                f.debug_struct("Unreadable").field("reason", reason).finish()
-            }
+            Received::Unreadable { reason, mismatch } => f
+                .debug_struct("Unreadable")
+                .field("reason", reason)
+                .field("mismatch", mismatch)
+                .finish(),
         }
     }
 }
@@ -342,6 +351,7 @@ pub fn received(buffer: &[u8]) -> Received {
                 buffer.len(),
                 MessagePrefix::SIZE
             ),
+            mismatch: None,
         };
     };
     if !prefix.is_readable() {
@@ -353,6 +363,21 @@ pub fn received(buffer: &[u8]) -> Received {
                 prefix.version,
                 av_driver_proto::PROTOCOL_VERSION
             ),
+            // `is_readable` refuses an unknown *kind* as well as a wrong version,
+            // so the two are told apart here rather than assumed. A *known* kind
+            // that fails the check can only have failed on the version, and that
+            // is the silent-blindness case the event thread warns about.
+            //
+            // The distinction is not academic: the driver's port hands up a
+            // zero-filled prefix now and then -- `KIND_RESERVED` 0, version 0,
+            // which is exactly `MessagePrefix::default` -- and treating that as
+            // a version mismatch made the new warning fire on a healthy pairing
+            // the first time it ran (test VM, 2026-10-23 18:24).
+            mismatch: if av_driver_proto::wire::MessageKind::is_known(prefix.kind) {
+                Some((prefix.version, av_driver_proto::PROTOCOL_VERSION))
+            } else {
+                None
+            },
         };
     }
     // `is_readable` has already established that the kind is one of these, so
@@ -365,18 +390,21 @@ pub fn received(buffer: &[u8]) -> Received {
             Some(message) => Received::DecisionRequest(message),
             None => Received::Unreadable {
                 reason: "a decision request truncated below its own size".to_string(),
+                mismatch: None,
             },
         },
         Some(MessageKind::Event) => match read_struct::<EventMessage>(buffer) {
             Some(message) => Received::Event(message),
             None => Received::Unreadable {
                 reason: "an event truncated below its own size".to_string(),
+                mismatch: None,
             },
         },
         Some(MessageKind::Status) => match read_struct::<StatusMessage>(buffer) {
             Some(message) => Received::Status(message),
             None => Received::Unreadable {
                 reason: "a status message truncated below its own size".to_string(),
+                mismatch: None,
             },
         },
         Some(MessageKind::Config) => Received::Unreadable {
@@ -393,9 +421,11 @@ pub fn received(buffer: &[u8]) -> Received {
                      driver; one arriving here means the driver and this build disagree about the \
                      protocol"
                 .to_string(),
+            mismatch: None,
         },
         None => Received::Unreadable {
             reason: format!("a message kind this build does not define: {}", prefix.kind),
+            mismatch: None,
         },
     }
 }
@@ -1109,7 +1139,7 @@ impl Dispatcher {
                 self.status = Some(message.status);
                 Action::Ignored(describe_status(&message.status))
             }
-            Received::Unreadable { reason } => Action::Ignored(reason),
+            Received::Unreadable { reason, .. } => Action::Ignored(reason),
         }
     }
 
@@ -1409,6 +1439,9 @@ pub(crate) fn connection_event(connected: bool, port_name: &str) -> DriverEvent 
         parent_process_id: 0,
         thread_id: 0,
         detail: u32::from(connected),
+        value: None,
+        // The service's own note about the port; nothing was started.
+        command_line: None,
         driver_state: Some(if connected {
             Presence {
                 // Connecting to the port is proof that the driver created it,
@@ -1847,6 +1880,8 @@ fn configure(
             parent_process_id: 0,
             thread_id: 0,
             detail: detail as u32,
+            value: None,
+            command_line: None,
             driver_state: None,
         }),
     );
@@ -2151,6 +2186,10 @@ fn receive_until_the_port_ends(
 /// for the measurement that made events stop arriving behind a scan.
 #[cfg(windows)]
 fn report_events(messages: &Receiver<Received>, events: &Sender<Event>) {
+    // One warning per connection: the driver reconnects when the service does,
+    // so a mismatch that is still there is said once each time rather than on
+    // every event -- which on a busy machine would be thousands a second.
+    let mut warned_about_mismatch = false;
     loop {
         // No stop flag: this thread ends when the receive thread drops the last
         // sender, which happens when the port ends or the service stops, and
@@ -2161,9 +2200,26 @@ fn report_events(messages: &Receiver<Received>, events: &Sender<Event>) {
         };
         match message {
             Received::Event(event) => publish(events, Event::Driver(driver::translate(&event))),
-            Received::Unreadable { reason } => {
-                log::debug!("a driver message was ignored: {reason}")
-            }
+            // A version mismatch is the one refusal that means this product is
+            // running blind: the driver's events are all being dropped, so the
+            // behaviour rules see nothing and the driver's own status is never
+            // recorded. Measured on 2026-10-23 -- a service one protocol version
+            // ahead of the driver in the test VM dropped every event for two
+            // rounds of testing, and nothing but a debug line said so.
+            Received::Unreadable { reason, mismatch } => match mismatch {
+                Some((driver, build)) if !warned_about_mismatch => {
+                    warned_about_mismatch = true;
+                    log::warn!(
+                        "the driver speaks protocol version {driver} and this build speaks {build}: \
+                         every event the driver sends is being dropped, so behaviour protection is \
+                         not running and the driver's status is not being recorded. Install the \
+                         service and the driver from the same build. Further messages of this kind \
+                         are logged at debug."
+                    );
+                }
+                _ => log::debug!("a driver message was ignored: {reason}"),
+            },
+            // [lane] puts these on the decision lane.
             // [`lane`] puts these on the decision lane. A message here is a
             // defect in that function, and it is said rather than decided on a
             // thread that holds no engine.
@@ -2364,7 +2420,8 @@ mod tests {
         assert_eq!(lane(&Received::Event(event)), Lane::Events);
         assert_eq!(
             lane(&Received::Unreadable {
-                reason: "a message this build cannot read".to_string()
+                reason: "a message this build cannot read".to_string(),
+                mismatch: None,
             }),
             Lane::Events
         );
@@ -2471,8 +2528,9 @@ mod tests {
         let mut bytes = bytes_of(&request_for(r"C:\Windows\System32\cmd.exe"));
         bytes.truncate(MessagePrefix::SIZE + 4);
         match received(&bytes) {
-            Received::Unreadable { reason } => {
+            Received::Unreadable { reason, mismatch } => {
                 assert!(reason.contains("truncated"), "{reason}");
+                assert_eq!(mismatch, None, "a truncation is not a version mismatch");
             }
             other => panic!("a truncated request was not refused: {other:?}"),
         }
@@ -2485,8 +2543,15 @@ mod tests {
         let mut request = request_for(r"C:\Windows\System32\cmd.exe");
         request.prefix.version = av_driver_proto::PROTOCOL_VERSION + 1;
         match received(&bytes_of(&request)) {
-            Received::Unreadable { reason } => {
+            Received::Unreadable { reason, mismatch } => {
                 assert!(reason.contains("version"), "{reason}");
+                // And the versions are carried, because a mismatch is what the
+                // event thread raises to a warning: dropping every event of a
+                // peer is not a debug-level fact.
+                assert_eq!(
+                    mismatch,
+                    Some((av_driver_proto::PROTOCOL_VERSION + 1, av_driver_proto::PROTOCOL_VERSION))
+                );
             }
             other => panic!("a message from another build was decoded: {other:?}"),
         }
@@ -2499,8 +2564,9 @@ mod tests {
         let mut request = request_for(r"C:\Windows\System32\cmd.exe");
         request.prefix.kind = 9_999;
         match received(&bytes_of(&request)) {
-            Received::Unreadable { reason } => {
+            Received::Unreadable { reason, mismatch } => {
                 assert!(reason.contains("9999"), "{reason}");
+                assert_eq!(mismatch, None, "an unknown kind is not a version mismatch");
             }
             other => panic!("an unknown kind was read as a message: {other:?}"),
         }

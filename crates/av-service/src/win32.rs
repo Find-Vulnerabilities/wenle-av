@@ -147,3 +147,239 @@ mod tests {
         assert_eq!(to_wide_str("").len(), 1);
     }
 }
+
+// ---------------------------------------------------------------------------
+// A started process's command line
+// ---------------------------------------------------------------------------
+
+/// `ProcessCommandLineInformation`, from `ntddk.h`'s `PROCESSINFOCLASS`.
+///
+/// Not in the `windows` crate's `Win32` surface — it is an NT call and the
+/// `Win32` bindings do not carry it — so the declaration below is hand-written,
+/// the same way `av-driver` declares the kernel calls it uses.
+const PROCESS_COMMAND_LINE_INFORMATION: u32 = 60;
+
+#[link(name = "ntdll")]
+extern "system" {
+    fn NtQueryInformationProcess(
+        process_handle: *mut core::ffi::c_void,
+        process_information_class: u32,
+        process_information: *mut core::ffi::c_void,
+        process_information_length: u32,
+        return_length: *mut u32,
+    ) -> i32;
+}
+
+/// The command line a process was started with, read from the process itself.
+///
+/// # Why the service reads this and not the driver
+///
+/// `PS_CREATE_NOTIFY_INFO` carries the image and the parent process and no
+/// arguments, and a driver that read another process's `PEB` to find them would
+/// be touching user-mode memory from a kernel callback. The service can open the
+/// process and ask, which is an ordinary user-mode call with an ordinary failure
+/// mode.
+///
+/// # What it cannot do
+///
+/// A process that has already exited cannot be opened, so the answer is `None`
+/// for exactly the programs that run and finish fastest — and `None` is not the
+/// empty command line: a rule with a command-line condition treats it as
+/// "unknown" and does not fire. That is the honest reading, and it is why the
+/// behaviour rules that use this are written as pairs with a path or a parent.
+#[cfg(windows)]
+pub fn command_line(process_id: u32) -> Option<String> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    // SAFETY: the handle is opened for query access, every call below is given
+    // a buffer this function owns, and the handle is closed on every path
+    // through it — including the two early returns.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id).ok()?;
+        let mut needed = 0u32;
+        // The first call is for the size and is expected to fail with
+        // STATUS_INFO_LENGTH_MISMATCH; its status is not interesting, its
+        // `needed` is.
+        NtQueryInformationProcess(
+            handle.0,
+            PROCESS_COMMAND_LINE_INFORMATION,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        );
+        if needed == 0 || needed > 0x1_0000 {
+            let _ = CloseHandle(handle);
+            return None;
+        }
+        let mut buffer = vec![0u8; needed as usize + 2];
+        let status = NtQueryInformationProcess(
+            handle.0,
+            PROCESS_COMMAND_LINE_INFORMATION,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+            &mut needed,
+        );
+        let _ = CloseHandle(handle);
+        if status < 0 {
+            return None;
+        }
+        parse_command_line(&buffer, buffer.as_ptr() as usize)
+    }
+}
+
+/// Pull the text out of the `UNICODE_STRING` that
+/// `ProcessCommandLineInformation` leaves at the front of the buffer.
+///
+/// `base` is the address the buffer starts at, which is what the `Buffer` field
+/// is an absolute pointer to. Every field is checked against the buffer rather
+/// than trusted: this parses a kernel-written structure from a process that is
+/// not ours.
+fn parse_command_line(buffer: &[u8], base: usize) -> Option<String> {
+    if buffer.len() < 16 {
+        return None;
+    }
+    let length = u16::from_le_bytes([buffer[0], buffer[1]]) as usize;
+    let pointer = u64::from_le_bytes(buffer[8..16].try_into().ok()?) as usize;
+    if length == 0 || length % 2 != 0 || pointer == 0 {
+        return None;
+    }
+    let offset = pointer.checked_sub(base)?;
+    let end = offset.checked_add(length)?;
+    if end > buffer.len() {
+        return None;
+    }
+    let units: Vec<u16> = buffer[offset..end]
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    let text = String::from_utf16_lossy(&units);
+    let text = text.trim_end_matches('\0').trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
+#[cfg(test)]
+mod command_line_tests {
+    use super::parse_command_line;
+
+    /// A buffer shaped like the one `ProcessCommandLineInformation` returns:
+    /// a `UNICODE_STRING` whose `Buffer` points into the same allocation, and
+    /// the text after it.
+    fn buffer_with(text: &str) -> Vec<u8> {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let length = (units.len() * 2) as u16;
+        let mut buffer = vec![0u8; 16 + units.len() * 2 + 2];
+        buffer[0..2].copy_from_slice(&length.to_le_bytes());
+        buffer[2..4].copy_from_slice(&length.to_le_bytes());
+        let base = buffer.as_ptr() as usize;
+        // The pointer is filled in after the allocation is made; this is the
+        // address the text will live at, which is `base + 16`.
+        let pointer = (base + 16) as u64;
+        buffer[8..16].copy_from_slice(&pointer.to_le_bytes());
+        for (index, unit) in units.iter().enumerate() {
+            let at = 16 + index * 2;
+            buffer[at..at + 2].copy_from_slice(&unit.to_le_bytes());
+        }
+        buffer
+    }
+
+    #[test]
+    fn a_command_line_is_read_out_of_the_buffer() {
+        let buffer = buffer_with(r#""C:\Windows\System32\vssadmin.exe" delete shadows /all"#);
+        let base = buffer.as_ptr() as usize;
+        assert_eq!(
+            parse_command_line(&buffer, base).as_deref(),
+            Some(r#""C:\Windows\System32\vssadmin.exe" delete shadows /all"#)
+        );
+    }
+
+    #[test]
+    fn a_pointer_outside_the_buffer_is_refused_rather_than_followed() {
+        // The shape a hostile or stale answer would have: a length and a
+        // pointer that disagree with the allocation. Following it would read
+        // memory this process does not own, which is the reason the check is
+        // here rather than in a comment.
+        let mut buffer = buffer_with("benign");
+        let base = buffer.as_ptr() as usize;
+        let far = (base + 0x10_0000) as u64;
+        buffer[8..16].copy_from_slice(&far.to_le_bytes());
+        assert_eq!(parse_command_line(&buffer, base), None);
+    }
+
+    #[test]
+    fn a_length_past_the_end_of_the_buffer_is_refused() {
+        let mut buffer = buffer_with("benign");
+        let base = buffer.as_ptr() as usize;
+        buffer[0..2].copy_from_slice(&0xFFFEu16.to_le_bytes());
+        assert_eq!(parse_command_line(&buffer, base), None);
+    }
+
+    #[test]
+    fn an_empty_command_line_is_none_and_not_an_empty_string() {
+        let buffer = buffer_with("");
+        let base = buffer.as_ptr() as usize;
+        assert_eq!(parse_command_line(&buffer, base), None);
+    }
+
+    #[test]
+    fn a_truncated_buffer_is_refused() {
+        assert_eq!(parse_command_line(&[0u8; 8], 0), None);
+    }
+
+    // ---------------------------------------------------------------- live
+    //
+    // The four tests above prove the *parsing*. These two prove the call: the
+    // structure is only worth parsing if `NtQueryInformationProcess` really
+    // fills it, and that question cannot be answered by a synthetic buffer.
+    #[cfg(windows)]
+    #[test]
+    fn the_command_line_of_this_process_is_readable() {
+        let line = super::command_line(std::process::id()).expect("read this process's command line");
+        let folded = line.to_ascii_lowercase();
+        assert!(
+            folded.contains("av_service"),
+            "the command line does not name the test binary: {line}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_command_line_of_another_process_is_readable() {
+        // A process given an argument the test chose, so the assertion is about
+        // the argument and not about the executable's name.
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/c", "ping -n 6 127.0.0.1 >nul"])
+            .spawn()
+            .expect("spawn a child to read");
+        let mut line = None;
+        // The child has to exist *and* have its command line committed; the loop
+        // is short and the child lives for about five seconds.
+        for _ in 0..40 {
+            if let Some(read) = super::command_line(child.id()) {
+                line = Some(read);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let line = line.expect("read the child's command line");
+        let folded = line.to_ascii_lowercase();
+        assert!(
+            folded.contains("ping -n 6") && folded.contains("127.0.0.1"),
+            "the child's arguments are not in what was read: {line}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_process_that_does_not_exist_yields_none_rather_than_an_error() {
+        // An id that cannot be running: the pid space is far larger than any
+        // possible process, and the answer has to be "unknown", not a panic.
+        assert_eq!(super::command_line(0xFFFF_FFF0), None);
+    }
+}

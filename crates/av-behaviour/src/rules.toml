@@ -34,6 +34,13 @@ path_suffix = [
     ".wcry", ".locky", ".zepto", ".cerber", ".ryk", ".petya", ".conti",
     ".rhysida", ".blackcat", ".akira", ".makop", ".phobos", ".djvu", ".sage",
 ]
+# Measured on the host on 2026-10-19 at 15:57 and again at 16:00: Steam's
+# updater renamed `C:\Program Files (x86)\Steam\libx264-142.dll` to
+# `libx264-142.dll.crypt` — the name Steam ships its DRM-encrypted decoder
+# under, with the matching `.md5` beside it since 2026-07-02. One file, so one
+# path, and not the whole Steam install: a `.crypt` file anywhere else still
+# fires.
+path_excludes = ["\\steam\\libx264-142.dll.crypt"]
 dedupe_seconds = 300
 
 [[rule]]
@@ -58,6 +65,77 @@ description = "One process renamed twenty files in half a minute, which is the s
 severity = "medium"
 subject = "file"
 action = ["file_renamed"]
+# Trees where a healthy machine renames files in bulk, measured on the host on
+# 2026-10-19 while the driver was loaded: every entry below produced a warning
+# about a machine with nothing wrong with it.
+#
+#   …\AppData\Local\Comms\Unistore\…     UnistoreSvc's own rewrite
+#   …\Windows\AppCompat\Programs\…       the compatibility inventory
+#   …\Windows\Prefetch\…                 prefetch rotation
+#   …\Windows\System32\SRU\…             the resource-usage log window
+#   …\System32\config\systemprofile\…    the service account's cache
+#   …\EBWebView\…                        an application's embedded browser cache
+#   …\Code Cache\…, …\GrShaderCache\…    the browsers' caches
+#   …\CacheStorage\…, …\CryptnetUrlCache\, …\DataReporting\
+#   …\User Data\System Profile\…         Chrome's rewrite of `Secure Preferences`
+#   …\discount_infos_db\…                the browsers' price-tracking database
+#   …\AppData\Roaming\Surfshark\…        a VPN's log rotation
+#   …\AppData\Roaming\.minecraft\…       the launcher's staging cache
+#   …\AppData\LocalLow\SogouPY\…         an input method's data
+#   …\Program Files (x86)\Steam\…        a platform update's own files
+#   …\AppData\Local\Steam\…              the platform's embedded-browser cache
+#   …\AppData\Local\Programs\…           a per-user installer's own files
+#
+# The last line is the measurement of 2026-10-19 17:08: Inno Setup, installed
+# per-user by winget, renamed its language files in bulk while it unpacked
+# itself into `%LOCALAPPDATA%\Programs\Inno Setup 6`. Every per-user installer
+# writes and renames its files there — Obsidian does the same at 17:15 when it
+# removes itself — so the tree is excluded, while `C:\Program Files` stays
+# reported except for Steam.
+#
+# These are trees, not processes: the same sweep in a user's documents, on the
+# Desktop, in Downloads or in %TEMP% still fires. The development toolchain's
+# own trees (`target\debug`, `target\release`, `.claude\plugins\cache`) are
+# deliberately absent — they were measured, but they say "this machine builds
+# software", not "Windows churns here".
+path_excludes = [
+    "\\appdata\\local\\comms\\", "\\windows\\appcompat\\programs\\",
+    "\\windows\\prefetch\\", "\\windows\\system32\\sru\\",
+    "\\windows\\system32\\config\\systemprofile\\appdata\\local\\",
+    "\\ebwebview\\", "\\code cache\\", "\\grshadercache\\",
+    "\\cachestorage\\", "\\cryptneturlcache\\", "\\datareporting\\",
+    "\\user data\\system profile\\", "\\discount_infos_db\\",
+    "\\appdata\\roaming\\surfshark\\", "\\appdata\\roaming\\.minecraft\\",
+    "\\appdata\\locallow\\sogoupy\\", "\\.cc-switch\\", "\\com.ccswitch.desktop\\",
+    "\\program files (x86)\\steam\\", "\\appdata\\local\\steam\\",
+    "\\appdata\\local\\programs\\", "\\fontcache\\",
+    "\\windows\\appcompat\\aidd\\", "\\temp\\ns", "\\temp\\7zs",
+]
+# The font cache, the application-impact store, and the two installer
+# unpackers are the 17:26 to 18:16 measurement of the same day: the font cache
+# rotated `FontCache-Obsolete-*.dat`, the compatibility store rewrote
+# `aidd_*.txt`, and NSIS and 7-Zip unpacked their own files into `%TEMP%`
+# while installing and removing software.
+#
+# The actor, not the tree. An uninstaller removing the product it was installed
+# to remove renames that product's files in bulk, and the path cannot say so:
+# `C:\Program Files\Audacity\…` is the same path whether the user is removing
+# Audacity or something is sweeping it. Measured on the host on 2026-10-19 from
+# 17:03 to 18:16 over twenty-two install and uninstall pairs driven through
+# winget: Windows Installer's `msiexec.exe` (Audacity, Zoom, LibreOffice,
+# Thunderbird), Inno Setup's `unins000.exe` and `_iu_*.tmp`, NSIS's `Un_A.exe`
+# and `Un_B.exe`, and Squirrel's `update.exe` (Slack, and Discord when it
+# updates) each did exactly this. Each produces one warning per removal
+# otherwise, and every one is a program being removed by its own uninstaller.
+#
+# The list is of names, not of trust: a process named `unins000.exe` that
+# sweeps a user's documents is still reported, because these entries refuse
+# only this mass-file rule, and BEH-0005's document roots do not include any
+# program tree.
+process_image_excludes = [
+    "msiexec.exe", "unins*.exe", "*uninstall*.exe", "un_a.exe", "un_b.exe",
+    "un.exe", "_unins", "_iu", "update.exe",
+]
 count = 20
 window_seconds = 30
 dedupe_seconds = 600
@@ -69,6 +147,97 @@ description = "One process requested the deletion of twenty-five files in half a
 severity = "medium"
 subject = "file"
 action = ["file_deleted"]
+# Defender's scan history store. Measured on 2026-10-19 at 13:56:00 while the
+# behaviour fixture was being run in the test VM: Defender's own maintenance
+# deleted twenty-five files under
+# `C:\ProgramData\Microsoft\Windows Defender\Scans\History\Store\…` in half a
+# minute, and the rule warned about a healthy machine a minute after the
+# fixture had finished. The store is rotated and pruned by design, so its
+# volume says nothing about the process pruning it. The exclusion is the
+# measured subtree, not all of Defender: a program deleting its definitions or
+# its program files is still reported.
+#
+# The rest are the host measurement of 2026-10-19, 14:41 to 15:42, with the
+# driver loaded. Each line is a site where a healthy machine deleted
+# twenty-five files in half a minute:
+#
+#   …\AppData\Local\Comms\Volatile\POOM\…   UnistoreSvc's own rewrite
+#   C:\$Extend\$Deleted\…                    the NTFS delete queue, not files
+#   …\Windows\AppCompat\Programs\…           the compatibility inventory
+#   …\Windows\Prefetch\…                     prefetch rotation
+#   …\Windows\System32\SRU\…                 the resource-usage log window
+#   …\System32\config\systemprofile\…        the service account's cache
+#   …\D3DSCache\…                            the shader cache
+#   …\EBWebView\…, …\Code Cache\…            browser and WebView2 caches
+#   …\GrShaderCache\…, …\CacheStorage\…
+#   …\CryptnetUrlCache\, …\OneDrive\logs\…   caches and log rotation
+#   …\AppData\Roaming\Surfshark\…            a VPN's log rotation
+#   …\AppData\Roaming\.minecraft\…           the launcher's staging cache
+#   …\AppData\LocalLow\SogouPY\…             an input method's data
+#   …\Mozilla\Firefox\Profiles\…\cache2\…    Firefox's cache rotation
+#   …\Program Files (x86)\Steam\…            a platform update deleting `.old`
+#   …\AppData\Local\Steam\htmlcache\…        its embedded-browser cache
+#   …\Program Files\WindowsApps\Deleted\…   a package update removing the old copy
+#   …\ProgramData\Microsoft\Windows\AppRepository\Packages\…
+#                                            the package repository's own record
+#   C:\Config.Msi\…                          an MSI's rollback file
+#   …\AppData\Local\Programs\…               a per-user installer's own files
+#   …\AppData\Local\PowerToys\…              a program removing itself
+#   …\AppData\Local\Temp\ns*.tmp\…           an NSIS installer unpacking
+#
+# The last six are the measurement of 2026-10-19, 17:03 to 17:16, from eight
+# installations and uninstalls driven through winget while the driver was
+# loaded: Notepad++, VLC, 7-Zip, Everything, Obsidian, Inno Setup, Discord and
+# PowerToys. Every one produced a warning about a machine with nothing wrong
+# with it. These are the harnesses Windows itself uses to install and remove
+# software, so their volume says nothing about the process doing it.
+#
+# Beyond the table, the 17:26 to 18:16 measurement of the same day added three
+# trees: the font cache rotating `FontCache-Obsolete-*.dat` under
+# `…\ServiceProfiles\LocalService\AppData\Local\FontCache\`, the
+# application-impact store under `…\Windows\AppCompat\AIDD\`, and WhatsApp's
+# WebView2 profile (already covered by `\ebwebview\`).
+#
+# Program Files is deliberately absent from the tree list: an uninstaller
+# deleting its own install directory is the one item in the measurement that no
+# path can separate from something worth reporting. It is separated by actor
+# instead, below. Steam is the exception because its updater deletes its own
+# files on a schedule — measured at 15:57, 15:58 and 16:01 on 2026-10-19 — and
+# a warning on every update is a warning nobody reads.
+path_excludes = [
+    "\\programdata\\microsoft\\windows defender\\scans\\history\\",
+    "\\appdata\\local\\comms\\", "\\$extend\\",
+    "\\windows\\appcompat\\programs\\", "\\windows\\prefetch\\",
+    "\\windows\\system32\\sru\\",
+    "\\windows\\system32\\config\\systemprofile\\appdata\\local\\",
+    "\\d3dscache\\", "\\ebwebview\\", "\\code cache\\", "\\grshadercache\\",
+    "\\cachestorage\\", "\\cryptneturlcache\\", "\\onedrive\\logs\\",
+    "\\appdata\\roaming\\surfshark\\", "\\appdata\\roaming\\.minecraft\\",
+    "\\appdata\\locallow\\sogoupy\\", "\\.cc-switch\\", "\\com.ccswitch.desktop\\",
+    "\\cache2\\", "\\program files (x86)\\steam\\", "\\appdata\\local\\steam\\",
+    "\\scoped_dir_steam",
+    "\\program files\\windowsapps\\deleted\\", "\\windows\\apprepository\\",
+    "\\config.msi\\", "\\appdata\\local\\programs\\",
+    "\\appdata\\local\\powertoys\\", "\\appdata\\local\\temp\\ns",
+    "\\fontcache\\", "\\windows\\appcompat\\aidd\\", "\\temp\\7zs",
+]
+# The actor, not the tree. An uninstaller removing the product it was installed
+# to remove deletes that product's files in bulk, and the path cannot say so:
+# `C:\Program Files\Zoom\…` is the same path whether the user is removing Zoom
+# or something is sweeping it. Measured on the host on 2026-10-19 from 17:03 to
+# 18:16 over twenty-two install and uninstall pairs driven through winget:
+# Windows Installer's `msiexec.exe` (Audacity, Zoom, LibreOffice, Thunderbird),
+# Inno Setup's `unins000.exe` and `_iu*.tmp`, NSIS's `Un_A.exe` and `Un_B.exe`,
+# and Squirrel's `update.exe` (Slack, and Discord when it updates) each did
+# exactly this, producing one warning per removal.
+#
+# A process named `unins000.exe` that deletes a user's documents is still
+# reported: these entries refuse only this mass-file rule, and a document root
+# is not an uninstaller's own tree.
+process_image_excludes = [
+    "msiexec.exe", "unins*.exe", "*uninstall*.exe", "un_a.exe", "un_b.exe",
+    "un.exe", "_unins", "_iu", "update.exe",
+]
 count = 25
 window_seconds = 30
 dedupe_seconds = 600
@@ -84,6 +253,25 @@ path_suffix = [
     ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".pdf", ".jpg", ".jpeg",
     ".png", ".txt", ".csv", ".zip", ".rar", ".7z",
 ]
+# The extension list is not enough to say "documents": a program's own `.png`
+# artwork and `.txt` licence carry the same suffixes, and installing and
+# removing software renames them in bulk. So the rule asks a second question —
+# *whose* documents — and only a user's document roots answer it: the profile's
+# Documents, Desktop, Pictures, Videos, Music and Downloads, and a synced
+# library (OneDrive, Dropbox, Google Drive, iCloud Drive) wherever it is
+# mounted. A custom folder (`D:\Files\`) is not on the list deliberately: the
+# rule is about the place Windows calls a person's documents, and a sweep
+# anywhere else still reaches BEH-0003's twenty-file threshold.
+#
+# Measured on 2026-10-19 at 15:56 and 15:58 (a Steam update renaming fifteen
+# controller images) and at 17:03 and 17:16 (a winget source update renaming
+# licence files as packages were installed). The same fifteen in Pictures
+# still fire.
+path_contains = [
+    "\\documents\\", "\\desktop\\", "\\pictures\\", "\\videos\\", "\\music\\",
+    "\\downloads\\", "\\onedrive", "\\dropbox\\", "\\google drive\\",
+    "\\icloud drive\\",
+]
 count = 15
 window_seconds = 60
 dedupe_seconds = 300
@@ -98,6 +286,17 @@ action = ["file_deleted"]
 path_suffix = [
     ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".pdf", ".jpg", ".jpeg",
     ".png", ".txt", ".csv", ".zip", ".rar", ".7z",
+]
+# The same document-root question as BEH-0005, for the same measured reason.
+# Measured on 2026-10-19 at 17:03 and 17:16: a winget source update and a
+# PowerToys uninstall removed package artwork (`…\Assets\…\*.png`) under
+# `C:\Program Files\WindowsApps\Deleted\…`, and a GIMP and Joplin uninstall
+# deleted their own `.txt` and `.png` files. None of those is a person's
+# document; the same fifteen in Pictures still fire.
+path_contains = [
+    "\\documents\\", "\\desktop\\", "\\pictures\\", "\\videos\\", "\\music\\",
+    "\\downloads\\", "\\onedrive", "\\dropbox\\", "\\google drive\\",
+    "\\icloud drive\\",
 ]
 count = 15
 window_seconds = 60
@@ -132,10 +331,24 @@ path_suffix = [".exe", ".dll", ".sys"]
 # Registry: persistence
 # ---------------------------------------------------------------------------
 
+# Every rule in this file was written from what an event *names* until
+# 2026-10-19, when the driver began sending a registry value's data as well.
+# The persistence rules below are the ones that could finally tell two writes
+# apart, and each is narrowed to what the data has to say: an autostart entry in
+# a directory an unprivileged user can write to is the signal, and
+# `C:\Program Files\…`, which is what every ordinary installer writes, is not.
+#
+# The narrowing is a *measurement gap made into a rule*: until this build the
+# driver never carried a value, so the host rounds could not say which values
+# are ordinary — only that the rules fired on every install. The VM run from
+# 2026-10-19 onwards is the measurement for these, and any value a rule here
+# still reports on a healthy machine belongs in a `value_excludes` entry rather
+# than in a wider threshold.
+
 [[rule]]
 id = "BEH-0010"
-name = "Run key value"
-description = "A value was written under a Run key, which is where a program is listed to start at sign-in."
+name = "Run key value in a writable location"
+description = "A program was listed to start at sign-in from a directory an unprivileged user can write to."
 severity = "medium"
 subject = "registry"
 action = ["registry_changed"]
@@ -143,6 +356,41 @@ detail = ["registry_value_set"]
 path_contains = [
     "\\currentversion\\run\\", "\\currentversion\\runonce\\",
     "\\currentversion\\runservices\\", "\\currentversion\\runservicesonce\\",
+]
+# The directories a standard user can write to. A program that has to survive a
+# reboot and is installed properly lives in `Program Files`; one that lives here
+# was put here by someone who could not write there, which is the shape of
+# persistence rather than of an installer. Matched against the value's data, not
+# the key: the key is the same for both.
+value_contains = [
+    "\\appdata\\", "%appdata%", "%localappdata%",
+    "%temp%", "%tmp%", "\\temp\\",
+    "%userprofile%", "\\users\\public\\",
+    "\\programdata\\", "\\downloads\\", "\\desktop\\", "\\documents\\",
+]
+
+# The other half of the same question: the data is a command rather than a
+# path. An installer writes its own executable; a loader writes whatever it was
+# told to, and the interpreter is the one part of that command the attacker
+# cannot hide.
+[[rule]]
+id = "BEH-0037"
+name = "Run key value launches an interpreter"
+description = "A Run key was written whose data starts a script host or a command interpreter."
+severity = "high"
+score = 80
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_value_set"]
+path_contains = [
+    "\\currentversion\\run\\", "\\currentversion\\runonce\\",
+    "\\currentversion\\runservices\\", "\\currentversion\\runservicesonce\\",
+]
+value_contains = [
+    "powershell", "pwsh", "mshta", "wscript", "cscript",
+    "rundll32", "regsvr32",
+    "cmd.exe /c", "cmd.exe /k", "cmd /c", "cmd /k",
+    "-encodedcommand", "-enc ",
 ]
 
 [[rule]]
@@ -181,6 +429,17 @@ subject = "registry"
 action = ["registry_changed"]
 detail = ["registry_value_set"]
 path_contains = ["\\image file execution options\\"]
+# The rule names one value, and now tests for it. Every key under Image File
+# Execution Options was the whole condition before, and a healthy machine fills
+# that tree with values that have nothing to do with hijacking a program:
+# measured on the host on 2026-10-19 at 14:41:32, Defender's own maintenance
+# wrote `…\DefenderAgentScan.exe\MitigationOptions` — the exploit-protection
+# setting — and earlier Notepad3 set `…\notepad.exe\UseFilter` to install
+# itself as notepad. Both warned. `Debugger` is what the rule is named for and
+# what a copy of a system binary is pointed at, so the value name is the
+# condition; the other values in the tree are another rule's business, not
+# this one's.
+path_suffix = ["\\debugger"]
 
 [[rule]]
 id = "BEH-0014"
@@ -194,14 +453,44 @@ path_contains = ["\\silentprocessexit\\"]
 
 [[rule]]
 id = "BEH-0015"
-name = "service image path"
-description = "A service's image path was changed."
+name = "service image path in a writable location"
+description = "A service was pointed at an executable in a directory an unprivileged user can write to."
 severity = "medium"
 subject = "registry"
 action = ["registry_changed"]
 detail = ["registry_value_set"]
 path_contains = ["\\services\\"]
 path_suffix = ["\\imagepath"]
+# The same list as BEH-0010, for the same reason and with the same measurement
+# status. A service runs as SYSTEM when it starts, so an `ImagePath` in a
+# user-writable directory is how an unprivileged write becomes SYSTEM code at
+# the next boot. Services installed the ordinary way live in `System32` or
+# `Program Files`.
+value_contains = [
+    "\\appdata\\", "%appdata%", "%localappdata%",
+    "%temp%", "%tmp%", "\\temp\\",
+    "%userprofile%", "\\users\\public\\",
+    "\\programdata\\", "\\downloads\\", "\\desktop\\", "\\documents\\",
+]
+
+# And the same second half: `ImagePath` naming a shell instead of a program is
+# how a service is used to run an arbitrary command line at boot.
+[[rule]]
+id = "BEH-0038"
+name = "service image path is a command line"
+description = "A service's image path starts a command interpreter."
+severity = "high"
+score = 80
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_value_set"]
+path_contains = ["\\services\\"]
+path_suffix = ["\\imagepath"]
+value_contains = [
+    "cmd.exe /c", "cmd.exe /k", "cmd /c", "cmd /k",
+    "powershell", "pwsh", "wscript", "cscript", "mshta",
+    "rundll32", "regsvr32",
+]
 
 [[rule]]
 id = "BEH-0016"
@@ -216,13 +505,49 @@ path_contains = ["\\currentversion\\windows\\appinit_dlls"]
 
 [[rule]]
 id = "BEH-0017"
-name = "shell open command"
-description = "A file association's open command was changed."
+name = "shell open command in a writable location"
+description = "A file association was pointed at an executable in a directory an unprivileged user can write to."
 severity = "medium"
 subject = "registry"
 action = ["registry_changed"]
 detail = ["registry_value_set"]
 path_suffix = ["\\shell\\open\\command"]
+# The command line a file type runs when it is double-clicked. Every program
+# that registers a file type writes one, and the ones that install properly
+# write a path in `Program Files`; the value is what separates an installer
+# from a hijack.
+value_contains = [
+    "\\appdata\\", "%appdata%", "%localappdata%",
+    "%temp%", "%tmp%", "\\temp\\",
+    "%userprofile%", "\\users\\public\\",
+    "\\programdata\\", "\\downloads\\", "\\desktop\\", "\\documents\\",
+]
+# Measured on the VM on 2026-10-20 19:37:20: OneDrive registered its own
+# `odopen` URL handler, whose command is
+# `"C:\Users\<user>\AppData\Local\Microsoft\OneDrive\OneDrive.exe" /url:"%1"`.
+# A per-user application that installs itself under `AppData` and owns the
+# protocol it registers is what an installer does; the location alone cannot
+# tell it from a hijack. The exclusion names the binary, not the directory:
+# `AppData\Local\Microsoft\OneDrive\` is user-writable like everything else
+# under `AppData`, so excluding the directory would hide a dropper placed
+# there. A different executable in that directory still fires.
+value_excludes = ["\\microsoft\\onedrive\\onedrive.exe"]
+
+[[rule]]
+id = "BEH-0039"
+name = "shell open command runs an interpreter"
+description = "A file association's open command starts a command interpreter."
+severity = "high"
+score = 80
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_value_set"]
+path_suffix = ["\\shell\\open\\command"]
+value_contains = [
+    "cmd.exe /c", "cmd.exe /k", "cmd /c", "cmd /k",
+    "powershell", "pwsh", "wscript", "cscript", "mshta",
+    "rundll32", "regsvr32",
+]
 
 [[rule]]
 id = "BEH-0018"
@@ -250,13 +575,24 @@ path_contains = [
 
 [[rule]]
 id = "BEH-0020"
-name = "App Paths value"
-description = "An App Paths entry was written, which can redirect which program runs for a name."
+name = "App Paths value in a writable location"
+description = "An App Paths entry was pointed at an executable in a directory an unprivileged user can write to."
 severity = "medium"
 subject = "registry"
 action = ["registry_changed"]
 detail = ["registry_value_set"]
 path_contains = ["\\currentversion\\app paths\\"]
+# App Paths is what makes `winword` resolve to a program without a full path,
+# and every application that supports "Run" from the Start menu writes one. The
+# value is normally the program's own directory or its executable under
+# `Program Files`; an entry in a user-writable directory redirects a name that
+# other programs trust.
+value_contains = [
+    "\\appdata\\", "%appdata%", "%localappdata%",
+    "%temp%", "%tmp%", "\\temp\\",
+    "%userprofile%", "\\users\\public\\",
+    "\\programdata\\", "\\downloads\\", "\\desktop\\", "\\documents\\",
+]
 
 # ---------------------------------------------------------------------------
 # Registry: the machine's defences
@@ -364,10 +700,39 @@ detail = ["registry_key_deleted"]
 # `\REGISTRY\MACHINE\SOFTWARE\Microsoft\Windows Search\Gather\Windows\SystemIndex\
 # Sites\LocalHost\Paths\…` at a session end. The tree exists to be rewritten,
 # so its volume says nothing about the process that rewrites it.
+#
+# The last three are the host measurement of 2026-10-19 between 15:11 and
+# 15:41. `svchost` deleted thirty Windows Error Reporting `TermReason` keys,
+# the network stack deleted a disconnected interface's `Properties`, and an
+# installer deleted thirty `Installer\UserData\…\Components` entries as it
+# unregistered itself. All three trees are scratch space the owning component
+# rewrites; their volume says nothing about the process rewriting them.
+#
+# The state repository is the 17:03 and 17:16 measurement of the eight-app
+# installation round: installing and removing an AppX package (winget's own
+# source, PowerToys' sparse package) made Windows delete thirty entries under
+# `…\CurrentVersion\AppModel\StateRepository\Cache\…`, twice. It is the
+# database of per-user app state, not configuration anyone is defending.
 path_excludes = [
     "\\registry\\a\\",
     "\\registry\\machine\\system\\controlset*\\services\\*_*",
     "\\registry\\machine\\software\\microsoft\\windows search\\",
+    "\\windows error reporting\\termreason\\",
+    "\\networksetup2\\",
+    "\\installer\\userdata\\",
+    "\\appmodel\\staterepository\\",
+]
+# The actor, as in BEH-0003 and BEH-0004. Measured on the host on 2026-10-19,
+# 17:03 to 18:16: as each of twenty-two packages was installed or removed,
+# `msiexec.exe`, Inno Setup's `unins000.exe`, NSIS's `Un_A.exe` and Squirrel's
+# `update.exe` deleted thirty or more keys — COM registrations under
+# `HKEY_CLASSES_ROOT`, file associations, the product's own tree — which is
+# exactly what the rule is for and exactly what an uninstall is. The remaining
+# warnings in the round were all of this shape; a process with none of these
+# names deleting thirty keys is still reported.
+process_image_excludes = [
+    "msiexec.exe", "unins*.exe", "*uninstall*.exe", "un_a.exe", "un_b.exe",
+    "un.exe", "_unins", "_iu", "update.exe",
 ]
 count = 30
 window_seconds = 30
@@ -463,6 +828,22 @@ severity = "low"
 subject = "process"
 action = ["process_started"]
 path_contains = ["\\appdata\\local\\temp\\", "\\windows\\temp\\"]
+# The installer harnesses measured on the host on 2026-10-19, 17:06 to 17:15:
+# winget's own download directory, Inno Setup's `is-*.tmp` extraction, NSIS's
+# `~nsu*.tmp` uninstaller and Squirrel's `SquirrelTemp` all started programs
+# from a temporary folder six times in one installation round. Each is a
+# harness Windows software distribution uses, so the folder alone is not the
+# signal this rule is looking for. A dropper's own directory is not excluded.
+#
+# The same round's 17:26 to 18:16 half added two more: 7-Zip's self-extractor
+# runs the installer from `%TEMP%\7zS*`, and Inno Setup's uninstaller copies
+# itself to `%TEMP%\_iu*.tmp` and runs from there. `\temp\ns` is the same NSIS
+# prefix without its `~nsu` spelling; `%TEMP%\ns*.tmp` was measured at 17:16.
+path_excludes = [
+    "\\appdata\\local\\temp\\winget\\", "\\appdata\\local\\temp\\is-",
+    "\\appdata\\local\\temp\\~nsu", "\\appdata\\local\\squirreltemp\\",
+    "\\temp\\7zs", "\\temp\\_iu",
+]
 
 [[rule]]
 id = "BEH-0034"
@@ -495,3 +876,593 @@ subject = "process"
 action = ["process_started"]
 path_contains = ["\\appdata\\"]
 path_suffix = [".scr", ".pif", ".cpl", ".hta"]
+
+# ---------------------------------------------------------------------------
+# Detection evasion: the keys that point the protection somewhere else
+#
+# Every rule above watches what a program *does*. These watch the smaller set of
+# keys that decide whether anything is watching at all, or which component runs
+# in the place of the one that should. They are narrow by construction rather
+# than by exclusion: each of these keys is written by the component that owns it
+# and by nothing else, so "this key changed" is already a specific statement,
+# and a whitelist would only be a list of the installers that legitimately write
+# them.
+#
+# The directories below are the same "an unprivileged user can write here" list
+# BEH-0010 established -- a component installed properly lives in
+# `Program Files`; one that lives in a profile was put there by something that
+# could not write to `Program Files`.
+# ---------------------------------------------------------------------------
+
+[[rule]]
+id = "BEH-0040"
+name = "Defender exclusion added"
+description = "An exclusion was added to Windows Defender's scan list."
+severity = "high"
+score = 70
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_value_set"]
+# The exclusions live outside the `Policies` tree BEH-0021 watches: that one is
+# the GPO switch that turns a feature off, this one is the list of places to
+# stop looking. `\exclusions\paths` and `\exclusions\extensions` are the two an
+# attack reaches for; `\exclusions\processes` is the third and is included with
+# them because a process exclusion is the strongest of the three.
+path_contains = [
+    "\\microsoft\\windows defender\\exclusions\\",
+]
+# Legitimate writers exist and are not silent: an enterprise deployment policy
+# adds exclusions, and some security products add one for their own install
+# directory. That is why this is evidence worth 70 and not a refusal -- it takes
+# a second rule to reach the malicious threshold.
+
+[[rule]]
+id = "BEH-0041"
+name = "AMSI provider registered"
+description = "A DLL was registered as an AMSI provider."
+severity = "high"
+score = 70
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_value_set"]
+# AMSI is the interface every script host on Windows asks before it runs
+# something. Registering a provider is how an antivirus hooks it -- and how
+# something that wants to answer "clean" on its own behalf does the same thing.
+# Both write this key and only they do, so the key is the whole condition.
+#
+# This product's own `wenle integrate amsi install` writes it too. That is a
+# warning on an install the user typed, which is noise the product should own
+# rather than hide: excluding the image name would exclude a copy of the
+# installer renamed to that name.
+path_contains = [
+    "\\microsoft\\amsi\\providers\\",
+]
+
+[[rule]]
+id = "BEH-0042"
+name = "COM server points into a writable folder"
+description = "A COM class was pointed at a DLL in a directory an unprivileged user can write to."
+severity = "high"
+score = 75
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_value_set"]
+# COM hijacking: the class keeps its name, so every program that asks for it
+# loads whatever the key now points at. The discriminator is the directory the
+# value points into -- a COM server in `Program Files` is every registered
+# component on the machine, and one in a profile is not. `InprocServer32` is the
+# key a DLL-backed class uses, so the key itself already says "this is a DLL";
+# requiring a `.dll` in the value would only add a way to miss a quoted path.
+path_contains = ["\\inprocserver32"]
+value_contains = [
+    "\\appdata\\", "%appdata%", "%localappdata%",
+    "%temp%", "%tmp%", "\\temp\\",
+    "%userprofile%", "\\users\\public\\",
+    "\\programdata\\", "\\downloads\\", "\\desktop\\", "\\documents\\",
+]
+# Per-user installers register their classes under HKCU and put the DLL in
+# `%LOCALAPPDATA%\Programs\<product>` -- the same measurement BEH-0003 records
+# from the winget round of 2026-10-19. That tree is where per-user software is
+# installed, which is not where a hijack hides. The exclusion is against the
+# *value*, not the key, for the same reason the positive condition is: the key
+# is `InprocServer32` in both cases.
+value_excludes = ["\\appdata\\local\\programs\\"]
+
+[[rule]]
+id = "BEH-0043"
+name = "AppCertDlls written"
+description = "A DLL was added to the list every process loads when it calls the certificate APIs."
+severity = "high"
+score = 85
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_value_set"]
+# `AppCertDlls` is loaded into every process that calls into the Win32
+# certificate verification APIs -- it is a documented injection point and has no
+# ordinary caller: no installer adds one, no driver needs one, and the list is
+# empty on a healthy machine. A write here is the behaviour, so there is no
+# value condition to narrow.
+path_contains = ["\\control\\session manager\\appcertdlls"]
+
+[[rule]]
+id = "BEH-0044"
+name = "boot execute program added"
+description = "A program was added to the list the session manager runs before anything else starts."
+severity = "high"
+score = 85
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_value_set"]
+# `BootExecute` runs in the native session before any driver-dependent
+# subsystem exists, which is why it is attractive and why almost nothing writes
+# it. The one ordinary writer is `chkdsk`, which schedules a check by writing
+# `autocheck autochk ...`, so that string is the exclusion rather than a
+# process name. Its limit is worth stating: a value that carries both a check
+# and a program passes, because the exclusion is a substring and the positive
+# condition is the key.
+path_contains = ["\\control\\session manager\\bootexecute"]
+value_excludes = ["autocheck autochk"]
+
+[[rule]]
+id = "BEH-0045"
+name = "Run key written under the Explorer policy path"
+description = "A program was listed to start at sign-in from the policy branch of the Run key."
+severity = "high"
+score = 80
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_value_set"]
+# The same idea as BEH-0010 at the other address: BEH-0010 matches
+# `\currentversion\run\`, and this one matches the `Policies` branch a policy
+# would write. No installer uses this branch, which makes it the more specific
+# of the two even before the value is looked at.
+path_contains = ["\\currentversion\\policies\\explorer\\run\\"]
+value_contains = [
+    "\\appdata\\", "%appdata%", "%localappdata%",
+    "%temp%", "%tmp%", "\\temp\\",
+    "%userprofile%", "\\users\\public\\",
+    "\\programdata\\", "\\downloads\\", "\\desktop\\", "\\documents\\",
+]
+
+[[rule]]
+id = "BEH-0046"
+name = "service DLL in a writable folder"
+description = "A service was pointed at a DLL in a directory an unprivileged user can write to."
+severity = "high"
+score = 75
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_value_set"]
+# The sibling of BEH-0015, which watches `ImagePath`. A service that names a
+# host executable (`svchost.exe -k ...`) loads its own code through `ServiceDll`
+# instead, so a service pointing its `ImagePath` at `System32` can still load a
+# DLL from a profile folder -- and that is the half BEH-0015 cannot see.
+path_contains = ["\\services\\"]
+path_suffix = ["\\servicedll"]
+value_contains = [
+    "\\appdata\\", "%appdata%", "%localappdata%",
+    "%temp%", "%tmp%", "\\temp\\",
+    "%userprofile%", "\\users\\public\\",
+    "\\programdata\\", "\\downloads\\", "\\desktop\\", "\\documents\\",
+]
+
+[[rule]]
+id = "BEH-0047"
+name = "program started from a network share"
+description = "A program was started from a network share rather than from a local disk."
+severity = "high"
+score = 70
+subject = "process"
+action = ["process_started"]
+# A `\\server\share` binary is not installed on this machine, is not in any
+# local backup, and is not there the next time it runs -- which is why loaders
+# and lateral movement use one. Ordinary use of a share is rare enough that the
+# path shape alone is specific.
+path_prefix = ["\\\\"]
+
+[[rule]]
+id = "BEH-0048"
+name = "service host started an interpreter"
+description = "A service host process started a command interpreter or a script host."
+severity = "high"
+score = 75
+subject = "process"
+action = ["process_started"]
+# `svchost.exe` starts services, not command lines. The child is matched by its
+# trailing name rather than by a directory, because where the interpreter lives
+# is not what makes this specific -- who started it is.
+parent_image = ["svchost.exe", "services.exe", "lsass.exe", "wininit.exe"]
+path_suffix = [
+    "\\powershell.exe", "\\pwsh.exe", "\\cmd.exe", "\\mshta.exe",
+    "\\wscript.exe", "\\cscript.exe", "\\rundll32.exe", "\\regsvr32.exe",
+    "\\bitsadmin.exe", "\\certutil.exe",
+]
+
+[[rule]]
+id = "BEH-0049"
+name = "document or browser started a DLL host"
+description = "A document reader or a browser started rundll32 or regsvr32."
+severity = "high"
+score = 75
+subject = "process"
+action = ["process_started"]
+# Both of these load a DLL named on their command line, which makes them the
+# usual second stage for a document that decided to run something: the reader
+# stays the parent and the loader is a signed Microsoft binary in `System32`.
+# The pair is the condition; neither half is interesting on its own, which is
+# what keeps it quiet on a healthy machine.
+parent_image = [
+    "winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe", "msaccess.exe",
+    "onenote.exe", "mspub.exe", "visio.exe",
+    "chrome.exe", "msedge.exe", "firefox.exe", "iexplore.exe", "acrord32.exe",
+]
+path_suffix = ["\\rundll32.exe", "\\regsvr32.exe"]
+
+[[rule]]
+id = "BEH-0050"
+name = "Defender real-time protection key written"
+description = "The registry key that switches Windows Defender's real-time protection was written."
+severity = "medium"
+score = 55
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_value_set"]
+# The switch itself is a `REG_DWORD`, which this driver does not render as text,
+# so the rule cannot read what it was set to. It says the key was written and
+# claims nothing about the direction. The key is only written when something
+# toggles the setting: the user in the Security app, a policy, or whatever wants
+# the scanner off.
+path_contains = ["\\microsoft\\windows defender\\real-time protection\\"]
+
+[[rule]]
+id = "BEH-0051"
+name = "LSA notification package registered"
+description = "A package was added to the list the local security authority loads into every logon."
+severity = "high"
+score = 85
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_value_set"]
+# The sibling of BEH-0026, which watches `security packages`. A notification
+# package is loaded into `lsass.exe` itself and is handed the credentials of
+# every logon, which is why almost nothing legitimate registers one -- the list
+# is empty on a healthy machine.
+path_contains = ["\\control\\lsa\\notification packages"]
+
+[[rule]]
+id = "BEH-0052"
+name = "logon script set for this user"
+description = "A logon script was set in the user's environment key."
+severity = "high"
+score = 80
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_value_set"]
+# `UserInitMprLogonScript` runs when the user's session is created, and it is
+# the one Run-like mechanism that survives policy changes to the Run keys. Group
+# Policy does not set it and no installer uses it; it is set by hand.
+path_contains = ["\\environment\\userinitmprlogonscript"]
+
+# ---------------------------------------------------------------------------
+# The ransomware chain, at the rungs that are visible
+#
+# What this stream can see is file-system operations. A bootkit writing sector
+# zero of a disk opens `\\.\PhysicalDrive0` and writes; no file system is
+# involved, so no callback of a minifilter sees it, and a rule for it would
+# never fire. What *is* a file is the boot chain on the EFI system partition --
+# `bootmgfw.efi` and the BCD store -- and that is the half of the same attack
+# this product can observe. Detection there is still after the fact; it is
+# reported because knowing which process rewrote the loader is worth something,
+# not because it is prevention.
+# ---------------------------------------------------------------------------
+
+[[rule]]
+id = "BEH-0053"
+name = "ransom note written"
+description = "A file with a ransom note's name was written."
+severity = "high"
+score = 90
+subject = "file"
+action = ["file_written"]
+# BEH-0002 catches the note when it arrives by rename, which is how most
+# families drop it beside the encrypted files. This is the other way it arrives:
+# written directly. Both are the same sentence to a user and neither is a
+# rename, so they cannot share a rule.
+path_contains = [
+    "how_to_decrypt", "how to decrypt", "how_to_restore", "decrypt_instructions",
+    "decryption_instructions", "readme_for_decrypt", "your_files_are_encrypted",
+    "restore_your_files", "recover_your_files", "help_decrypt", "!!!readme",
+]
+dedupe_seconds = 300
+
+[[rule]]
+id = "BEH-0054"
+name = "documents written in bulk"
+description = "One process wrote forty files inside document folders within half a minute."
+severity = "medium"
+score = 60
+subject = "file"
+action = ["file_written"]
+# Encryption in place leaves no rename and no delete: the file keeps its name
+# and its directory and its bytes change, which on this stream is a write and
+# nothing else. So the sweep that BEH-0003 and BEH-0005 catch by name has a
+# third shape, and this is it.
+#
+# The trees are the ones a user's work lives in. Everything below them is where
+# software churns by design and is excluded for the reason BEH-0003 records:
+# caches, package directories and build output all write dozens of files in
+# seconds on a healthy machine.
+path_contains = [
+    "\\documents\\", "\\desktop\\", "\\downloads\\",
+    "\\pictures\\", "\\videos\\", "\\music\\", "\\onedrive\\",
+]
+path_excludes = [
+    "\\appdata\\", "\\windows\\", "\\program files", "\\programdata\\",
+    "\\$recycle.bin\\", "\\node_modules\\", "\\.git\\", "\\target\\debug\\",
+    "\\target\\release\\", "\\.venv\\", "\\site-packages\\",
+]
+count = 40
+window_seconds = 30
+dedupe_seconds = 300
+
+[[rule]]
+id = "BEH-0055"
+name = "recovery removal tool started"
+description = "A tool that deletes shadow copies or backup catalogues was started."
+severity = "high"
+score = 60
+subject = "process"
+action = ["process_started"]
+# The rung before the encryption: a family that intends to make restoration
+# impossible runs one of these first. The command line is not in this event
+# stream, so the rule reports the tool and not its arguments, and the score
+# reflects a tool that an administrator can also legitimately reach for.
+path_suffix = ["\\vssadmin.exe", "\\wbadmin.exe", "\\diskshadow.exe"]
+
+[[rule]]
+id = "BEH-0056"
+name = "boot loader or boot configuration modified"
+description = "A file in the boot chain was written or renamed by something other than servicing."
+severity = "high"
+score = 70
+subject = "file"
+action = ["file_written", "file_renamed"]
+# The visible half of the bootkit question. A raw write to the disk's partition
+# table never reaches a file-system filter, but the loader and the BCD store are
+# files, and replacing them is how a bootkit gets loaded next time without
+# touching a single sector itself.
+path_contains = ["\\efi\\microsoft\\boot\\", "\\efi\\boot\\", "\\boot\\bcd"]
+path_suffix = [".efi", "\\bcd"]
+# Windows servicing rewrites these on every feature update.
+process_image_excludes = [
+    "tiworker.exe", "trustedinstaller.exe", "dism.exe", "setup.exe",
+    "windowsupdatebox.exe", "bcdedit.exe", "wusa.exe",
+]
+
+# ---------------------------------------------------------------------------
+# Pairs and places
+#
+# The rules below are pairs -- this parent starting this child, here -- because
+# a pair is the most specific condition this event stream can express: neither
+# half is interesting, and the combination has almost no ordinary writer.
+# ---------------------------------------------------------------------------
+
+[[rule]]
+id = "BEH-0057"
+name = "browser started a downloaded program"
+description = "A browser started a program from the folder it saves downloads into."
+severity = "high"
+score = 80
+subject = "process"
+action = ["process_started"]
+# A browser that has to run something downloads an installer and the user runs
+# it from Explorer, so the browser is not the parent. When it *is* the parent,
+# the download was executed by whatever drove the browser -- which is the
+# "click here to update your Flash" shape. The start folder is matched rather
+# than the file name, because the name is the attacker's to choose.
+parent_image = [
+    "chrome.exe", "msedge.exe", "firefox.exe", "iexplore.exe", "brave.exe",
+    "opera.exe", "vivaldi.exe", "thorium.exe",
+]
+path_contains = ["\\downloads\\", "\\appdata\\local\\temp\\", "\\windows\\temp\\"]
+
+[[rule]]
+id = "BEH-0058"
+name = "program started from the recycle bin"
+description = "A program was executed out of the Recycle Bin."
+severity = "high"
+score = 85
+subject = "process"
+action = ["process_started"]
+# Nothing legitimate starts from `$Recycle.Bin`: a deleted program that runs is
+# either being resurrected or was never meant to look like a program. There is
+# no caveat worth writing, which is why this is one condition.
+path_contains = ["\\$recycle.bin\\"]
+
+# Sideloading is deliberately absent: `ImageLoaded` events in this build carry
+# the process and no path (`dsl.rs`, `Subject::from_driver`), so "a DLL loaded
+# out of %TEMP%" is not expressible until the driver sends the image's path.
+
+[[rule]]
+id = "BEH-0060"
+name = "COM local server points into a writable folder"
+description = "A COM class was pointed at an executable in a directory an unprivileged user can write to."
+severity = "high"
+score = 75
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_value_set"]
+# The sibling of BEH-0042, for the classes that run out of process. Same reason,
+# same discriminator: the key is fixed and the value's directory is the fact.
+path_contains = ["\\localserver32"]
+value_contains = [
+    "\\appdata\\", "%appdata%", "%localappdata%",
+    "%temp%", "%tmp%", "\\temp\\",
+    "%userprofile%", "\\users\\public\\",
+    "\\programdata\\", "\\downloads\\", "\\desktop\\", "\\documents\\",
+]
+value_excludes = ["\\appdata\\local\\programs\\"]
+
+[[rule]]
+id = "BEH-0061"
+name = "executable written into a startup folder"
+description = "A program or a shortcut was written into a Startup folder."
+severity = "high"
+score = 75
+subject = "file"
+action = ["file_written"]
+# BEH-0007 catches an executable that arrives by rename. Dropping one is a
+# write, and it is the commoner way: the file is created there rather than moved
+# there. Same folders, same suffixes, different action -- which is why neither
+# rule can cover both.
+path_contains = ["\\start menu\\programs\\startup\\"]
+path_suffix = [
+    ".lnk", ".exe", ".dll", ".bat", ".cmd", ".vbs", ".vbe", ".js", ".jse",
+    ".wsf", ".hta", ".ps1", ".scr",
+]
+
+[[rule]]
+id = "BEH-0062"
+name = "print processor or port monitor driver written"
+description = "A print processor or port monitor was pointed at a DLL."
+severity = "high"
+score = 80
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_value_set"]
+# A print processor and a port monitor are both loaded by the spooler into every
+# process that prints, which makes them a persistence surface that needs no
+# service of its own and no scheduled task. Their `Driver` value is the DLL, and
+# the only ordinary writer is a printer driver's installer.
+path_contains = [
+    "\\control\\print\\environments\\", "\\control\\print\\monitors\\",
+]
+path_suffix = ["\\driver"]
+
+[[rule]]
+id = "BEH-0063"
+name = "icon service DLL written"
+description = "The DLL every program with a window loads at start-up was changed."
+severity = "high"
+score = 80
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_value_set"]
+# `IconServiceLib` is the sibling of `AppInit_DLLs` that BEH-0016 watches: a DLL
+# named there is loaded into processes that draw an icon, and nothing but a
+# deliberate change writes it. It is a separate rule because it is a different
+# key -- a rule for one would never match the other.
+path_contains = ["\\currentversion\\windows\\iconservicelib"]
+
+[[rule]]
+id = "BEH-0064"
+name = "program started from the public profile"
+description = "A program was started from the shared Public profile."
+severity = "medium"
+score = 55
+subject = "process"
+action = ["process_started"]
+# `C:\Users\Public` is writable by every account and is not where anything is
+# installed, which is why it shows up as a staging directory. Installers use it
+# too -- some redistributables unpack there -- so this is a warning, and the
+# pair rules above are what turn it into a finding.
+path_contains = ["\\users\\public\\"]
+
+[[rule]]
+id = "BEH-0065"
+name = "shadow copy exclusion added"
+description = "A path was excluded from volume shadow copies."
+severity = "high"
+score = 75
+subject = "registry"
+action = ["registry_changed"]
+detail = ["registry_value_set"]
+# `FilesNotToSnapshot` decides what a shadow copy leaves out, and adding an
+# entry is how a family makes sure the encrypted files are not recoverable from
+# a previous version. Backup software writes here too, which is what the score
+# says: evidence, not a verdict.
+path_contains = ["\\control\\backuprestore\\filesnottosnapshot"]
+
+# ---------------------------------------------------------------------------
+# Command lines
+#
+# A rule here is a program **and** what it was asked to do. That is the pair the
+# command line unlocks: `vssadmin.exe` listing shadow copies and
+# `vssadmin.exe delete shadows /all` were the same event until the service
+# started reading the command line off the started process. The condition is
+# written as substrings of the folded command line, so `delete` and `shadows` in
+# either order -- and in either case -- satisfy it, while a `vssadmin list`
+# does not.
+# ---------------------------------------------------------------------------
+
+[[rule]]
+id = "BEH-0066"
+name = "shadow copies deleted"
+description = "vssadmin was asked to delete shadow copies."
+severity = "high"
+score = 85
+subject = "process"
+action = ["process_started"]
+# The rung that makes everything after it unrecoverable. `vssadmin list
+# shadows` is an administrator looking; `vssadmin delete shadows` is the
+# preparation for encryption, and the two are told apart only by these two
+# words.
+path_suffix = ["\\vssadmin.exe"]
+command_line_requires = ["delete", "shadows"]
+
+[[rule]]
+id = "BEH-0067"
+name = "recovery disabled through the boot configuration"
+description = "bcdedit was asked to disable recovery."
+severity = "high"
+score = 85
+subject = "process"
+action = ["process_started"]
+# `bcdedit /set {default} recoveryenabled No` -- written as the two words with
+# the space between them, because that is the form the syntax produces. A bare
+# `no` would match most command lines on a machine.
+path_suffix = ["\\bcdedit.exe"]
+command_line_contains = ["recoveryenabled no"]
+
+[[rule]]
+id = "BEH-0068"
+name = "certutil used to download"
+description = "certutil was asked to fetch a URL into the cache."
+severity = "high"
+score = 80
+subject = "process"
+action = ["process_started"]
+# `certutil -urlcache -f http://...` is a download with a signed Microsoft
+# binary, which is why it is used. `-urlcache` alone is also how a cache is
+# cleared, so the pair carries the condition.
+path_suffix = ["\\certutil.exe"]
+command_line_requires = ["-urlcache", "http"]
+
+[[rule]]
+id = "BEH-0069"
+name = "powershell with an encoded command"
+description = "powershell was started with a base64-encoded command."
+severity = "high"
+score = 80
+subject = "process"
+action = ["process_started"]
+# `-encodedcommand` is the long form and is unambiguous. `-enc` is the
+# abbreviation every loader uses and also the prefix of `-encodedcommand`
+# itself, so the two together cover both spellings without matching an
+# ordinary argument.
+path_suffix = ["\\powershell.exe", "\\pwsh.exe"]
+command_line_contains = ["-encodedcommand", "-enc "]
+
+[[rule]]
+id = "BEH-0070"
+name = "mshta started on a URL"
+description = "mshta was started on a web address or an inline script."
+severity = "high"
+score = 80
+subject = "process"
+action = ["process_started"]
+# `mshta http://...` runs whatever the page returns without writing a file
+# first, and `mshta javascript:` does the same inline. Both are the same
+# sentence: an HTML host was handed something to execute.
+path_suffix = ["\\mshta.exe"]
+command_line_contains = ["http", "javascript:", "vbscript:"]
