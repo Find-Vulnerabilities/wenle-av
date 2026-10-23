@@ -276,6 +276,20 @@ pub enum Received {
     Event(EventMessage),
     /// The driver's own account of itself.
     Status(StatusMessage),
+    /// The receive returned success without writing a message.
+    ///
+    /// Not a driver message and not a refusal: `FilterGetMessage` does this when
+    /// more than one thread waits on the same port handle (measured 2026-10-18,
+    /// thousands a second) and at the edges of a connection. The buffer is
+    /// exactly as this process cleared it, so its prefix is
+    /// `MessagePrefix::default` -- kind `KIND_RESERVED` 0, version 0 -- which no
+    /// sender ever writes.
+    ///
+    /// It is a variant rather than a reason string because there is nothing to
+    /// decide and nothing to report: a message that was never written must not
+    /// reach a decision procedure, and calling it "a message this build cannot
+    /// read" sent a reader looking for a protocol bug that does not exist.
+    Empty,
     /// Something this build will not read, and why. Nothing is done with it
     /// beyond the log: the one thing a message like this must not do is reach a
     /// decision procedure that would be guessing at the layout of bytes it has
@@ -317,6 +331,7 @@ impl core::fmt::Debug for Received {
                 .field("state", &status.status.state)
                 .field("mode", &status.status.mode)
                 .finish(),
+            Received::Empty => f.write_str("Empty"),
             Received::Unreadable { reason, mismatch } => f
                 .debug_struct("Unreadable")
                 .field("reason", reason)
@@ -354,6 +369,12 @@ pub fn received(buffer: &[u8]) -> Received {
             mismatch: None,
         };
     };
+    // The empty-success case, told apart before anything else:
+    // `MessagePrefix::default` is what a buffer nobody wrote to holds, and no
+    // sender produces it.
+    if prefix.kind == 0 && prefix.version == 0 {
+        return Received::Empty;
+    }
     if !prefix.is_readable() {
         return Received::Unreadable {
             reason: format!(
@@ -1138,6 +1159,9 @@ impl Dispatcher {
             Received::Status(message) => {
                 self.status = Some(message.status);
                 Action::Ignored(describe_status(&message.status))
+            }
+            Received::Empty => {
+                Action::Ignored("the filter manager returned success without a message".to_string())
             }
             Received::Unreadable { reason, .. } => Action::Ignored(reason),
         }
@@ -1984,6 +2008,7 @@ pub fn lane(message: &Received) -> Lane {
         Received::Status(_) => Lane::Decide,
         Received::Event(_) => Lane::Events,
         Received::Unreadable { .. } => Lane::Events,
+        Received::Empty => Lane::Events,
     }
 }
 
@@ -2190,6 +2215,8 @@ fn report_events(messages: &Receiver<Received>, events: &Sender<Event>) {
     // so a mismatch that is still there is said once each time rather than on
     // every event -- which on a busy machine would be thousands a second.
     let mut warned_about_mismatch = false;
+    // Counted, not logged per message: see the Received::Empty arm.
+    let mut empty_receives: u64 = 0;
     loop {
         // No stop flag: this thread ends when the receive thread drops the last
         // sender, which happens when the port ends or the service stops, and
@@ -2219,10 +2246,25 @@ fn report_events(messages: &Receiver<Received>, events: &Sender<Event>) {
                 }
                 _ => log::debug!("a driver message was ignored: {reason}"),
             },
-            // [lane] puts these on the decision lane.
             // [`lane`] puts these on the decision lane. A message here is a
             // defect in that function, and it is said rather than decided on a
             // thread that holds no engine.
+            // A receive that returned success without writing a message. Known,
+            // and harmless: the buffer is what this process cleared, so nothing
+            // was overwritten and no decision can be about it. Said once per
+            // connection, because a port answering with empty successes
+            // thousands of times a second is the shape of the two-waiter defect
+            // `RECEIVE_THREADS` records.
+            Received::Empty => {
+                empty_receives += 1;
+                if empty_receives == 1 {
+                    log::debug!(
+                        "the filter manager returned success without a message; this is the \
+                         empty-success case and not a driver message. Further ones are counted \
+                         silently."
+                    );
+                }
+            }
             Received::DecisionRequest(_) | Received::Status(_) => {
                 log::error!("a decision message reached the event thread; it was not answered")
             }
@@ -2504,18 +2546,21 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_message_is_refused_rather_than_read_as_a_request() {
-        // The zeroed buffer is what a receive that wrote nothing looks like, and
-        // kind 0 is reserved: it must not decode as "decision request", because
-        // the answer to a question nobody asked is a reply the driver discards
-        // and a log line that says nothing happened.
+    fn a_receive_that_wrote_nothing_is_its_own_answer_and_not_a_refusal() {
+        // The zeroed buffer is what a receive that wrote nothing looks like.
+        // `MessagePrefix::default` is kind 0, version 0, and no sender produces
+        // it -- so this is the filter manager's empty success, not a message
+        // this build failed to understand. Telling them apart matters: the
+        // first is a documented Windows behaviour that needs no investigation,
+        // and the second was read as "a message this build cannot read" for a
+        // day, which sent the search toward a protocol bug that did not exist
+        // (test VM, 2026-10-23 20:56).
+        assert!(matches!(received(&[0u8; 64]), Received::Empty));
+        // A buffer too short to hold a prefix is still a refusal: there is not
+        // enough there to tell the two apart.
         assert!(matches!(received(&[]), Received::Unreadable { .. }));
         assert!(matches!(
             received(&[0u8; 8]),
-            Received::Unreadable { .. }
-        ));
-        assert!(matches!(
-            received(&[0u8; 64]),
             Received::Unreadable { .. }
         ));
     }
