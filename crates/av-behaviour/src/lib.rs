@@ -174,9 +174,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn every_shipped_rule_states_its_precision() {
+        // `Precision` defaults to `Contextual`, which is the safe answer and
+        // also an invisible one: a rule that forgot the field would look
+        // classified. So the file itself is read as text and every block is
+        // checked, which is a statement about the corpus rather than about the
+        // parser.
+        let text = include_str!("rules.toml");
+        let mut blocks = 0;
+        for block in text.split("[[rule]]").skip(1) {
+            blocks += 1;
+            let id = block
+                .lines()
+                .find_map(|line| line.strip_prefix("id = \""))
+                .and_then(|rest| rest.split('"').next())
+                .unwrap_or("<no id>");
+            assert!(
+                block.lines().any(|line| line.starts_with("precision = ")),
+                "{id} does not state a precision"
+            );
+        }
+        assert!(blocks >= 68, "the corpus lost rules: {blocks} blocks");
+    }
+
     /// A registry event, in the shape `Record::from_driver` makes.
-    fn registry_record(path: &str, at: u64, process_id: u32) -> Record {
-        Record {
+    fn registry_record(path: &str, at: u64, process_id: u32) -> Record {        Record {
             timestamp: at,
             subject: Subject::Registry,
             action: Action::RegistryChanged,

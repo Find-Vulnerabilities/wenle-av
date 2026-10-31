@@ -218,6 +218,56 @@ impl Detail {
     }
 }
 
+/// How much one match of a rule is worth on its own.
+///
+/// The language has always carried a `score` and nothing that says what a score
+/// *means*: 90 from a rule about `Run` keys in `%TEMP%` and 90 from a rule about
+/// `AppCertDlls` were the same number, and the service classified each finding
+/// alone, so neither could ever convict.
+///
+/// It changes no behaviour yet -- nothing reads it but `RuleSet::validate` --
+/// because what it exists for is the next step: a conviction worth acting on has
+/// to know which evidence is exact and which is only a shape.
+///
+/// * [`Precision::Exact`] -- the key or the command is one nothing ordinary
+///   writes, so a single match is evidence worth acting on.
+/// * [`Precision::Contextual`] -- a legitimate writer exists, so one match
+///   corroborates and does not convict.
+/// * [`Precision::Burst`] -- a count over a window. It counts how often something
+///   ordinary happens, so it can never convict alone: measured on the host over
+///   2026-10-19 and 2026-10-20, `BEH-0004` was 86 of the 168 warnings those two
+///   days produced, every one of them an installer or a test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Precision {
+    /// One match is conclusive on its own.
+    Exact,
+    /// One match corroborates and does not convict.
+    Contextual,
+    /// A count over a window; never conclusive alone.
+    Burst,
+}
+
+impl Precision {
+    /// The name a rule writes.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Precision::Exact => "exact",
+            Precision::Contextual => "contextual",
+            Precision::Burst => "burst",
+        }
+    }
+}
+
+impl Default for Precision {
+    /// The safe answer for a rule that does not state one: a match corroborates
+    /// and nothing more. Defaulting to [`Precision::Exact`] would make a rule
+    /// that forgot the field convicting by accident.
+    fn default() -> Self {
+        Precision::Contextual
+    }
+}
+
 /// One rule.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -231,6 +281,13 @@ pub struct Rule {
     /// How serious this is if genuine. Defaults to `medium`.
     #[serde(default = "default_severity")]
     pub severity: Severity,
+    /// What one match of this rule is worth on its own. See [`Precision`].
+    ///
+    /// Defaults to [`Precision::Contextual`], and the shipped corpus states it
+    /// on every rule: a test reads the file to prove that rather than trusting
+    /// the default.
+    #[serde(default)]
+    pub precision: Precision,
     /// Score contribution. Defaults to [`Severity::default_score`].
     #[serde(default)]
     pub score: Option<u16>,
@@ -762,6 +819,34 @@ impl RuleSet {
                     reason: "count is zero, so it can never be reached".to_string(),
                 });
             }
+            // `Precision` is a statement about one match, so it has to agree
+            // with `count`. An `exact` rule says its single event is
+            // conclusive; a rule that needs two events is not making that
+            // claim. A `burst` rule is a count by definition, and one with no
+            // count is a single event calling itself statistical.
+            match rule.precision {
+                Precision::Exact if rule.count > 1 => {
+                    return Err(LoadError::Invalid {
+                        id: rule.id.clone(),
+                        reason: format!(
+                            "precision = \"exact\" with count = {}: an exact rule is one whose \
+                             single event is conclusive, and a count is a burst by nature",
+                            rule.count
+                        ),
+                    });
+                }
+                Precision::Burst if rule.count < 2 => {
+                    return Err(LoadError::Invalid {
+                        id: rule.id.clone(),
+                        reason: format!(
+                            "precision = \"burst\" with count = {}: a burst is a count over a \
+                             window, so this rule either needs a count or is not a burst",
+                            rule.count
+                        ),
+                    });
+                }
+                _ => {}
+            }
             if rule.window_seconds == 0 {
                 return Err(LoadError::Invalid {
                     id: rule.id.clone(),
@@ -945,6 +1030,48 @@ mod tests {
         )
         .expect_err("refused");
         assert!(error.to_string().contains("belongs to"), "{error}");
+    }
+
+    #[test]
+    fn an_exact_rule_that_counts_is_refused() {
+        // `exact` says one event is conclusive. A rule that needs three is
+        // making the opposite claim, and shipping both would put a statistical
+        // rule in the class that is allowed to convict.
+        let error = RuleSet::parse(
+            r#"
+            [[rule]]
+            id = "BEH-9001"
+            name = "n"
+            description = "d"
+            precision = "exact"
+            subject = "file"
+            action = ["file_renamed"]
+            path_suffix = [".locked"]
+            count = 3
+            "#,
+        )
+        .expect_err("refused");
+        assert!(error.to_string().contains("exact"), "{error}");
+    }
+
+    #[test]
+    fn a_burst_rule_without_a_count_is_refused() {
+        // The other direction: a burst is a count over a window, and one with no
+        // count is a single event calling itself statistical.
+        let error = RuleSet::parse(
+            r#"
+            [[rule]]
+            id = "BEH-9002"
+            name = "n"
+            description = "d"
+            precision = "burst"
+            subject = "file"
+            action = ["file_renamed"]
+            path_suffix = [".locked"]
+            "#,
+        )
+        .expect_err("refused");
+        assert!(error.to_string().contains("burst"), "{error}");
     }
 
     #[test]
