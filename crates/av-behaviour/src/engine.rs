@@ -32,7 +32,7 @@ use std::collections::{HashMap, VecDeque};
 
 use av_core::Severity;
 
-use crate::dsl::{Rule, RuleSet, Verdict};
+use crate::dsl::{Precision, Rule, RuleSet, Verdict};
 use crate::error::LoadError;
 use crate::event::Record;
 use crate::Action;
@@ -62,6 +62,13 @@ pub struct Finding {
     pub description: String,
     /// How damaging this would be if genuine.
     pub severity: Severity,
+    /// What one match of the rule is worth on its own -- see [Precision].
+    ///
+    /// Carried so the layer above can act on the difference: an `exact` rule
+    /// names a key or a command nothing ordinary writes, and that is the class
+    /// that may be allowed to terminate a process. A `burst` rule counts how
+    /// often something ordinary happens and must never be given that power.
+    pub precision: Precision,
     /// What it contributes to a verdict. Every shipped rule is below the
     /// malicious threshold on its own — see [`crate::RULES_TOML`].
     pub score: u16,
@@ -220,6 +227,7 @@ impl Engine {
                 name: rule.name.clone(),
                 description: rule.description.clone(),
                 severity: rule.severity,
+                precision: rule.precision,
                 score: rule.score(),
                 path: record.path.clone(),
                 value: record.value.clone(),
@@ -770,6 +778,63 @@ mod tests {
         no_path.path = None;
         no_path.folded_path = None;
         assert!(engine.observe(&no_path).is_empty());
+    }
+
+    #[test]
+    fn a_finding_carries_the_precision_of_the_rule_that_made_it() {
+        // The layer above is allowed to act on `exact` and must never act on
+        // `burst`, so the class has to travel with the finding. A finding that
+        // lost it would either be treated as contextual (harmless) or, if
+        // something defaulted the other way, be allowed to act on statistics.
+        let mut engine = engine(
+            r#"
+            [[rule]]
+            id = "BEH-9101"
+            name = "exact one"
+            description = "d"
+            precision = "exact"
+            subject = "file"
+            action = ["file_renamed"]
+            path_suffix = [".locked"]
+
+            [[rule]]
+            id = "BEH-9102"
+            name = "burst one"
+            description = "d"
+            precision = "burst"
+            subject = "file"
+            action = ["file_renamed"]
+            path_suffix = [".locked"]
+            count = 2
+            window_seconds = 60
+            "#,
+        );
+        let fired = engine.observe(&record(
+            Action::FileRenamed,
+            Subject::File,
+            r"C:\Users\me\a.locked",
+            4242,
+            10,
+        ));
+        let exact = fired
+            .iter()
+            .find(|f| f.rule_id == "BEH-9101")
+            .expect("the exact rule fired");
+        assert_eq!(exact.precision, crate::Precision::Exact);
+        // The burst rule needs two events, so it is not in this first round.
+        assert!(fired.iter().all(|f| f.rule_id != "BEH-9102"));
+        let fired = engine.observe(&record(
+            Action::FileRenamed,
+            Subject::File,
+            r"C:\Users\me\b.locked",
+            4242,
+            20,
+        ));
+        let burst = fired
+            .iter()
+            .find(|f| f.rule_id == "BEH-9102")
+            .expect("the burst rule fired on its second event");
+        assert_eq!(burst.precision, crate::Precision::Burst);
     }
 
     #[test]

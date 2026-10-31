@@ -81,7 +81,7 @@ mod engine;
 mod error;
 mod event;
 
-pub use dsl::{Action, Detail, Rule, RuleSet, Subject};
+pub use dsl::{Action, Detail, Precision, Rule, RuleSet, Subject};
 pub use engine::{Engine, Finding, TICKS_PER_SECOND};
 pub use error::LoadError;
 pub use event::Record;

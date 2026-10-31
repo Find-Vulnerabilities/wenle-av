@@ -1851,9 +1851,13 @@ impl Host {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(format!("pid {}", finding.process_id)));
             log::warn!(
-                "behaviour: {} {} (pid {}, {} event{} in {} s): {}{}",
+                "behaviour: {} {} [{}] (pid {}, {} event{} in {} s): {}{}",
                 finding.rule_id,
                 finding.name,
+                // Which class of evidence this is, in the line itself: `exact`
+                // is the class that may later be allowed to act, and a log that
+                // does not say which class fired cannot be used to decide that.
+                finding.precision.as_str(),
                 finding.process_id,
                 finding.count,
                 if finding.count == 1 { "" } else { "s" },
