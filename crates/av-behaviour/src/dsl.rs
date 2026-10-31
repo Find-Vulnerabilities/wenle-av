@@ -924,14 +924,20 @@ impl RuleSet {
                             .to_string(),
                     });
                 }
-                Response::Quarantine if rule.precision != Precision::Exact => {
+                // Quarantine does not require exact evidence, and the asymmetry
+                // with `terminate` is deliberate: a process that has been
+                // stopped cannot be un-stopped, while a file the vault has taken
+                // can be restored. What it does require is `subject = "file"`,
+                // above, because the thing taken has to be the thing the event
+                // named, and it must not be a burst: a rule that counts ordinary
+                // events must never move the files those events are about.
+                Response::Quarantine if rule.precision == Precision::Burst => {
                     return Err(LoadError::Invalid {
                         id: rule.id.clone(),
-                        reason: format!(
-                            "response = \"quarantine\" with precision = \"{}\": moving a file \
-                             the user needs is not recoverable by a user who never asked for it",
-                            rule.precision.as_str()
-                        ),
+                        reason: "response = \"quarantine\" with precision = \"burst\": a rule \
+                                 that counts ordinary events must not move the files those \
+                                 events are about"
+                            .to_string(),
                     });
                 }
                 _ => {}
@@ -1207,22 +1213,51 @@ mod tests {
     }
 
     #[test]
-    fn quarantine_is_refused_without_exact_evidence() {
+    fn quarantine_is_refused_for_a_rule_that_counts_ordinary_events() {
+        // `terminate` needs exact evidence because it cannot be undone; a take
+        // can be restored, so contextual evidence is allowed to ask for one.
+        // But a rule that counts how often something ordinary happens must not
+        // be allowed to move the files those events are about.
         let error = RuleSet::parse(
             r#"
             [[rule]]
             id = "BEH-9203"
             name = "n"
             description = "d"
-            precision = "contextual"
+            precision = "burst"
             response = "quarantine"
             subject = "file"
             action = ["file_written"]
             path_suffix = [".exe"]
+            count = 20
+            window_seconds = 60
             "#,
         )
         .expect_err("refused");
         assert!(error.to_string().contains("quarantine"), "{error}");
+    }
+
+    #[test]
+    fn quarantine_is_allowed_for_a_contextual_rule_about_a_file() {
+        // The other half of the asymmetry, asserted rather than implied: this is
+        // the shape BEH-0061 has, and a change that made it unloadable would be
+        // found here rather than on a machine that no longer starts.
+        let rules = RuleSet::parse(
+            r#"
+            [[rule]]
+            id = "BEH-9204"
+            name = "n"
+            description = "d"
+            precision = "contextual"
+            response = "quarantine"
+            subject = "file"
+            action = ["file_written"]
+            path_contains = ["\\start menu\\programs\\startup\\"]
+            path_suffix = [".exe"]
+            "#,
+        )
+        .expect("contextual quarantine is allowed");
+        assert_eq!(rules.rules[0].response, Response::Quarantine);
     }
 
     #[test]

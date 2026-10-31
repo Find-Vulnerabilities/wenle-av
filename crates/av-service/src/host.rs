@@ -1872,12 +1872,22 @@ impl Host {
                     .map(|value| format!(" = `{value}`"))
                     .unwrap_or_default()
             );
-            // The one class of behaviour finding that may act. `response` is a
-            // property of the rule and `RuleSet::validate` refuses `terminate`
-            // on anything that is not an exact rule about a process, so reaching
-            // here means the rule named a process and meant it.
-            let terminated = finding.response == av_behaviour::Response::Terminate
-                && self.stop_for_behaviour(&finding);
+            // What the rule asked for, and nothing else. `response` is a
+            // property of the rule and `RuleSet::validate` has already refused
+            // the combinations that cannot mean anything: `terminate` only on
+            // an exact rule about a process, `quarantine` only on a rule about
+            // a file that does not count ordinary events.
+            let mut terminated = false;
+            let mut action = DetectionAction::Reported;
+            match finding.response {
+                av_behaviour::Response::Report => {}
+                av_behaviour::Response::Terminate => {
+                    terminated = self.stop_for_behaviour(&finding);
+                }
+                av_behaviour::Response::Quarantine => {
+                    action = self.quarantine(&path, context_for_behaviour(&finding, verdict));
+                }
+            }
             out.push(Event::Detection(Detection {
                 file_name: file_name_of(&path),
                 path,
@@ -1886,7 +1896,7 @@ impl Host {
                 severity: finding.severity,
                 threat: None,
                 rules: vec![finding.rule_id],
-                action: DetectionAction::Reported,
+                action,
                 source: EntrySource::Behaviour,
                 size: 0,
                 at: Utc::now(),
@@ -3307,6 +3317,35 @@ pub fn already_decided(finding: &av_realtime::Finding) -> Option<DetectionAction
         .map(|reason| DetectionAction::QuarantineFailed {
             reason: reason.clone(),
         })
+}
+
+/// The vault record for a file a behaviour rule asked to take.
+///
+/// Built from the finding rather than from a scan report, for the reason
+/// [`context_for_finding`] gives: no report exists on this path -- the rule saw
+/// an event, not a file -- so the two fields that normally come from one are
+/// copied from the finding (the rule identifier) and the verdict the service
+/// reached for it.
+///
+/// The note says how it was taken, which is the one thing the vault entry cannot
+/// work out: the file was written first and taken afterwards, so the program it
+/// describes had already been created.
+pub fn context_for_behaviour(
+    finding: &av_behaviour::Finding,
+    verdict: Verdict,
+) -> QuarantineContext {
+    QuarantineContext {
+        threat: None,
+        detection: Some(finding.rule_id.clone()),
+        severity: finding.severity,
+        verdict,
+        source: EntrySource::Behaviour,
+        note: Some(format!(
+            "taken by the behaviour monitor after `{}` saw it written; the write was not stopped",
+            finding.rule_id
+        )),
+        remove_original: true,
+    }
 }
 
 /// The vault context for a watcher finding.
