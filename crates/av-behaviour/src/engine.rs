@@ -48,6 +48,34 @@ pub const TICKS_PER_SECOND: u64 = 10_000_000;
 /// matched at least once*, not per process.
 const MAX_TRACKED_SERIES: usize = 4096;
 
+/// How long a run of exclusions by one pattern is folded into one line.
+///
+/// An exclusion is a rule doing its job, and on a healthy machine it happens
+/// hundreds of times an hour: measured 2026-10-31 in the test VM, `BEH-0003`
+/// excluded every `\Windows\System32\SRU\*.log` the service wrote, and a log
+/// line per event made the log itself the slowest part of the loop -- behaviour
+/// findings arrived 13 to 23 seconds after their command at `trace` level.
+///
+/// A minute is short enough that a diagnostic still reads as "now", and long
+/// enough that a busy exclusion costs one line instead of hundreds.
+const EXCLUSION_QUIET_SECONDS: u64 = 60;
+
+/// How many distinct (rule, pattern) pairs are remembered.
+///
+/// Bounded because the key is a pair of strings: a rule with a wide exclusion
+/// list seen against many paths would otherwise be a slow leak. When the bound
+/// is reached the table is cleared, which costs at most one extra line.
+const MAX_EXCLUSION_KEYS: usize = 256;
+
+/// How many events one (rule, pattern) pair has excluded since its last line.
+#[derive(Debug, Clone, Copy)]
+struct ExclusionRun {
+    /// When the line that opened this run was written.
+    last: u64,
+    /// How many events have been excluded since, not counting that one.
+    count: u64,
+}
+
 /// How many processes' lineage is remembered.
 const MAX_TRACKED_PROCESSES: usize = 8192;
 
@@ -128,6 +156,9 @@ pub struct Engine {
     series: HashMap<(usize, u32), Series>,
     processes: HashMap<u32, ProcessInfo>,
     order: u64,
+    /// One entry per (rule, pattern) that is currently excluding things. See
+    /// [`Engine::note_exclusion`].
+    exclusions: HashMap<(usize, String), ExclusionRun>,
 }
 
 impl Engine {
@@ -138,6 +169,7 @@ impl Engine {
             series: HashMap::new(),
             processes: HashMap::new(),
             order: 0,
+            exclusions: HashMap::new(),
         }
     }
 
@@ -171,47 +203,52 @@ impl Engine {
 
         let mut findings = Vec::new();
         for index in 0..self.rules.len() {
-            match self.rules[index].verdict(record, image.as_deref(), parent.as_deref()) {
+            // The refusal is copied out of the verdict before anything touches
+            // `self` again: `Verdict` borrows the rule's own strings, and the
+            // counting below needs `&mut self`.
+            enum Refusal {
+                Path(String),
+                Image(String),
+                Value(String),
+            }
+            let refusal = match self.rules[index].verdict(record, image.as_deref(), parent.as_deref()) {
                 Verdict::NoMatch => continue,
-                Verdict::Excluded(pattern) => {
-                    // The one thing a rule does that would otherwise leave no
-                    // trace. At `trace` and not at `info`: the application hive
-                    // alone produces hundreds of these on a healthy machine,
-                    // and what they are worth is a diagnostic, not a warning.
-                    log::trace!(
-                        "behaviour: {} excluded {} by path_excludes entry `{pattern}`",
-                        self.rules[index].id,
-                        record.path.as_deref().unwrap_or("")
-                    );
-                    continue;
+                Verdict::Matches => None,
+                Verdict::Excluded(pattern) => Some(Refusal::Path(pattern.to_string())),
+                Verdict::ExcludedByImage(pattern) => Some(Refusal::Image(pattern.to_string())),
+                Verdict::ExcludedByValue(pattern) => Some(Refusal::Value(pattern.to_string())),
+            };
+            if let Some(refusal) = refusal {
+                // The one thing a rule does that would otherwise leave no trace.
+                // At `trace` and not at `info`: the application hive alone
+                // produces hundreds of these on a healthy machine, and what they
+                // are worth is a diagnostic, not a warning. Throttled because
+                // that volume is also what made the log the slowest part of the
+                // loop -- see `EXCLUSION_QUIET_SECONDS`.
+                let line = match &refusal {
+                    Refusal::Path(pattern) => self.note_exclusion(
+                        index,
+                        pattern,
+                        record.timestamp,
+                        || format!("last: {}", record.path.as_deref().unwrap_or("")),
+                    ),
+                    Refusal::Image(pattern) => self.note_exclusion(
+                        index,
+                        pattern,
+                        record.timestamp,
+                        || format!("the acting image was {}", image.as_deref().unwrap_or("unknown")),
+                    ),
+                    Refusal::Value(pattern) => self.note_exclusion(
+                        index,
+                        pattern,
+                        record.timestamp,
+                        || format!("the value was `{}`", record.value.as_deref().unwrap_or("")),
+                    ),
+                };
+                if let Some(line) = line {
+                    log::trace!("{line}");
                 }
-                Verdict::ExcludedByValue(pattern) => {
-                    // The third refusal, named against the same event the other
-                    // two name. A registry value is the only event that has
-                    // one, and a rule written against a value that refuses it
-                    // is the narrowest statement in the file — the trace line
-                    // is how the exclusion can be shown to be doing its job.
-                    log::trace!(
-                        "behaviour: {} excluded {} by value_excludes entry `{pattern}` (the value was `{}`)",
-                        self.rules[index].id,
-                        record.path.as_deref().unwrap_or(""),
-                        record.value.as_deref().unwrap_or("")
-                    );
-                    continue;
-                }
-                Verdict::ExcludedByImage(pattern) => {
-                    // Same reasoning, and the image is named in the line because
-                    // the path alone cannot explain why the event was refused:
-                    // the same delete by any other process is still reported.
-                    log::trace!(
-                        "behaviour: {} excluded {} by process_image_excludes entry `{pattern}` (the acting image was {})",
-                        self.rules[index].id,
-                        record.path.as_deref().unwrap_or(""),
-                        image.as_deref().unwrap_or("unknown")
-                    );
-                    continue;
-                }
-                Verdict::Matches => {}
+                continue;
             }
             let (count, window, dedupe) = {
                 let rule = &self.rules[index];
@@ -248,6 +285,51 @@ impl Engine {
         }
         self.trim(record.timestamp);
         findings
+    }
+
+    /// Count one exclusion, and return the line to write if it is time to.
+    ///
+    /// The first exclusion by a (rule, pattern) pair is written immediately, so
+    /// a diagnostic still shows *when* an exclusion started. The rest are
+    /// counted, and folded into one line when the quiet window ends. `detail`
+    /// is a closure because building it is the one allocation that would
+    /// otherwise be paid for every excluded event.
+    fn note_exclusion(
+        &mut self,
+        rule: usize,
+        pattern: &str,
+        at: u64,
+        detail: impl FnOnce() -> String,
+    ) -> Option<String> {
+        let id = self.rules[rule].id.clone();
+        let quiet = EXCLUSION_QUIET_SECONDS.saturating_mul(TICKS_PER_SECOND);
+        let key = (rule, pattern.to_string());
+        match self.exclusions.get_mut(&key) {
+            Some(run) if at.saturating_sub(run.last) < quiet => {
+                run.count += 1;
+                None
+            }
+            Some(run) => {
+                let count = run.count + 1;
+                run.count = 0;
+                run.last = at;
+                Some(format!(
+                    "behaviour: {id} excluded {count} more events in {EXCLUSION_QUIET_SECONDS} s \
+                     by `{pattern}` ({})",
+                    detail()
+                ))
+            }
+            None => {
+                if self.exclusions.len() >= MAX_EXCLUSION_KEYS {
+                    self.exclusions.clear();
+                }
+                self.exclusions.insert(key, ExclusionRun { last: at, count: 0 });
+                Some(format!(
+                    "behaviour: {id} excluded an event by `{pattern}` ({})",
+                    detail()
+                ))
+            }
+        }
     }
 
     /// Offer a driver event. `None`-shaped events — the driver's own state and
@@ -379,6 +461,50 @@ mod tests {
     use super::*;
     use crate::event::Record;
     use crate::{Detail, Subject};
+
+    #[test]
+    fn an_exclusion_is_said_at_once_and_then_counted_into_one_line() {
+        // The first line has to appear immediately: its job is to say *when* a
+        // rule started refusing things, and a count that only shows up a minute
+        // later would not answer that. The rest are folded, because writing one
+        // line per excluded event is what made the log the slowest part of the
+        // loop in the test VM on 2026-10-31.
+        let mut engine = Engine::from_toml(
+            r#"
+            [[rule]]
+            id = "BEH-9301"
+            name = "n"
+            description = "d"
+            precision = "burst"
+            response = "report"
+            subject = "file"
+            action = ["file_renamed"]
+            path_suffix = [".log"]
+            count = 20
+            window_seconds = 60
+            path_excludes = ["\\windows\\system32\\sru\\"]
+            "#,
+        )
+        .expect("the rule parses");
+        let pattern = "\\windows\\system32\\sru\\";
+        let first = engine.note_exclusion(0, pattern, 0, || "first".to_string());
+        assert!(first.expect("said at once").contains("excluded an event"));
+
+        for n in 1..=3 {
+            let silent = engine.note_exclusion(0, pattern, n * 10 * TICKS_PER_SECOND, || "x".to_string());
+            assert!(silent.is_none(), "line {n} should have been counted");
+        }
+
+        let line = engine
+            .note_exclusion(0, pattern, 70 * TICKS_PER_SECOND, || "last".to_string())
+            .expect("time to say it");
+        assert!(line.contains("4 more events"), "{line}");
+        assert!(line.contains("60 s"), "{line}");
+
+        // A different pattern is a different run, and says its own first line.
+        let other = engine.note_exclusion(0, "\\other\\", 71 * TICKS_PER_SECOND, || "y".to_string());
+        assert!(other.expect("its own line").contains("\\other\\"));
+    }
 
     fn record(action: Action, subject: Subject, path: &str, pid: u32, at: u64) -> Record {
         Record {
