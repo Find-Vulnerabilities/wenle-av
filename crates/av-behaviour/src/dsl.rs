@@ -268,6 +268,42 @@ impl Default for Precision {
     }
 }
 
+/// What the product may do when a rule fires.
+///
+/// Separate from [`Precision`] because the two answer different questions:
+/// precision says how much one match is worth, this says what may be done about
+/// it. They are not the same axis, and binding them together is how a rule about
+/// the boot loader would end up being quarantined for being `exact` -- which
+/// would leave a machine that does not start.
+///
+/// The default is [`Response::Report`], and the shipped corpus states it on
+/// every rule so that "acts on nothing" is written down rather than inherited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Response {
+    /// Report it and do nothing else.
+    #[default]
+    Report,
+    /// Terminate the process that matched. Only a rule whose subject is a
+    /// process can ask for this, because it is the process that is stopped.
+    Terminate,
+    /// Quarantine the file that matched. Only a rule whose subject is a file can
+    /// ask for this, and only where taking the file away cannot break the
+    /// machine -- never the boot loader.
+    Quarantine,
+}
+
+impl Response {
+    /// The name a rule writes.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Response::Report => "report",
+            Response::Terminate => "terminate",
+            Response::Quarantine => "quarantine",
+        }
+    }
+}
+
 /// One rule.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -288,6 +324,13 @@ pub struct Rule {
     /// the default.
     #[serde(default)]
     pub precision: Precision,
+    /// What the product may do when this rule fires. See [`Response`].
+    ///
+    /// Defaults to [`Response::Report`] and the shipped corpus states it on
+    /// every rule, for the same reason [`Precision`] is stated on every rule: a
+    /// rule that forgot the field must not acquire the power to stop something.
+    #[serde(default)]
+    pub response: Response,
     /// Score contribution. Defaults to [`Severity::default_score`].
     #[serde(default)]
     pub score: Option<u16>,
@@ -847,6 +890,52 @@ impl RuleSet {
                 }
                 _ => {}
             }
+            // `response` names an action against a specific thing, so it has to
+            // agree with what the rule is about and with how sure it is. Only
+            // these combinations are allowed, and each refusal is a rule that
+            // would otherwise act on something it cannot name or is not sure of.
+            match rule.response {
+                Response::Terminate if rule.subject != Subject::Process => {
+                    return Err(LoadError::Invalid {
+                        id: rule.id.clone(),
+                        reason: format!(
+                            "response = \"terminate\" on a rule about the {}: only a rule about \
+                             a process can ask for the process to be stopped",
+                            rule.subject.as_str()
+                        ),
+                    });
+                }
+                Response::Terminate if rule.precision != Precision::Exact => {
+                    return Err(LoadError::Invalid {
+                        id: rule.id.clone(),
+                        reason: format!(
+                            "response = \"terminate\" with precision = \"{}\": acting on \
+                             anything less than exact evidence is how a legitimate program gets \
+                             killed",
+                            rule.precision.as_str()
+                        ),
+                    });
+                }
+                Response::Quarantine if rule.subject == Subject::Process => {
+                    return Err(LoadError::Invalid {
+                        id: rule.id.clone(),
+                        reason: "response = \"quarantine\" on a rule about a process: the file \
+                                 to take away is not the one the event named"
+                            .to_string(),
+                    });
+                }
+                Response::Quarantine if rule.precision != Precision::Exact => {
+                    return Err(LoadError::Invalid {
+                        id: rule.id.clone(),
+                        reason: format!(
+                            "response = \"quarantine\" with precision = \"{}\": moving a file \
+                             the user needs is not recoverable by a user who never asked for it",
+                            rule.precision.as_str()
+                        ),
+                    });
+                }
+                _ => {}
+            }
             if rule.window_seconds == 0 {
                 return Err(LoadError::Invalid {
                     id: rule.id.clone(),
@@ -1072,6 +1161,68 @@ mod tests {
         )
         .expect_err("refused");
         assert!(error.to_string().contains("burst"), "{error}");
+    }
+
+    #[test]
+    fn terminate_is_refused_on_a_rule_that_is_not_about_a_process() {
+        // There is no process to stop when the event is a registry key, and a
+        // rule that asked for one would either do nothing or stop whatever the
+        // finding's process_id happened to name.
+        let error = RuleSet::parse(
+            r#"
+            [[rule]]
+            id = "BEH-9201"
+            name = "n"
+            description = "d"
+            precision = "exact"
+            response = "terminate"
+            subject = "registry"
+            action = ["registry_changed"]
+            path_contains = ["\\appcertdlls"]
+            "#,
+        )
+        .expect_err("refused");
+        assert!(error.to_string().contains("terminate"), "{error}");
+    }
+
+    #[test]
+    fn terminate_is_refused_without_exact_evidence() {
+        // Acting on anything less than exact evidence is how a legitimate
+        // program gets killed by a rule that counts ordinary events.
+        let error = RuleSet::parse(
+            r#"
+            [[rule]]
+            id = "BEH-9202"
+            name = "n"
+            description = "d"
+            precision = "contextual"
+            response = "terminate"
+            subject = "process"
+            action = ["process_started"]
+            path_suffix = [".exe"]
+            "#,
+        )
+        .expect_err("refused");
+        assert!(error.to_string().contains("exact"), "{error}");
+    }
+
+    #[test]
+    fn quarantine_is_refused_without_exact_evidence() {
+        let error = RuleSet::parse(
+            r#"
+            [[rule]]
+            id = "BEH-9203"
+            name = "n"
+            description = "d"
+            precision = "contextual"
+            response = "quarantine"
+            subject = "file"
+            action = ["file_written"]
+            path_suffix = [".exe"]
+            "#,
+        )
+        .expect_err("refused");
+        assert!(error.to_string().contains("quarantine"), "{error}");
     }
 
     #[test]

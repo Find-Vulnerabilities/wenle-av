@@ -1872,6 +1872,12 @@ impl Host {
                     .map(|value| format!(" = `{value}`"))
                     .unwrap_or_default()
             );
+            // The one class of behaviour finding that may act. `response` is a
+            // property of the rule and `RuleSet::validate` refuses `terminate`
+            // on anything that is not an exact rule about a process, so reaching
+            // here means the rule named a process and meant it.
+            let terminated = finding.response == av_behaviour::Response::Terminate
+                && self.stop_for_behaviour(&finding);
             out.push(Event::Detection(Detection {
                 file_name: file_name_of(&path),
                 path,
@@ -1885,11 +1891,74 @@ impl Host {
                 size: 0,
                 at: Utc::now(),
                 in_process: None,
-                terminated: false,
-                // `false`: nothing was stopped, and the word this produces is
-                // "found after it appeared".
-                phase: Phase::observed(EntrySource::Behaviour, false),
+                terminated,
+                // `terminated` above: a rule that asked to stop the process
+                // either did or did not, and the word this produces follows it.
+                phase: Phase::observed(EntrySource::Behaviour, terminated),
             }));
+        }
+    }
+
+    /// Stop the process an exact behaviour rule convicted.
+    ///
+    /// # Why the process watcher's switch and not a new one
+    ///
+    /// `process_watch` already answers "may this service terminate a process",
+    /// and that is the setting the user turned. A second switch would mean a
+    /// user who turned process termination off still had it, on a path that
+    /// never mentions the setting they changed.
+    ///
+    /// # Why the token and not just the identifier
+    ///
+    /// A process that exited between the event and this call has had its
+    /// identifier freed, and `terminate::stop` refuses to act on an identifier
+    /// that now belongs to somebody else. That is the difference between
+    /// stopping the process the rule named and stopping whatever took its place.
+    ///
+    /// Returns whether the process is gone because of this call, which is what
+    /// [`av_ipc::Detection::terminated`] is set from.
+    fn stop_for_behaviour(&mut self, finding: &av_behaviour::Finding) -> bool {
+        use crate::terminate::{ProcessToken, Stopped};
+
+        let permitted = self
+            .process_watch
+            .as_ref()
+            .map(|watch| watch.is_terminating())
+            .unwrap_or(false);
+        if !permitted {
+            log::info!(
+                "behaviour: {} named pid {} and did not stop it: process termination is off",
+                finding.rule_id,
+                finding.process_id
+            );
+            return false;
+        }
+        if finding.process_id == std::process::id() {
+            log::warn!(
+                "behaviour: {} named this service's own process; it was not stopped",
+                finding.rule_id
+            );
+            return false;
+        }
+        match crate::terminate::stop(&ProcessToken::of(finding.process_id)) {
+            Stopped::Terminated => {
+                log::warn!(
+                    "behaviour: {} stopped pid {} ({})",
+                    finding.rule_id,
+                    finding.process_id,
+                    finding.process_image.as_deref().unwrap_or("unknown image")
+                );
+                true
+            }
+            other => {
+                log::info!(
+                    "behaviour: {} named pid {} and stopped nothing: {}",
+                    finding.rule_id,
+                    finding.process_id,
+                    other.describe()
+                );
+                false
+            }
         }
     }
 

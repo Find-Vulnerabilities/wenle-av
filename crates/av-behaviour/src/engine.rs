@@ -32,7 +32,7 @@ use std::collections::{HashMap, VecDeque};
 
 use av_core::Severity;
 
-use crate::dsl::{Precision, Rule, RuleSet, Verdict};
+use crate::dsl::{Precision, Response, Rule, RuleSet, Verdict};
 use crate::error::LoadError;
 use crate::event::Record;
 use crate::Action;
@@ -62,6 +62,12 @@ pub struct Finding {
     pub description: String,
     /// How damaging this would be if genuine.
     pub severity: Severity,
+    /// What the product may do about this finding -- see [Response].
+    ///
+    /// Carried for the same reason the precision is: the layer that acts is not
+    /// the layer that evaluated the rule, and a rule that asked to terminate a
+    /// process must not have its request lost on the way.
+    pub response: Response,
     /// What one match of the rule is worth on its own -- see [Precision].
     ///
     /// Carried so the layer above can act on the difference: an `exact` rule
@@ -228,6 +234,7 @@ impl Engine {
                 description: rule.description.clone(),
                 severity: rule.severity,
                 precision: rule.precision,
+                response: rule.response,
                 score: rule.score(),
                 path: record.path.clone(),
                 value: record.value.clone(),
