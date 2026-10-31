@@ -2067,7 +2067,7 @@ unsafe extern "system" fn section_pre_operation(
 /// that convicts on it must corroborate, which is the same standard the
 /// threshold policy sets for every count-based signal.
 unsafe extern "system" fn write_post_operation(
-    _data: *mut FltCallbackData,
+    data: *mut FltCallbackData,
     _flt_objects: *const c_void,
     _completion_context: *mut c_void,
     _flags: u32,
@@ -2076,7 +2076,32 @@ unsafe extern "system" fn write_post_operation(
     // kernel mode" in its declaration (`ntddk.h` 11385); it takes no argument
     // and dereferences nothing this driver supplies.
     let process_id = unsafe { flt::PsGetCurrentProcessId() } as usize as u32;
-    defer_write_event(process_id);
+
+    // The name is resolved **here**, and only here, because
+    // `FltGetFileNameInformation`'s answer expires when this callback returns.
+    // Copying it into the block that the worker will send is what makes a
+    // `FileWritten` event carry a path at all: until 2026-10-31 it carried none,
+    // and every rule written against `file_written` and a path was dead
+    // (`BEH-0061`, `BEH-0054` -- measured in the test VM, where copying a
+    // program into a Startup folder produced no event at all).
+    //
+    // The IRQL is the reason this is conditional. `FltGetFileNameInformation`
+    // is `_IRQL_requires_max_(APC_LEVEL)` and a write post-operation can be
+    // entered at `DISPATCH_LEVEL`; the registration's
+    // `FLTFL_OPERATION_REGISTRATION_SKIP_PAGING_IO` removes the common raised
+    // case and not every one of them. Above `APC_LEVEL` the event goes without a
+    // path rather than not at all: the process that wrote is still a true
+    // statement, and a rule that needs the path will not match it.
+    let mut dos = [0u16; MAX_PATH_UNITS];
+    let units = if flt::current_irql() <= flt::APC_LEVEL {
+        // SAFETY: `data` is this callback's live callback data, and the helper's
+        // own contract asks for exactly that at `APC_LEVEL` or below, which is
+        // the branch this is.
+        unsafe { operation_file_dos_path(data, &mut dos) }.unwrap_or(0)
+    } else {
+        0
+    };
+    defer_write_event(process_id, &dos, units);
     FLT_POSTOP_FINISHED_PROCESSING
 }
 
@@ -3102,6 +3127,7 @@ fn ask_service(path: &[u16]) -> bool {
 /// It was `MAX_PENDING_WRITES` until 2026-10-09, when the driver-state report
 /// began using the same block through the same queue. The number did not
 /// change; the name did, because it no longer counts one thing.
+#[allow(dead_code)]
 const MAX_PENDING_EVENTS: usize = 1024;
 
 /// How many driver-state reports may be waiting, which is a different question.
@@ -3142,6 +3168,21 @@ const MAX_PENDING_PROCESS_EVENTS: usize = 64;
 /// dropped, and what a consumer does with a burst is read from the ones that
 /// arrived rather than wait for the tail.
 const MAX_PENDING_FILE_EVENTS: usize = 64;
+
+/// How many write notifications may be in flight at once.
+///
+/// Its own number, and its own counter, because a write burst and a rename
+/// burst are different quantities and sharing a counter lets either starve the
+/// other. Measured on 2026-10-31 in the test VM: the first version of the
+/// path-carrying write event used `MAX_PENDING_FILE_EVENTS`, and a single copy
+/// of a program into a Startup folder was enough to fill the sixty-four slots
+/// -- after which the rename that the same test performed produced no event at
+/// all, and `BEH-0007` went quiet for the first time since it was written.
+///
+/// Small on purpose. A write this driver drops costs a finding that other
+/// events still corroborate; a rename it drops because writes filled the queue
+/// costs the finding entirely.
+const MAX_PENDING_WRITE_EVENTS: usize = 32;
 
 /// How many registry notifications may be waiting for a worker thread.
 ///
@@ -3235,6 +3276,9 @@ static PENDING_PROCESS_EVENTS: AtomicUsize = AtomicUsize::new(0);
 /// [`defer_file_event`] and decremented by [`file_event_worker`].
 static PENDING_FILE_EVENTS: AtomicUsize = AtomicUsize::new(0);
 
+/// The slot count for write notifications. See [`MAX_PENDING_WRITE_EVENTS`].
+static PENDING_WRITE_EVENTS: AtomicUsize = AtomicUsize::new(0);
+
 /// How many registry notifications are queued, incremented by
 /// [`defer_registry_event`] and decremented by [`registry_event_worker`].
 static PENDING_REGISTRY_EVENTS: AtomicUsize = AtomicUsize::new(0);
@@ -3253,6 +3297,9 @@ fn pending_counter(action: EventAction) -> &'static AtomicUsize {
         // process-start burst are different quantities, and one counter for both
         // would let either starve the other.
         EventAction::FileRenamed | EventAction::FileDeleted => &PENDING_FILE_EVENTS,
+        // A write has its own budget: sharing the rename's is what let a copy
+        // of one program silence `BEH-0007` on 2026-10-31.
+        EventAction::FileWritten => &PENDING_WRITE_EVENTS,
         // Registry notifications carry a path too, and have their own cap for
         // the reason above: a key-writing loop and a rename burst are different
         // quantities and one counter for both would let either starve the other.
@@ -3469,7 +3516,7 @@ unsafe fn queue_pending(
 /// and clears it in the unload callback, so no callback of this filter can run
 /// with a null or stale one. That is an invariant this module keeps rather than
 /// a precondition its caller has to know.
-fn defer_write_event(process_id: u32) {
+fn defer_write_event(process_id: u32, name: &[u16], units: usize) {
     // The IRQL this can be entered at is `DISPATCH_LEVEL`, and
     // `FltAllocateGenericWorkItem` and `FltQueueGenericWorkItem` are capped
     // there. Both facts are in `flt.rs`; this is where they meet.
@@ -3480,7 +3527,11 @@ fn defer_write_event(process_id: u32) {
     // A dropped event is silent rather than counted, for the reason the send
     // below gives. At the cap the event is dropped rather than queued: the
     // alternative is unbounded pool.
-    if PENDING_EVENTS.load(Ordering::Relaxed) >= MAX_PENDING_EVENTS {
+    // The file-event cap rather than the plain one: the block carries a path
+    // now, so it is the same size as a rename's (`MAX_PENDING_FILE_EVENTS`'s
+    // documentation says why that number is smaller). A write dropped at this
+    // cap is dropped silently, which is the cost of the name.
+    if PENDING_WRITE_EVENTS.load(Ordering::Relaxed) >= MAX_PENDING_WRITE_EVENTS {
         return;
     }
 
@@ -3499,39 +3550,43 @@ fn defer_write_event(process_id: u32) {
     let block = unsafe {
         flt::ExAllocatePool2(
             flt::POOL_FLAG_NON_PAGED,
-            core::mem::size_of::<PendingEvent>(),
-            flt::EVENT_TAG,
+            core::mem::size_of::<PendingFileEvent>(),
+            flt::FILE_EVENT_TAG,
         )
     }
-    .cast::<PendingEvent>();
+    .cast::<PendingFileEvent>();
     if block.is_null() {
         return;
     }
 
     // SAFETY: `block` came from the non-paged pool just above, is
-    // `size_of::<PendingEvent>()` bytes, and nothing else can reach it until it
-    // is queued.
+    // `size_of::<PendingFileEvent>()` bytes, and nothing else can reach it
+    // until it is queued.
     let pending = unsafe { &mut *block };
-    pending.sequence = NEXT_EVENT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    pending.event.sequence = NEXT_EVENT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     // Read now rather than in the worker: that is what makes the timestamp the
     // time of the write instead of the time of the send.
-    pending.now_100ns = interrupt_time_100ns();
+    pending.event.now_100ns = interrupt_time_100ns();
     // The process whose thread issued the write, read by the caller before it
-    // got here. The write's own path is still deliberately not read: resolving
-    // it needs the callback, and the callback has returned.
-    pending.process_id = process_id;
-    pending.detail = 0;
-    pending.subject = SubjectKind::File;
-    pending.action = EventAction::FileWritten;
+    // got here, and the path that caller resolved while the callback was still
+    // the only place it could be resolved.
+    pending.event.process_id = process_id;
+    pending.event.detail = 0;
+    pending.event.subject = SubjectKind::File;
+    pending.event.action = EventAction::FileWritten;
+    let units = units.min(MAX_PATH_UNITS).min(name.len());
+    pending.units = units as u32;
+    pending.path[..units].copy_from_slice(&name[..units]);
 
     // SAFETY: as documented on `queue_pending`; `block` was allocated with
-    // `EVENT_TAG` and `filter` was checked above.
+    // `FILE_EVENT_TAG` and `filter` was checked above. The routine is the file
+    // worker because that is the one whose block this is.
     unsafe {
         queue_pending(
             block.cast::<c_void>(),
-            flt::EVENT_TAG,
-            event_worker,
-            &PENDING_EVENTS,
+            flt::FILE_EVENT_TAG,
+            file_event_worker,
+            &PENDING_WRITE_EVENTS,
             filter,
         );
     }
