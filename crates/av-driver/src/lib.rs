@@ -329,6 +329,7 @@ use flt::{
     IRP_MJ_ACQUIRE_FOR_SECTION_SYNCHRONIZATION, IRP_MJ_CREATE, IRP_MJ_OPERATION_END,
     IRP_MJ_SET_INFORMATION, IRP_MJ_WRITE, OBJ_CASE_INSENSITIVE, OBJ_KERNEL_HANDLE,
     STATUS_ACCESS_DENIED, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_PARAMETER, STATUS_SUCCESS,
+  STATUS_VIRUS_INFECTED,
 };
 
 /// `FLT_REGISTRATION_VERSION`, from `fltKernel.h`.
@@ -1790,7 +1791,17 @@ unsafe extern "C" fn process_notify(
         // passed to this callback, and `CreationStatus` is declared `_Inout_`
         // (`ntddk.h` 11211) — the header's own statement that a notify routine
         // may write it to fail the creation.
-        unsafe { (*create_info).CreationStatus = STATUS_ACCESS_DENIED };
+        // `STATUS_VIRUS_INFECTED` and not `STATUS_ACCESS_DENIED`: both refuse
+        // the creation, and only one of them tells the user why. Windows turns
+        // this one into `ERROR_VIRUS_INFECTED` and the shell says the file
+        // contains a virus, instead of "access denied".
+        //
+        // It only reaches the user on a *second* attempt, because the section
+        // gate refuses the mapping before this callback is reached and its
+        // status cannot be chosen -- see `STATUS_VIRUS_INFECTED` in `flt.rs`
+        // for the measurement behind that. The sentence is still worth having
+        // here: a user who tries again is told the truth.
+        unsafe { (*create_info).CreationStatus = STATUS_VIRUS_INFECTED };
     }
 
     // A dropped event is silent rather than counted, for the reason

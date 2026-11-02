@@ -62,6 +62,23 @@ pub const STATUS_ACCESS_DENIED: NtStatus = 0xC000_0022u32 as NtStatus;
 /// communication port cannot be created, which fails the driver's load.
 pub const STATUS_INSUFFICIENT_RESOURCES: NtStatus = 0xC000_009Au32 as NtStatus;
 
+/// `STATUS_VIRUS_INFECTED`, from `ntstatus.h`.
+///
+/// The status Windows translates into `ERROR_VIRUS_INFECTED` (225) and shows as
+/// *"the operation did not complete successfully because the file contains a
+/// virus or potentially unwanted software"*. That sentence is the reason this
+/// constant exists: `STATUS_ACCESS_DENIED` blocks exactly as well and tells the
+/// user nothing, and a refusal whose message is "access denied" or "not enough
+/// system resources" reads as a broken machine rather than as this product
+/// doing its job.
+///
+/// Honoured where the filter manager accepts a failure: a create
+/// (`CreationStatus`, or `FLT_PREOP_COMPLETE` on `IRP_MJ_CREATE`) and both are
+/// measured. **Not** honoured on `IRP_MJ_ACQUIRE_FOR_SECTION_SYNCHRONIZATION`,
+/// which accepts only `STATUS_INSUFFICIENT_RESOURCES` -- see [`refuse`] in
+/// `lib.rs`; writing any other status there lets a convicted image execute.
+pub const STATUS_VIRUS_INFECTED: NtStatus = 0xC000_0906u32 as NtStatus;
+
 /// `STATUS_INVALID_PARAMETER`, from `ntstatus.h`.
 ///
 /// What the port's message callback answers a configuration message it will not
