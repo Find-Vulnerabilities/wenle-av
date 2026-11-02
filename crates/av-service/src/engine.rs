@@ -183,11 +183,25 @@ pub fn load_with(
             empty_database(),
             None,
             Some(format!(
-                "no rule database was found in {}; run `wenle build` to make one",
-                paths.db_dir.display()
+                "no rule database was found in {} or in {}; run `wenle build` to make one",
+                paths.db_dir.display(),
+                paths.install_dir.display()
             )),
         ),
     };
+    // Said here as well as in the status reply, and said at `error`: the status
+    // reaches a window that is open and a log reaches whoever reads it later.
+    // Measured on 2026-11-02 -- the test VM ran for an afternoon with no
+    // database at all, every file was scored clean, and nothing the product
+    // wrote said so, because the service had been started from a directory the
+    // database was not beside and `%ProgramData%\WenleAV\db` was empty.
+    if let Some(reason) = &load_error {
+        log::error!(
+            "no usable rule database: {reason}. Every file this service scans will be treated \
+             as clean until one is in place; behaviour rules are unaffected because they are \
+             compiled into this binary."
+        );
+    }
     Engine {
         engine: Arc::new(build(database, scanning, catalog)),
         database: status,
