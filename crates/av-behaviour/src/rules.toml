@@ -228,6 +228,13 @@ path_excludes = [
     "\\config.msi\\", "\\appdata\\local\\programs\\",
     "\\appdata\\local\\powertoys\\", "\\appdata\\local\\temp\\ns",
     "\\fontcache\\", "\\windows\\appcompat\\aidd\\", "\\temp\\7zs",
+    # Measured in the test VM on 2026-11-02: Windows' own servicing emptied
+    # `C:\Windows\CbsTemp\…` (twenty-five files in thirty seconds, one warning)
+    # and Defender pruned `…\Windows Defender\Support\…` the same way a minute
+    # later. Both are the machine maintaining itself, and the second is a
+    # different subtree from the scan history the entry above already covers --
+    # `Support` is where its tracing writes, not where its detections are kept.
+    "\\windows\\cbstemp\\", "\\windows defender\\support\\",
 ]
 # The actor, not the tree. An uninstaller removing the product it was installed
 # to remove deletes that product's files in bulk, and the path cannot say so:

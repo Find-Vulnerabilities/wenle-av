@@ -540,6 +540,76 @@ command_line: None,
     }
 
     #[test]
+    fn the_mass_file_delete_rule_ignores_servicing_and_defender_tracing() {
+        // Measured in the test VM on 2026-11-02 at 19:32 and 19:33, with the
+        // service connected and nothing of ours running: Windows' servicing
+        // emptied `C:\Windows\CbsTemp\…` (twenty-five files in thirty seconds)
+        // and Defender pruned `…\Windows Defender\Support\…` a minute later.
+        // Both warned. They are two different subtrees -- `CbsTemp` is the
+        // component-install scratch space and `Support` is where Defender's
+        // tracing writes, not the scan history the older exclusion covers -- so
+        // each needed its own entry. Both halves are kept true, in the same
+        // shape as the Defender-history test above.
+        let engine_at = 5_000 * TICKS_PER_SECOND;
+        let delete = |path: String, step: u64| av_ipc::DriverEvent {
+            sequence: step,
+            timestamp_100ns: engine_at + step,
+            action: av_ipc::DriverEventAction::FileDeleted,
+            subject: av_ipc::DriverSubject::File,
+            path: Some(std::path::PathBuf::from(path)),
+            process_id: 4_123,
+            parent_process_id: 0,
+            thread_id: 0,
+            detail: 0,
+            value: None,
+            command_line: None,
+            driver_state: None,
+        };
+
+        let mut engine = builtin().expect("the shipped rules parse");
+        for step in 0..30u64 {
+            let findings = engine.observe_driver(&delete(
+                format!(r"C:\Windows\CbsTemp\{{DB5FF3C8-F8E8-424E}}\LocalFoD\{step:02}.xml"),
+                step,
+            ));
+            assert!(
+                findings.is_empty(),
+                "servicing wrote into CbsTemp and the rule fired: {findings:?}"
+            );
+        }
+
+        let mut engine = builtin().expect("the shipped rules parse");
+        for step in 0..30u64 {
+            let findings = engine.observe_driver(&delete(
+                format!(
+                    r"C:\ProgramData\Microsoft\Windows Defender\Support\MpWppTracing-2026{step:04}.bin"
+                ),
+                step,
+            ));
+            assert!(
+                findings.is_empty(),
+                "Defender pruned its own tracing and the rule fired: {findings:?}"
+            );
+        }
+
+        // The rule itself is unchanged: the same count anywhere else still
+        // fires, once.
+        let mut engine = builtin().expect("the shipped rules parse");
+        let mut fired = Vec::new();
+        for step in 0..30u64 {
+            fired.extend(engine.observe_driver(&delete(
+                format!(r"C:\Users\example\Documents\gone{step:02}.txt"),
+                step,
+            )));
+        }
+        // `.txt` under Documents is also a document, so BEH-0006 fires beside
+        // this one; what is asserted is that BEH-0004 still fires once and has
+        // not been silenced by the two exclusions above.
+        let mass: Vec<_> = fired.iter().filter(|f| f.rule_id == "BEH-0004").collect();
+        assert_eq!(mass.len(), 1, "the rule stopped working elsewhere: {fired:?}");
+    }
+
+    #[test]
     fn the_mass_file_rules_ignore_the_comms_store() {
         // Measured on the build machine on 2026-10-19 at 14:34:55 and
         // 14:34:57, with the driver loaded and nothing else running: one
