@@ -2240,6 +2240,18 @@ unsafe extern "system" fn write_pre_operation(
         return FLT_PREOP_SUCCESS_WITH_CALLBACK;
     }
 
+    // The product's own images are how a legitimate update gets in, and this
+    // gate needs the same exception the other two have. Measured in the test VM
+    // on 2026-11-06: `wenle update apply` opened its own service binary for
+    // writing as `wenle.exe` and the write still arrived from a **system
+    // worker**, so `IoGetCurrentProcess` was `System` and the refusal landed on
+    // the updater itself. `std::fs::copy` is `CopyFileEx`, which the file system
+    // is free to serve on a worker thread; the updater now opens and writes the
+    // file itself, and this exception is what makes that write legal.
+    if caller_is_ours() {
+        return FLT_PREOP_SUCCESS_WITH_CALLBACK;
+    }
+
     // The counter an operator reads to tell this gate from the two execution
     // gates. It was declared on 2026-09-26 and never moved, because until now
     // nothing in this driver could refuse a write.

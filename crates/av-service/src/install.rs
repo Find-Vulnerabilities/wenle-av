@@ -616,6 +616,57 @@ pub fn stop() -> Result<StopOutcome, ServiceError> {
     Err(not_windows())
 }
 
+/// Stop the service and wait until the SCM says it is no longer running.
+///
+/// [`stop`] only sends the request: the SCM answers `StopRequested` while the
+/// process is still there, and replacing the binary in that window fails with a
+/// sharing violation -- measured in the test VM on 2026-11-06 as "the process
+/// cannot access the file because it is being used by another process" (os
+/// error 32). An updater that copies immediately after asking is an updater
+/// that fails on the one file it exists to replace.
+///
+/// Returns the outcome of the request. A service that is still `StopPending`
+/// when the timeout expires is an error rather than a quiet success: the caller
+/// has to decide what to do about a service that will not stop, and it cannot
+/// decide that from a claim it has not checked.
+#[cfg(windows)]
+pub fn stop_and_wait(timeout: std::time::Duration) -> Result<StopOutcome, ServiceError> {
+    let outcome = stop()?;
+    if matches!(outcome, StopOutcome::NotRunning) {
+        return Ok(outcome);
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        match state()? {
+            ScmState::Stopped | ScmState::NotInstalled => return Ok(outcome),
+            ScmState::StopPending | ScmState::Running | ScmState::Paused => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            // Starting while it was asked to stop: the request was lost or the
+            // recovery policy restarted it. Report rather than spin.
+            other => {
+                return Err(ServiceError::Scm {
+                    message: format!(
+                        "{SERVICE_NAME} is {} after being asked to stop",
+                        other.as_str()
+                    ),
+                })
+            }
+        }
+    }
+    Err(ServiceError::Scm {
+        message: format!(
+            "{SERVICE_NAME} did not stop within {} seconds",
+            timeout.as_secs()
+        ),
+    })
+}
+
+#[cfg(not(windows))]
+pub fn stop_and_wait(_timeout: std::time::Duration) -> Result<StopOutcome, ServiceError> {
+    Err(not_windows())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

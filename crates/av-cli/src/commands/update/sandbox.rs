@@ -60,6 +60,62 @@ impl Report {
     }
 }
 
+/// Copy one file by opening both ends ourselves.
+///
+/// `std::fs::copy` is `CopyFileEx`, which the file system is free to serve on a
+/// **system worker thread**; the driver's write gate then sees `System` rather
+/// than this process and refuses the write it was asked to allow. Measured in
+/// the test VM on 2026-11-06 as os error 5 on the update's own service binary.
+/// Opening, reading and writing here means every request arrives from this
+/// process, which is the one the driver has an exception for.
+fn copy_here(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let mut source = std::fs::File::open(from)?;
+    let mut target = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(to)?;
+    std::io::copy(&mut source, &mut target)?;
+    target.flush()?;
+    Ok(())
+}
+
+/// Put one file in place, working around the file that cannot be replaced.
+///
+/// Windows will not overwrite a running image, and the two files an update
+/// exists to replace -- the service and the command-line tool running this
+/// command -- are both running. Renaming a running image *is* allowed, so the
+/// old one is moved aside and the new one takes its name; the old file stays as
+/// `<name>.old` and is removed the next time this runs.
+///
+/// Measured in the test VM on 2026-11-06: the direct copy failed with os error
+/// 32, "the process cannot access the file because it is being used by another
+/// process", for `wenle-av-service.exe` even after the stop request had been
+/// answered. The rename is what makes the update possible at all.
+fn install_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    match copy_here(from, to) {
+        Ok(()) => Ok(()),
+        Err(first) => {
+            let aside = to.with_extension("old");
+            let _ = std::fs::remove_file(&aside);
+            match std::fs::rename(to, &aside) {
+                Ok(()) => match copy_here(from, to) {
+                    Ok(()) => Ok(()),
+                    Err(second) => {
+                        // Put the old one back rather than leave the product
+                        // without a file at all.
+                        let _ = std::fs::rename(&aside, to);
+                        Err(second)
+                    }
+                },
+                Err(_) => Err(first),
+            }
+        }
+    }
+}
+
 /// The state a running script may see and change.
 struct Session {
     package: PathBuf,
@@ -87,7 +143,18 @@ pub fn run(
     entries: &[Entry],
     script: &str,
 ) -> Result<Report> {
-    let lua = Lua::new_with(StdLib::NONE, LuaOptions::default())
+    // `ALL_SAFE` is everything that computes and nothing that reaches the
+    // machine: `string`, `table`, `math`, `utf8`, `coroutine` and the base
+    // functions, without `io`, `os`, `package` or `debug`. Measured in the test
+    // VM on 2026-11-06: `NONE` was too little -- the built-in flow itself failed
+    // on `string.format`, and a package author would have failed on `ipairs`.
+    // What makes the sandbox a sandbox is the absence of the four that can name
+    // a file, a process or a module, not the absence of arithmetic.
+    // Named one by one rather than `ALL_SAFE`, which was measured in this
+    // session to load `io` and `os` as well -- a script that can open a file is
+    // not a sandbox, and the test below is what found it.
+    let libs = StdLib::STRING | StdLib::TABLE | StdLib::MATH | StdLib::UTF8 | StdLib::COROUTINE;
+    let lua = Lua::new_with(libs, LuaOptions::default())
         .context("starting the update script's interpreter")?;
     // A script that allocates without bound must not take the updater with it.
     // Sixteen megabytes is far more than the flow needs and far less than the
@@ -157,8 +224,8 @@ pub fn run(
                 }
             }
             let to = session.install_dir.join(&entry.name);
-            match std::fs::copy(&from, &to) {
-                Ok(_) => {
+            match install_file(&from, &to) {
+                Ok(()) => {
                     println!("  {} -- installed", entry.name);
                     session.report.installed.push(entry.name.clone());
                     Ok(true)
@@ -177,9 +244,12 @@ pub fn run(
         "stop_service",
         lua.create_function(move |_, ()| {
             let mut session = s.borrow_mut();
-            match av_service::install::stop() {
+            // Wait for it: a copy that starts while the service process is
+            // still alive fails with a sharing violation, which is exactly the
+            // file an update exists to replace. See `install::stop_and_wait`.
+            match av_service::install::stop_and_wait(std::time::Duration::from_secs(30)) {
                 Ok(_) => {
-                    println!("  the service was asked to stop");
+                    println!("  the service was asked to stop, and has stopped");
                     session.report.stopped = true;
                     Ok(true)
                 }
@@ -260,7 +330,7 @@ impl Clone for Report {
 /// different code path would not tell anybody whether the scripted one works.
 pub const DEFAULT_SCRIPT: &str = r#"
 local names = update.names()
-update.log(string.format("installing %d file(s)", #names))
+update.log("installing " .. #names .. " file(s)")
 update.stop_service()
 for _, name in ipairs(names) do
     update.install(name)
