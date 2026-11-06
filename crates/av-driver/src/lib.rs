@@ -2368,6 +2368,41 @@ unsafe extern "system" fn set_information_pre_operation(
         },
     };
 
+    // Self-protection covers "make this file stop existing", not only a change
+    // to its contents. Measured in the test VM on 2026-11-04: `Copy-Item
+    // -Force` deletes the destination and then creates the new file; the delete
+    // succeeded, the create was refused by the write gate, and the product was
+    // left with **no service binary at all**. A gate that only refuses writes
+    // is a gate an ordinary file operation steps around.
+    //
+    // Both sides of a rename are checked. Moving a protected file away is the
+    // same act as deleting it, and moving something onto its path is the same
+    // act as overwriting it. `dos` already holds the target when the rename's
+    // own header converted, so the source is resolved into a second buffer
+    // rather than assumed away -- one more name query on an operation that is
+    // two orders of magnitude rarer than a write.
+    let protected = units > 0 && gate_matches(&dos[..units]);
+    let protected = protected || {
+        let mut source = [0u16; MAX_PATH_UNITS];
+        // SAFETY: `data` is this callback's live callback data, and this is the
+        // set-information pre-operation, which the name query's own contract
+        // allows: `APC_LEVEL` or below, which is where this callback runs.
+        match unsafe { operation_file_dos_path(data, &mut source) } {
+            Some(source_units) => source_units > 0 && gate_matches(&source[..source_units]),
+            None => false,
+        }
+    };
+    if protected {
+        // The same counter and the same status the write gate refuses with:
+        // this is the same promise, applied to the two operations that also
+        // remove a file rather than merely rewrite it.
+        bump(C_BLOCKED_WRITES);
+        // SAFETY: `data` is the callback's own data pointer. Completing the
+        // operation from its pre-operation is what refuses it.
+        unsafe { refuse(data, STATUS_ACCESS_DENIED) };
+        return FLT_PREOP_COMPLETE;
+    }
+
     // SAFETY: `PsGetCurrentProcessId` has no precondition beyond "called from
     // kernel mode" in its declaration (`ntddk.h` 11385), and the read happens
     // here, inside the callback, rather than on the worker for the reason the
