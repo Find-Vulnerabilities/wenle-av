@@ -1936,6 +1936,26 @@ unsafe extern "system" fn create_pre_operation(
     // SAFETY: the callback's contract is that `data` and the parameter block it
     // points at are valid.
     let wanted = unsafe { desired_access(data) };
+    // The third and last shape of "make this product's file stop working". A
+    // protected file may be read and executed; it may not be opened for
+    // writing, because the open itself truncates. Measured twice: on 2026-11-04
+    // the service binary was deleted and on 2026-11-06 it was truncated to
+    // nothing, both by an ordinary `Copy-Item` whose write half was refused
+    // after the damage. See [`flt::WRITES`].
+    if wanted & flt::WRITES != 0 {
+        let mut dos = [0u16; MAX_PATH_UNITS];
+        // SAFETY: `data` is this callback's live callback data, and a create
+        // pre-operation runs at `PASSIVE_LEVEL`, which the name query requires.
+        if let Some(units) = unsafe { operation_file_dos_path(data, &mut dos) } {
+            if units > 0 && gate_matches(&dos[..units]) {
+                bump(C_BLOCKED_WRITES);
+                // SAFETY: `data` is the callback's own data pointer; completing
+                // the operation from its pre-operation is what refuses it.
+                unsafe { refuse(data, STATUS_ACCESS_DENIED) };
+                return FLT_PREOP_COMPLETE;
+            }
+        }
+    }
     if wanted & FILE_EXECUTE == 0 {
         // Not an open that intends to execute anything. This is the
         // overwhelming majority of the file opens on a running system.

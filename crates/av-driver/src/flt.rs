@@ -307,6 +307,25 @@ pub const FLT_PORT_ALL_ACCESS: u32 = 0x001F_0001;
 /// documented on [`FltFileNameInformation`].
 pub const FILE_EXECUTE: u32 = 0x0020;
 
+/// The access bits that mean "this open may change the file", from `wdm.h`:
+/// `FILE_WRITE_DATA` (`0x0002`), `FILE_APPEND_DATA` (`0x0004`),
+/// `FILE_WRITE_EA` (`0x0010`) and `DELETE` (`0x0001_0000`).
+///
+/// The self-protection gate used to look at writes only, and an open is not a
+/// write: `Copy-Item` opens the destination with create-and-truncate, and the
+/// truncation is the first half of the damage. Measured twice -- 2026-11-04,
+/// when the service binary vanished, and 2026-11-06, when it was left at zero
+/// length and `sc start` answered "the file or directory is corrupted"
+/// (1392). Both are the same missing check: the gate has to refuse the *open*,
+/// not the write that would have followed it.
+pub const FILE_WRITE_DATA: u32 = 0x0002;
+pub const FILE_APPEND_DATA: u32 = 0x0004;
+pub const FILE_WRITE_EA: u32 = 0x0010;
+pub const DELETE: u32 = 0x0001_0000;
+
+/// Every access bit that means the open may change the file.
+pub const WRITES: u32 = FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | DELETE;
+
 /// `FLT_PREOP_SUCCESS_NO_CALLBACK`. The pre-operation is done and the filter
 /// manager continues with the operation, without calling a post-operation.
 ///
