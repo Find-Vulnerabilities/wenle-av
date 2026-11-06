@@ -19,6 +19,12 @@ path = "src/main.rs"
 # this build was tested against rather than whichever Lua the machine happens to
 # have -- an updater that runs under an unknown interpreter is not a boundary.
 mlua = { version = "0.9", features = ["lua54", "vendored"] }
+# Fetching a release. Blocking on purpose: an update is a command a person runs
+# and waits for, and one request at a time is the whole traffic. TLS is rustls,
+# so the trust anchors come from the crate rather than from whatever schannel
+# configuration the machine has -- a product that trusts the machine's store for
+# its own updates is a product whose updates a proxy can rewrite.
+ureq = "2.10"
 av-core.workspace = true
 av-rules.workspace = true
 av-pe.workspace = true

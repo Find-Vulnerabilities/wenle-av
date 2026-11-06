@@ -233,6 +233,36 @@ pub fn installed_binary(install_dir: &Path) -> std::path::PathBuf {
     install_dir.join(SERVICE_BINARY)
 }
 
+/// Remove the images an update moved aside, and say how many went.
+///
+/// An update cannot delete the image it is running from: Windows will not remove
+/// a file that is mapped. What it *can* do is leave the old one as `<name>.old`,
+/// and the next process started from the new binary can delete it -- which is
+/// this function, called at start-up. Measured in the test VM on 2026-11-06:
+/// `wenle.old` survived the update that installed the new command-line tool and
+/// `protect verify` reported it as a file nobody had explained.
+///
+/// Only the names this product ships are swept. An updater that deletes by
+/// extension is an updater that deletes somebody's backup, and this runs as
+/// SYSTEM where it would not be refused.
+pub fn sweep_old_images(install_dir: &Path) -> usize {
+    const SET_ASIDE: [&str; 5] = [
+        "wenle-av-service.exe.old",
+        "wenle.exe.old",
+        "wenle-gui.exe.old",
+        "av_amsi.dll.old",
+        "WenleAvFilter.sys.old",
+    ];
+    let mut removed = 0;
+    for name in SET_ASIDE {
+        let path = install_dir.join(name);
+        if path.exists() && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// What a refused call says.
 ///
 /// One function rather than a sentence at each call site, because the sentence

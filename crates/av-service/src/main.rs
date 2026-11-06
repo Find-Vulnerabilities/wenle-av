@@ -284,6 +284,7 @@ fn run_service() -> Result<u8, ServiceError> {
     // host starts feeding it anything.
     logging::set_level(loaded.config.logging.level);
     announce(&loaded);
+    sweep_set_aside(&paths);
 
     match scm::run(paths, loaded) {
         Ok(()) => Ok(EXIT_OK),
@@ -310,6 +311,7 @@ fn run_console() -> Result<u8, ServiceError> {
     // host starts feeding it anything.
     logging::set_level(loaded.config.logging.level);
     announce(&loaded);
+    sweep_set_aside(&paths);
 
     let host = av_service::host::Host::open(paths, loaded)?;
     log::info!("running in the foreground; Ctrl-C ends the process");
@@ -320,6 +322,21 @@ fn run_console() -> Result<u8, ServiceError> {
     let mut host = control::serve(host, &stop)?;
     host.shut_down();
     Ok(EXIT_OK)
+}
+
+/// Remove the images an earlier update moved aside.
+///
+/// This is the one moment they are not the running image: this process was
+/// started from the new binary, so `<name>.old` is just a file. See
+/// [`av_service::install::sweep_old_images`].
+fn sweep_set_aside(paths: &av_core::paths::AvPaths) {
+    let removed = av_service::install::sweep_old_images(&paths.install_dir);
+    if removed > 0 {
+        log::info!(
+            "removed {removed} image(s) an earlier update had moved aside, now that nothing is \
+             running from them"
+        );
+    }
 }
 
 /// Report the configuration and everything this build does not do with it.

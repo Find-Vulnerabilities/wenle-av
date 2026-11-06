@@ -50,6 +50,88 @@ mod sandbox;
 /// The file a package's digests are read from.
 const MANIFEST_FILE: &str = "manifest.txt";
 
+/// One line of a *remote* manifest: the digest, the name, and where to get it.
+///
+/// A release published for fetching carries a third field the local manifest
+/// does not: the URL of the file. Without it every file would have to be guessed
+/// from the manifest's own location, which works for a flat release and not for
+/// one that keeps its binaries in a subdirectory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteEntry {
+    /// Lower-case hexadecimal SHA-256 of the file's contents.
+    pub sha256: String,
+    /// The file's name, written into the package under this name.
+    pub name: String,
+    /// Where to fetch it, or `None` to resolve it beside the manifest.
+    pub url: Option<String>,
+}
+
+/// Parse a remote manifest, returning what it names and what does not parse.
+///
+/// Same shape as [`parse_manifest`] with an optional third field. The rules that
+/// matter are the same ones, and they matter more here: a name is a file name
+/// and never a path, because this writes into a directory the caller named and
+/// not into one the release names.
+pub fn parse_remote_manifest(text: &str) -> Result<Vec<RemoteEntry>, String> {
+    let mut entries = Vec::new();
+    for (number, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let (Some(digest), Some(name)) = (parts.next(), parts.next()) else {
+            return Err(format!(
+                "line {}: expected a digest, a name and an optional url, found {:?}",
+                number + 1,
+                line
+            ));
+        };
+        if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!(
+                "line {}: {:?} is not a SHA-256 digest",
+                number + 1,
+                digest
+            ));
+        }
+        if name.contains('\\') || name.contains('/') || name == ".." || name == "." {
+            return Err(format!(
+                "line {}: {:?} is a path, not a file name; a release may not write into a \
+                 directory",
+                number + 1,
+                name
+            ));
+        }
+        let url = parts.next().map(|url| url.to_string());
+        if parts.next().is_some() {
+            return Err(format!(
+                "line {}: more than one url after the name",
+                number + 1
+            ));
+        }
+        entries.push(RemoteEntry {
+            sha256: digest.to_ascii_lowercase(),
+            name: name.to_string(),
+            url,
+        });
+    }
+    if entries.is_empty() {
+        return Err("the manifest names no files".to_string());
+    }
+    Ok(entries)
+}
+
+/// Resolve a file's URL: what the manifest says, or the name beside it.
+fn resolve_url(manifest_url: &str, entry: &RemoteEntry) -> String {
+    if let Some(url) = &entry.url {
+        return url.clone();
+    }
+    match manifest_url.rfind('/') {
+        Some(cut) => format!("{}/{}", &manifest_url[..cut], entry.name),
+        None => entry.name.clone(),
+    }
+}
+
 /// One line of a package manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
@@ -173,7 +255,9 @@ pub fn verify(dir: &Path) -> Result<Verdict> {
 pub fn run(command: &UpdateCommand, _globals: &Globals, context: &Context) -> Result<Exit> {
     match command {
         UpdateCommand::Verify { dir } => verify_command(dir),
+        UpdateCommand::Fetch { url, to } => fetch_command(url, to),
         UpdateCommand::Apply { dir, script } => apply_command(dir, script.as_deref(), context),
+        UpdateCommand::Rollback => rollback_command(context),
     }
 }
 
@@ -206,6 +290,117 @@ fn verify_command(dir: &Path) -> Result<Exit> {
         verdict.missing.len() + verdict.differing.len()
     );
     Ok(Exit::Failure)
+}
+
+/// `wenle update fetch <URL> --to <DIR>`.
+///
+/// The half of an update this product did not have: getting the files. It reads
+/// a manifest over the network, writes each named file into `to`, and checks
+/// every one against the digest the manifest gave. What comes out is an ordinary
+/// package directory, so `verify` and `apply` need to know nothing about where
+/// it came from.
+///
+/// # What this does and does not establish
+///
+/// HTTPS and the digest together say: these bytes are the ones this manifest
+/// describes, and they arrived unaltered. They do **not** say the manifest came
+/// from Wenle -- that is a signature over the manifest, and it is the next piece
+/// of this, not this piece. So the command says where it fetched from and the
+/// caller decides whether that is a place it trusts.
+fn fetch_command(url: &str, to: &Path) -> Result<Exit> {
+    output::heading("Fetch");
+    println!("  source:  {url}");
+    println!("  package: {}", to.display());
+    if !url.starts_with("https://") {
+        output::error(
+            "only https:// is accepted: a manifest that arrives over plain http can be changed in \
+             flight, and then every digest in it is a digest the attacker chose",
+        );
+        return Ok(Exit::Failure);
+    }
+
+    let body = match ureq::get(url).call() {
+        Ok(response) => response.into_string().context("reading the manifest")?,
+        Err(error) => {
+            output::error(&format!("{url} could not be fetched: {error}"));
+            return Ok(Exit::Failure);
+        }
+    };
+    let entries = match parse_remote_manifest(&body) {
+        Ok(entries) => entries,
+        Err(error) => {
+            output::error(&format!("{url}: {error}"));
+            return Ok(Exit::Failure);
+        }
+    };
+
+    std::fs::create_dir_all(to)
+        .with_context(|| format!("creating {}", to.display()))?;
+
+    let mut manifest = String::new();
+    let mut failures = Vec::new();
+    for entry in &entries {
+        let target = to.join(&entry.name);
+        let file_url = resolve_url(url, entry);
+        let response = match ureq::get(&file_url).call() {
+            Ok(response) => response,
+            Err(error) => {
+                failures.push(format!("{}: {error}", file_url));
+                continue;
+            }
+        };
+        let mut reader = response.into_reader();
+        let mut file = match std::fs::File::create(&target) {
+            Ok(file) => file,
+            Err(error) => {
+                failures.push(format!("{}: {error}", target.display()));
+                continue;
+            }
+        };
+        if let Err(error) = std::io::copy(&mut reader, &mut file) {
+            failures.push(format!("{}: {error}", target.display()));
+            continue;
+        }
+        drop(file);
+        match hash_file(&target) {
+            Ok(found) if found == entry.sha256 => {
+                println!("  {} -- fetched, matches", entry.name);
+                manifest.push_str(&format!("{}  {}\n", entry.sha256, entry.name));
+            }
+            Ok(found) => {
+                // A file that does not match is not left behind: the package
+                // directory is what somebody will run `apply` on next, and a
+                // wrong file in it is a trap that was already sprung once.
+                let _ = std::fs::remove_file(&target);
+                failures.push(format!(
+                    "{}: fetched {found}, the manifest says {}",
+                    entry.name, entry.sha256
+                ));
+            }
+            Err(error) => failures.push(format!("{}: {error}", entry.name)),
+        }
+    }
+
+    if !failures.is_empty() {
+        output::error("the package was not written, because not every file arrived intact");
+        for failure in &failures {
+            println!("  {failure}");
+        }
+        return Ok(Exit::Failure);
+    }
+
+    let manifest_path = to.join(MANIFEST_FILE);
+    std::fs::write(&manifest_path, manifest)
+        .with_context(|| format!("writing {}", manifest_path.display()))?;
+    println!();
+    println!(
+        "{} file(s) fetched into {}. Check them again with `wenle update verify` before applying; \
+         the next step is `wenle update apply {}`.",
+        entries.len(),
+        to.display(),
+        to.display()
+    );
+    Ok(Exit::Clean)
 }
 
 /// `wenle update apply <dir>`.
@@ -242,6 +437,18 @@ fn apply_command(dir: &Path, script: Option<&Path>, context: &Context) -> Result
 
     let text = sandbox::script_from(script)?;
     let entries = verified_entries(dir)?;
+    // The state being replaced, kept where `rollback` can find it. Taken before
+    // anything is touched, because a backup taken afterwards is a backup of the
+    // new files.
+    match backup_current(&install_dir, &entries) {
+        Ok(count) => println!("  {count} file(s) of the present installation kept as .old"),
+        Err(error) => {
+            output::error(&format!(
+                "the present installation could not be recorded, so nothing was changed: {error}"
+            ));
+            return Ok(Exit::Failure);
+        }
+    }
     // Images a previous update moved aside. The one this process is running
     // from cannot be removed while it is mapped -- measured in the test VM on
     // 2026-11-06, where the update left `wenle.old` behind for exactly that
@@ -313,6 +520,136 @@ fn sweep_old_files(install_dir: &Path) -> usize {
     removed
 }
 
+/// Where the state being replaced is recorded, so `rollback` can put it back.
+const STATE_FILE: &str = "update-state.txt";
+
+/// Record the present installation before the package replaces it.
+///
+/// For every file the package names that is already installed, the bytes are
+/// copied to `<name>.old` and their digest written to `update-state.txt`. A
+/// rollback is then a copy in the other direction, and it can check that what it
+/// is about to install is what was recorded rather than what happens to be on
+/// disk.
+///
+/// A backup taken *after* the first file is replaced is a backup of a mixture of
+/// two installations, so this runs before the flow does anything.
+fn backup_current(install_dir: &Path, entries: &[Entry]) -> Result<usize> {
+    let mut state = String::new();
+    let mut count = 0;
+    for entry in entries {
+        let current = install_dir.join(&entry.name);
+        if !current.exists() {
+            continue;
+        }
+        let digest = hash_file(&current)?;
+        let backup = backup_path(install_dir, &entry.name);
+        std::fs::copy(&current, &backup)
+            .with_context(|| format!("keeping {} as {}", current.display(), backup.display()))?;
+        state.push_str(&format!("{digest}  {}\n", entry.name));
+        count += 1;
+    }
+    let state_path = install_dir.join(STATE_FILE);
+    std::fs::write(&state_path, state)
+        .with_context(|| format!("recording the present installation in {}", state_path.display()))?;
+    Ok(count)
+}
+
+/// The name a backup of `name` takes beside it.
+fn backup_path(install_dir: &Path, name: &str) -> std::path::PathBuf {
+    install_dir.join(format!("{name}.old"))
+}
+
+/// Put back the installation an earlier `apply` replaced.
+///
+/// Reads `update-state.txt`, checks each backup against the digest recorded at
+/// the time, stops the service, installs the backups and starts the service
+/// again. Refuses the whole rollback when one backup is missing or does not
+/// match: a half-restored installation is a mixture of two versions, which is
+/// worse than either.
+fn rollback_command(context: &Context) -> Result<Exit> {
+    let install_dir = context.paths.install_dir.clone();
+    output::heading("Rollback");
+    println!("  installation: {}", install_dir.display());
+
+    let state_path = install_dir.join(STATE_FILE);
+    let text = match std::fs::read_to_string(&state_path) {
+        Ok(text) => text,
+        Err(error) => {
+            output::error(&format!(
+                "nothing to roll back to: {} could not be read ({error}). It is written by \
+                 `wenle update apply`, and only the most recent update keeps one.",
+                state_path.display()
+            ));
+            return Ok(Exit::Failure);
+        }
+    };
+    let entries = match parse_manifest(&text) {
+        Ok(entries) => entries,
+        Err(error) => {
+            output::error(&format!("{}: {error}", state_path.display()));
+            return Ok(Exit::Failure);
+        }
+    };
+
+    // Check every backup before changing anything.
+    let mut problems = Vec::new();
+    for entry in &entries {
+        let backup = backup_path(&install_dir, &entry.name);
+        match hash_file(&backup) {
+            Ok(found) if found == entry.sha256 => {}
+            Ok(found) => problems.push(format!(
+                "{} is not what was recorded (recorded {}, found {found})",
+                backup.display(),
+                entry.sha256
+            )),
+            Err(error) => problems.push(format!("{}: {error}", backup.display())),
+        }
+    }
+    if !problems.is_empty() {
+        output::error("nothing was changed, because not every backup matches what was recorded");
+        for problem in &problems {
+            println!("  {problem}");
+        }
+        return Ok(Exit::Failure);
+    }
+
+    match av_service::install::stop_and_wait(std::time::Duration::from_secs(30)) {
+        Ok(_) => println!("  the service was asked to stop, and has stopped"),
+        Err(error) => println!("  the service could not be stopped: {error}"),
+    }
+
+    let mut restored = 0;
+    let mut failures = Vec::new();
+    for entry in &entries {
+        let backup = backup_path(&install_dir, &entry.name);
+        let target = install_dir.join(&entry.name);
+        match sandbox::install_file(&backup, &target) {
+            Ok(()) => {
+                println!("  {} -- restored", entry.name);
+                restored += 1;
+            }
+            Err(error) => failures.push(format!("{}: {error}", entry.name)),
+        }
+    }
+
+    match av_service::install::start() {
+        Ok(_) => println!("  the service was started"),
+        Err(error) => println!("  the service could not be started: {error}"),
+    }
+
+    if failures.is_empty() {
+        println!();
+        println!("{restored} file(s) restored. `wenle protect manifest` records the restored files.");
+        return Ok(Exit::Clean);
+    }
+    println!();
+    println!("{restored} file(s) restored, {} failed:", failures.len());
+    for failure in &failures {
+        println!("  {failure}");
+    }
+    Ok(Exit::Failure)
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -360,5 +697,43 @@ d2a84f4b8b650937ec8f73cd8be2c74add5a911ba64df27458ed8229da804a26  wenle.exe
         let upper = "A".repeat(64);
         let entries = parse_manifest(&format!("{upper}  wenle.exe\n")).expect("parses");
         assert_eq!(entries[0].sha256, "a".repeat(64));
+    }
+
+    #[test]
+    fn a_remote_manifest_may_name_a_url_or_leave_it_out() {
+        let digest = "a".repeat(64);
+        let text = format!(
+            "{digest}  wenle.exe  https://example.invalid/rel/wenle.exe\n\
+             {digest}  rules.avdb\n"
+        );
+        let entries = parse_remote_manifest(&text).expect("parses");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0].url.as_deref(),
+            Some("https://example.invalid/rel/wenle.exe")
+        );
+        assert_eq!(entries[1].url, None);
+    }
+
+    #[test]
+    fn a_url_less_remote_entry_resolves_beside_the_manifest() {
+        let entry = RemoteEntry {
+            sha256: "a".repeat(64),
+            name: "wenle.exe".to_string(),
+            url: None,
+        };
+        assert_eq!(
+            resolve_url("https://example.invalid/rel/manifest.txt", &entry),
+            "https://example.invalid/rel/wenle.exe"
+        );
+    }
+
+    #[test]
+    fn a_remote_manifest_cannot_name_a_path() {
+        // The same rule as the local manifest, and it matters more here: this
+        // writes into a directory the caller named, not one the release names.
+        let digest = "a".repeat(64);
+        assert!(parse_remote_manifest(&format!("{digest}  ../../evil.exe\n")).is_err());
+        assert!(parse_remote_manifest(&format!("{digest}  sub/evil.exe\n")).is_err());
     }
 }

@@ -94,7 +94,7 @@ fn copy_here(from: &Path, to: &Path) -> std::io::Result<()> {
 /// 32, "the process cannot access the file because it is being used by another
 /// process", for `wenle-av-service.exe` even after the stop request had been
 /// answered. The rename is what makes the update possible at all.
-fn install_file(from: &Path, to: &Path) -> std::io::Result<()> {
+pub(super) fn install_file(from: &Path, to: &Path) -> std::io::Result<()> {
     match copy_here(from, to) {
         Ok(()) => Ok(()),
         Err(first) => {

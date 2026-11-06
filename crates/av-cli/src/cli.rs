@@ -173,6 +173,26 @@ pub enum UpdateCommand {
         #[arg(value_name = "DIR")]
         dir: std::path::PathBuf,
     },
+    /// Download a package from a release manifest over HTTPS.
+    ///
+    /// The manifest is one line per file: the SHA-256, the name, and optionally
+    /// the URL (without one, the file is fetched beside the manifest). Each file
+    /// is written into the package directory and checked against the digest
+    /// before it is kept; a file that does not match is removed rather than left
+    /// where the next `apply` would find it.
+    ///
+    /// Only `https://` is accepted. HTTPS and the digest together say the bytes
+    /// are the ones this manifest describes; they do not say the manifest came
+    /// from Wenle, which is a signature over the manifest and is not in this
+    /// build yet.
+    Fetch {
+        /// The manifest's URL.
+        #[arg(value_name = "URL")]
+        url: String,
+        /// Where to write the package.
+        #[arg(long, value_name = "DIR")]
+        to: std::path::PathBuf,
+    },
     /// Install a package: stop the service, replace the files, start it again.
     ///
     /// CHANGES THIS MACHINE, and needs administrator rights. Verifies first and
@@ -199,6 +219,14 @@ pub enum UpdateCommand {
         #[arg(long, value_name = "PATH")]
         script: Option<std::path::PathBuf>,
     },
+    /// Put back the installation the last `wenle update apply` replaced.
+    ///
+    /// CHANGES THIS MACHINE, and needs administrator rights. Reads the record
+    /// `apply` wrote before it changed anything, checks every kept copy against
+    /// the digest recorded at the time, and refuses the whole rollback when one
+    /// of them is missing or different -- a half-restored installation is a
+    /// mixture of two versions, which is worse than either.
+    Rollback,
 }
 
 /// The `protect` command's arguments.
