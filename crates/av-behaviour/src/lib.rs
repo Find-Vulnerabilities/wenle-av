@@ -539,6 +539,209 @@ command_line: None,
         assert_eq!(fired[0].rule_id, "BEH-0004");
     }
 
+    /// Three rules that add up to a conviction, and the shape of the events
+    /// each one needs. Deliberately small scores: what is under test is the
+    /// total, not the calibration of any single rule.
+    const AGREEMENT_RULES: &str = r#"
+        [[rule]]
+        id = "BEH-9101"
+        name = "ransomware extension"
+        description = "d"
+        severity = "high"
+        precision = "contextual"
+        response = "report"
+        score = 50
+        subject = "file"
+        action = ["file_renamed"]
+        path_suffix = [".locked"]
+
+        [[rule]]
+        id = "BEH-9102"
+        name = "bulk writes"
+        description = "d"
+        severity = "medium"
+        precision = "burst"
+        response = "report"
+        score = 30
+        subject = "file"
+        action = ["file_written"]
+        path_suffix = [".tmp"]
+        count = 2
+        window_seconds = 60
+
+        [[rule]]
+        id = "BEH-9103"
+        name = "bulk deletes"
+        description = "d"
+        severity = "medium"
+        precision = "burst"
+        response = "report"
+        score = 30
+        subject = "file"
+        action = ["file_deleted"]
+        path_suffix = [".tmp"]
+        count = 2
+        window_seconds = 60
+    "#;
+
+    fn event_of(
+        action: av_ipc::DriverEventAction,
+        path: &str,
+        process_id: u32,
+        step: u64,
+    ) -> av_ipc::DriverEvent {
+        av_ipc::DriverEvent {
+            sequence: step,
+            timestamp_100ns: 20_000 * TICKS_PER_SECOND + step,
+            action,
+            subject: av_ipc::DriverSubject::File,
+            path: Some(std::path::PathBuf::from(path)),
+            process_id,
+            parent_process_id: 0,
+            thread_id: 0,
+            detail: 0,
+            value: None,
+            command_line: None,
+            driver_state: None,
+        }
+    }
+
+    /// Rename one file to the ransomware suffix, write two `.tmp`s and delete
+    /// two more: the three rules above fire once each for `process_id`.
+    fn drive_three_rules(engine: &mut crate::Engine, process_id: u32) -> Vec<crate::Finding> {
+        let mut fired = Vec::new();
+        fired.extend(engine.observe_driver(&event_of(
+            av_ipc::DriverEventAction::FileRenamed,
+            r"C:\Users\example\Documents\a.locked",
+            process_id,
+            1,
+        )));
+        for step in 2..4u64 {
+            fired.extend(engine.observe_driver(&event_of(
+                av_ipc::DriverEventAction::FileWritten,
+                &format!(r"C:\Users\example\Documents\w{step}.tmp"),
+                process_id,
+                step,
+            )));
+        }
+        for step in 4..6u64 {
+            fired.extend(engine.observe_driver(&event_of(
+                av_ipc::DriverEventAction::FileDeleted,
+                &format!(r"C:\Users\example\Documents\d{step}.tmp"),
+                process_id,
+                step,
+            )));
+        }
+        fired
+    }
+
+    #[test]
+    fn three_signals_on_one_process_become_one_actionable_finding() {
+        // The measured shape of a ransomware sweep, from the test VM on
+        // 2026-11-06: one process produced a ransomware-suffixed file, a burst
+        // of deletes and a burst of writes inside eight seconds. Each rule is
+        // below the threshold alone, and together they are not.
+        let mut engine = crate::Engine::from_toml(AGREEMENT_RULES).expect("the rules parse");
+        let fired = drive_three_rules(&mut engine, 5_000);
+
+        let aggregate = fired
+            .iter()
+            .find(|finding| finding.rule_id == "BEH-AGG")
+            .expect("three signals should have produced the aggregate");
+        assert_eq!(aggregate.precision, crate::Precision::Exact);
+        assert_eq!(aggregate.response, crate::Response::Terminate);
+        assert!(aggregate.score >= 100, "{aggregate:?}");
+        assert!(aggregate.description.contains("BEH-9101"), "{aggregate:?}");
+        assert!(aggregate.description.contains("BEH-9103"), "{aggregate:?}");
+        // The per-rule findings are still there: the aggregate is an addition,
+        // not a replacement.
+        assert!(fired.iter().any(|finding| finding.rule_id == "BEH-9101"));
+        assert!(fired.iter().any(|finding| finding.rule_id == "BEH-9103"));
+    }
+
+    #[test]
+    fn a_pile_of_burst_rules_is_not_a_conviction() {
+        // Creating three hundred files and renaming a hundred of them fired
+        // four burst rules at once in the test VM on 2026-11-06, on a machine
+        // with nothing wrong with it. Counting that as agreement would make
+        // every installer an incident.
+        let rules = r#"
+            [[rule]]
+            id = "BEH-9111"
+            name = "bulk writes"
+            description = "d"
+            severity = "medium"
+            precision = "burst"
+            response = "report"
+            score = 60
+            subject = "file"
+            action = ["file_written"]
+            path_suffix = [".tmp"]
+            count = 2
+            window_seconds = 60
+
+            [[rule]]
+            id = "BEH-9112"
+            name = "bulk deletes"
+            description = "d"
+            severity = "medium"
+            precision = "burst"
+            response = "report"
+            score = 60
+            subject = "file"
+            action = ["file_deleted"]
+            path_suffix = [".tmp"]
+            count = 2
+            window_seconds = 60
+        "#;
+        let mut engine = crate::Engine::from_toml(rules).expect("the rules parse");
+        let mut fired = Vec::new();
+        for step in 0..2u64 {
+            fired.extend(engine.observe_driver(&event_of(
+                av_ipc::DriverEventAction::FileWritten,
+                &format!(r"C:\Users\example\Documents\w{step}.tmp"),
+                6_000,
+                step,
+            )));
+        }
+        for step in 2..4u64 {
+            fired.extend(engine.observe_driver(&event_of(
+                av_ipc::DriverEventAction::FileDeleted,
+                &format!(r"C:\Users\example\Documents\d{step}.tmp"),
+                6_000,
+                step,
+            )));
+        }
+        assert!(
+            fired.iter().all(|finding| finding.rule_id != "BEH-AGG"),
+            "burst evidence alone convicted: {fired:?}"
+        );
+    }
+
+    #[test]
+    fn signals_from_two_processes_do_not_add_up() {
+        // Two processes caught by one rule each are two warnings, not one
+        // conviction: nothing says the two are related.
+        let mut engine = crate::Engine::from_toml(AGREEMENT_RULES).expect("the rules parse");
+        let mut fired = Vec::new();
+        fired.extend(engine.observe_driver(&event_of(
+            av_ipc::DriverEventAction::FileRenamed,
+            r"C:\Users\example\Documents\a.locked",
+            7_001,
+            1,
+        )));
+        fired.extend(engine.observe_driver(&event_of(
+            av_ipc::DriverEventAction::FileRenamed,
+            r"C:\Users\example\Documents\b.locked",
+            7_002,
+            2,
+        )));
+        assert!(
+            fired.iter().all(|finding| finding.rule_id != "BEH-AGG"),
+            "separate processes were added together: {fired:?}"
+        );
+    }
+
     #[test]
     fn the_mass_file_delete_rule_ignores_servicing_and_defender_tracing() {
         // Measured in the test VM on 2026-11-02 at 19:32 and 19:33, with the

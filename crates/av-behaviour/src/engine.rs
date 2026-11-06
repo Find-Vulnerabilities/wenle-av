@@ -30,7 +30,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use av_core::Severity;
+use av_core::{Severity, VerdictThresholds};
 
 use crate::dsl::{Precision, Response, Rule, RuleSet, Verdict};
 use crate::error::LoadError;
@@ -59,6 +59,28 @@ const MAX_TRACKED_SERIES: usize = 4096;
 /// A minute is short enough that a diagnostic still reads as "now", and long
 /// enough that a busy exclusion costs one line instead of hundreds.
 const EXCLUSION_QUIET_SECONDS: u64 = 60;
+
+/// How long several rules' evidence stays able to add up, in seconds.
+///
+/// The same order as the rules' own windows: a ransomware sweep concentrates its
+/// tells inside a minute, and a process that takes longer than this between two
+/// of them is a process doing different things at different times.
+const AGREEMENT_WINDOW_SECONDS: u64 = 60;
+
+/// How long after an aggregate fires the same process may fire another.
+///
+/// Longer than the window on purpose. The aggregate's response is a termination,
+/// and terminating the same process twice in a minute is either a race this
+/// engine cannot win or a process that survived the first attempt -- neither is
+/// worth a second attempt on evidence that has not changed.
+const AGREEMENT_QUIET_SECONDS: u64 = 120;
+
+/// How many processes may have partially-accumulated evidence at once.
+///
+/// Bounded for the same reason every other table here is: the keys are process
+/// identifiers chosen by the machine, and a leak is a table that grows with
+/// uptime.
+const MAX_TRACKED_AGREEMENTS: usize = 1024;
 
 /// How many distinct (rule, pattern) pairs are remembered.
 ///
@@ -159,6 +181,36 @@ pub struct Engine {
     /// One entry per (rule, pattern) that is currently excluding things. See
     /// [`Engine::note_exclusion`].
     exclusions: HashMap<(usize, String), ExclusionRun>,
+    /// One entry per process whose rules are adding up. See [`Engine::agree`].
+    agreement: HashMap<u32, Agreement>,
+}
+
+/// What several rules have said about one process, and when.
+///
+/// The evidence a single rule carries is capped deliberately -- every shipped
+/// rule is below the malicious threshold on its own -- so a conviction has to
+/// come from independent signals agreeing. Measured in the test VM on
+/// 2026-11-06 with a real WannaCry sample: one process produced
+/// `BEH-0001` (a `.WNCRY` file), `BEH-0004` (twenty-five deletes in half a
+/// minute) and `BEH-0054` (forty documents written in half a minute) inside
+/// eight seconds, and each was reported and nothing else. This is the table
+/// that makes those three one statement.
+#[derive(Debug, Default)]
+struct Agreement {
+    /// Rule identifier to its score, for the rules that fired inside the
+    /// window. A `HashMap` because the same rule firing twice is one signal and
+    /// must not be counted twice.
+    scores: HashMap<String, u16>,
+    /// Whether any contributing rule could convict on its own class of
+    /// evidence -- see [`Precision`]. A pile of `burst` rules is a busy machine
+    /// and nothing more; the combination needs at least one rule whose evidence
+    /// is about what the process *did* rather than how much of it.
+    corroborated: bool,
+    /// When the aggregate last fired, so a process that keeps the total over
+    /// the threshold is stopped once and not once per event.
+    last_fired: Option<u64>,
+    /// The newest event that contributed, for expiry.
+    newest: u64,
 }
 
 impl Engine {
@@ -170,6 +222,7 @@ impl Engine {
             processes: HashMap::new(),
             order: 0,
             exclusions: HashMap::new(),
+            agreement: HashMap::new(),
         }
     }
 
@@ -283,8 +336,109 @@ impl Engine {
                 window_seconds: rule.window_seconds,
             });
         }
+        // Several independent rules naming one process is a stronger statement
+        // than any of them alone -- see [`Agreement`]. Added after the per-rule
+        // findings so that the aggregate can say which ones contributed.
+        if let Some(aggregate) = self.agree(record, &findings) {
+            findings.push(aggregate);
+        }
         self.trim(record.timestamp);
         findings
+    }
+
+    /// Add up what several rules have said about one process, and turn the total
+    /// into one actionable finding when it reaches the malicious threshold.
+    ///
+    /// Returns the aggregate on the event that first crosses the threshold and
+    /// nothing otherwise. The per-rule findings are untouched: every one of them
+    /// is still reported, and this is the one the service may act on.
+    ///
+    /// # Why a pile of `burst` rules is not enough
+    ///
+    /// Eight folder-sized operations fire four burst rules at once on a healthy
+    /// machine -- measured in the test VM on 2026-11-06, creating three hundred
+    /// files and renaming a hundred of them produced `BEH-0003`, `BEH-0004`,
+    /// `BEH-0005`, `BEH-0006` and `BEH-0054` in one go. Allowing that to convict
+    /// would make every installer an incident, so the total only counts when at
+    /// least one contributing rule is evidence about *what* the process did
+    /// rather than how much of it.
+    fn agree(&mut self, record: &Record, findings: &[Finding]) -> Option<Finding> {
+        if findings.is_empty() {
+            return None;
+        }
+        let pid = record.process_id;
+        let at = record.timestamp;
+        let window = AGREEMENT_WINDOW_SECONDS.saturating_mul(TICKS_PER_SECOND);
+        let quiet = AGREEMENT_QUIET_SECONDS.saturating_mul(TICKS_PER_SECOND);
+
+        if self
+            .agreement
+            .get(&pid)
+            .is_some_and(|state| at.saturating_sub(state.newest) >= window)
+        {
+            self.agreement.remove(&pid);
+        }
+        if self.agreement.len() >= MAX_TRACKED_AGREEMENTS && !self.agreement.contains_key(&pid) {
+            if let Some(oldest) = self
+                .agreement
+                .iter()
+                .min_by_key(|(_, state)| state.newest)
+                .map(|(pid, _)| *pid)
+            {
+                self.agreement.remove(&oldest);
+            }
+        }
+
+        let state = self.agreement.entry(pid).or_default();
+        state.newest = at;
+        for finding in findings {
+            state.scores.insert(finding.rule_id.clone(), finding.score);
+            if finding.precision != Precision::Burst {
+                state.corroborated = true;
+            }
+        }
+
+        let total: u32 = state.scores.values().map(|score| u32::from(*score)).sum();
+        let threshold = u32::from(VerdictThresholds::default().malicious);
+        if total < threshold || !state.corroborated {
+            return None;
+        }
+        if state
+            .last_fired
+            .is_some_and(|last| at.saturating_sub(last) < quiet)
+        {
+            return None;
+        }
+        state.last_fired = Some(at);
+
+        let mut rules: Vec<&str> = state.scores.keys().map(String::as_str).collect();
+        rules.sort_unstable();
+        let image = findings.iter().find_map(|finding| finding.process_image.clone());
+        Some(Finding {
+            rule_id: "BEH-AGG".to_string(),
+            name: "several independent signals agree".to_string(),
+            description: format!(
+                "{} behaviour rules named this process within {} seconds: {}",
+                rules.len(),
+                AGREEMENT_WINDOW_SECONDS,
+                rules.join(", ")
+            ),
+            severity: Severity::High,
+            // `Exact` on purpose: this is the finding the service is allowed to
+            // act on, and it must not be able to reach that decision through a
+            // class of evidence that cannot carry it.
+            precision: Precision::Exact,
+            response: Response::Terminate,
+            score: total.min(u32::from(u16::MAX)) as u16,
+            path: record.path.clone(),
+            value: None,
+            process_id: pid,
+            parent_process_id: record.parent_process_id,
+            process_image: image,
+            parent_image: None,
+            count: rules.len() as u32,
+            window_seconds: AGREEMENT_WINDOW_SECONDS,
+        })
     }
 
     /// Count one exclusion, and return the line to write if it is time to.
