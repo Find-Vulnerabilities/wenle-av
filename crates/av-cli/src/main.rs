@@ -124,6 +124,7 @@ fn main() -> std::process::ExitCode {
         Command::Service(service) => commands::service::run(&service.command, &globals, &context),
         Command::Integrate(integrate) => commands::integrate::run(&integrate.command, &globals, &context),
         Command::Protect(protect) => commands::protect::run(&protect.command, &globals, &context),
+        Command::Update(update) => commands::update::run(&update.command, &globals, &context),
         // Answered above, before the context exists. Listed here so that the
         // match stays exhaustive: a command added to the enum and forgotten
         // below is a compile error rather than a command that prints nothing.

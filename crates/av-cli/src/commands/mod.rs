@@ -25,6 +25,7 @@ pub mod protect;
 pub mod quarantine;
 pub mod scan;
 pub mod service;
+pub mod update;
 
 use std::path::{Path, PathBuf};
 

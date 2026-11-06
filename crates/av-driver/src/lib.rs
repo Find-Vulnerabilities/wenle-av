@@ -1942,7 +1942,9 @@ unsafe extern "system" fn create_pre_operation(
     // the service binary was deleted and on 2026-11-06 it was truncated to
     // nothing, both by an ordinary `Copy-Item` whose write half was refused
     // after the damage. See [`flt::WRITES`].
-    if wanted & flt::WRITES != 0 {
+    // ... and our own images are how a legitimate update gets in. See
+    // [`caller_is_ours`] for what that exception is and is not.
+    if wanted & flt::WRITES != 0 && !caller_is_ours() {
         let mut dos = [0u16; MAX_PATH_UNITS];
         // SAFETY: `data` is this callback's live callback data, and a create
         // pre-operation runs at `PASSIVE_LEVEL`, which the name query requires.
@@ -2412,7 +2414,7 @@ unsafe extern "system" fn set_information_pre_operation(
             None => false,
         }
     };
-    if protected {
+    if protected && !caller_is_ours() {
         // The same counter and the same status the write gate refuses with:
         // this is the same promise, applied to the two operations that also
         // remove a file rather than merely rewrite it.
@@ -2603,6 +2605,45 @@ fn gate_matches(path: &[u16]) -> bool {
     // own length.
     let directory = unsafe { &*GATE_DIRECTORY.0.get() };
     is_protected_file(&directory[..units], path)
+}
+
+/// Whether the thread asking for this operation belongs to one of the
+/// product's own images.
+///
+/// The self-protection refuses writes, deletes and renames of the product's
+/// files from everything else. Without this exception the product cannot update
+/// itself at all -- measured three times on 2026-11-04 and 2026-11-06, each time
+/// ending with the service binary deleted or truncated, and the only way out
+/// was unloading this filter and rebooting.
+///
+/// # What this is, and what it is not
+///
+/// It is an **update channel**, not an authorization boundary. The check is the
+/// image *name*, because that is the field the kernel gives cheaply, and a name
+/// can be copied: a program the attacker named `wenle.exe` passes it. The
+/// boundary that matters is elsewhere and unchanged -- the service binary's
+/// hash is recorded in the tamper manifest, `wenle protect verify` exits 3 when
+/// it moves, and the driver refuses the write for every other image on the
+/// machine, so malware cannot silently replace the product; it can only do what
+/// our own tools could already do, which is install a different build.
+fn caller_is_ours() -> bool {
+    // SAFETY: `IoGetCurrentProcess` takes no arguments, can be called at any
+    // IRQL, and returns the `EPROCESS` of the calling thread.
+    let process = unsafe { wdk_sys::ntddk::IoGetCurrentProcess() };
+    if process.is_null() {
+        return false;
+    }
+    // SAFETY: as at the object callback: the pointer is to
+    // `EPROCESS.ImageFileName`, a fixed array the kernel keeps for the life of
+    // the process, and this thread is that process.
+    let name = unsafe { flt::PsGetProcessImageFileName(process.cast::<c_void>()) };
+    if name.is_null() {
+        return false;
+    }
+    // SAFETY: `IMAGE_NAME_BYTES` is that array's width, and the slice is read
+    // and dropped inside this function.
+    let field = unsafe { core::slice::from_raw_parts(name, IMAGE_NAME_BYTES) };
+    is_our_image(field)
 }
 
 // ---------------------------------------------------------------------------

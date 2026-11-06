@@ -88,6 +88,19 @@ pub enum Command {
     Integrate(IntegrateArgs),
     /// Look at, and set up, the product's protection of itself.
     Protect(ProtectArgs),
+    /// Install a checked package over this installation.
+    ///
+    /// The product's self-protection refuses writes to its own files from every
+    /// image but the product's own, which is what makes the files hard to
+    /// replace and what made updating them by hand dangerous: twice in November
+    /// 2026 a plain `Copy-Item` left the service binary deleted or truncated,
+    /// and there was no way back without unloading the filter and rebooting.
+    ///
+    /// A package is a directory of files and a `manifest.txt` naming each file's
+    /// SHA-256. `verify` reports and changes nothing; `apply` refuses the whole
+    /// package on one mismatch, so a failed update cannot leave half an
+    /// installation behind.
+    Update(UpdateArgs),
     /// Show the configuration in force, and which of its keys this build acts
     /// on.
     ///
@@ -140,6 +153,40 @@ pub struct ConfigArgs {
 /// configured to *allow* (permissions, the service's start type and recovery)
 /// and what the product's own files *are* (the manifest). `status` is the only
 /// verb that reports both, which is why it exists.
+/// The `update` command's arguments.
+#[derive(Debug, ClapArgs)]
+pub struct UpdateArgs {
+    #[command(subcommand)]
+    pub command: UpdateCommand,
+}
+
+/// What can be asked of a package.
+#[derive(Debug, Subcommand)]
+pub enum UpdateCommand {
+    /// Check a package against its manifest. Changes nothing.
+    ///
+    /// Hashes every file the manifest names and reports what matches, what
+    /// differs, and what is missing. Safe to run on a package nobody trusts
+    /// yet, which is why it is the first thing to run.
+    Verify {
+        /// The package directory, holding `manifest.txt` and the files.
+        #[arg(value_name = "DIR")]
+        dir: std::path::PathBuf,
+    },
+    /// Install a package: stop the service, replace the files, start it again.
+    ///
+    /// CHANGES THIS MACHINE, and needs administrator rights. Verifies first and
+    /// installs nothing when one file does not match its manifest. The service
+    /// is started again even when a copy failed: a product left stopped turns a
+    /// failed update into an unprotected machine.
+    Apply {
+        /// The package directory, holding `manifest.txt` and the files.
+        #[arg(value_name = "DIR")]
+        dir: std::path::PathBuf,
+    },
+}
+
+/// The `protect` command's arguments.
 #[derive(Debug, ClapArgs)]
 pub struct ProtectArgs {
     #[command(subcommand)]
