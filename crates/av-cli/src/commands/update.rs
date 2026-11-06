@@ -45,6 +45,8 @@ use crate::commands::Context;
 use crate::exit::Exit;
 use crate::output;
 
+mod sandbox;
+
 /// The file a package's digests are read from.
 const MANIFEST_FILE: &str = "manifest.txt";
 
@@ -111,7 +113,11 @@ pub fn parse_manifest(text: &str) -> Result<Vec<Entry>, String> {
 }
 
 /// Hash a file the way the manifest says to.
-fn hash_file(path: &Path) -> Result<String> {
+///
+/// `pub(super)` because the sandbox hashes again at the moment of the copy: the
+/// gap between verifying a package and installing from it is however long the
+/// script runs, and a file that changed in that gap must not be installed.
+pub(super) fn hash_file(path: &Path) -> Result<String> {
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     Ok(HashKind::Sha256.digest(&bytes))
 }
@@ -167,7 +173,7 @@ pub fn verify(dir: &Path) -> Result<Verdict> {
 pub fn run(command: &UpdateCommand, _globals: &Globals, context: &Context) -> Result<Exit> {
     match command {
         UpdateCommand::Verify { dir } => verify_command(dir),
-        UpdateCommand::Apply { dir } => apply_command(dir, context),
+        UpdateCommand::Apply { dir, script } => apply_command(dir, script.as_deref(), context),
     }
 }
 
@@ -204,11 +210,15 @@ fn verify_command(dir: &Path) -> Result<Exit> {
 
 /// `wenle update apply <dir>`.
 ///
-/// Verifies first, then installs. The service is stopped for the copy because
-/// Windows will not replace a running image, and started again afterwards even
-/// when the copy failed -- a product that is uninstalled by a failed update is
-/// the problem this command exists to avoid.
-fn apply_command(dir: &Path, context: &Context) -> Result<Exit> {
+/// Verifies first, then hands the flow to the sandbox. The flow is a Lua script
+/// because the order of the steps is policy and changes more often than the
+/// operations; the operations themselves stay here, where a script cannot reach
+/// a path of its own choosing.
+///
+/// The service is started again when the script stopped it and did not start it:
+/// a product left stopped turns a failed update into an unprotected machine,
+/// which is the outcome this command exists to avoid.
+fn apply_command(dir: &Path, script: Option<&Path>, context: &Context) -> Result<Exit> {
     let verdict = verify(dir)?;
     if !verdict.is_installable() {
         output::error("the package does not match its manifest; nothing was changed");
@@ -223,51 +233,51 @@ fn apply_command(dir: &Path, context: &Context) -> Result<Exit> {
 
     let install_dir = context.paths.install_dir.clone();
     output::heading("Update");
-    println!("  package:     {}", dir.display());
+    println!("  package:      {}", dir.display());
     println!("  installation: {}", install_dir.display());
-
-    let stopped = av_service::install::stop();
-    match &stopped {
-        Ok(_) => println!("  the service was asked to stop"),
-        Err(error) => println!("  the service could not be asked to stop: {error}"),
+    match script {
+        Some(path) => println!("  flow:         {}", path.display()),
+        None => println!("  flow:         built in"),
     }
 
-    let mut replaced = 0usize;
-    let mut failures = Vec::new();
-    for name in &verdict.matching {
-        let from = dir.join(name);
-        let to = install_dir.join(name);
-        match std::fs::copy(&from, &to) {
-            Ok(_) => {
-                println!("  {name} -- installed");
-                replaced += 1;
-            }
-            Err(error) => failures.push(format!("{name}: {error}")),
+    let text = sandbox::script_from(script)?;
+    let entries = verified_entries(dir)?;
+    let report = sandbox::run(dir, &install_dir, &entries, &text)?;
+
+    if report.stopped && !report.started {
+        output::warn("the script stopped the service and did not start it; starting it now");
+        match av_service::install::start() {
+            Ok(_) => println!("  the service was started"),
+            Err(error) => output::error(&format!("the service could not be started: {error}")),
         }
     }
 
-    // The service comes back whatever happened above. Leaving it stopped would
-    // turn a failed copy into an unprotected machine.
-    let started = av_service::install::start();
-    match &started {
-        Ok(_) => println!("  the service was started"),
-        Err(error) => println!("  the service could not be started: {error}"),
-    }
-
-    if failures.is_empty() {
+    if report.is_clean() {
         println!();
         println!(
-            "{replaced} file(s) installed. Take the tamper manifest again with \
-             `wenle protect manifest`, which is what makes the next change visible."
+            "{} file(s) installed. Take the tamper manifest again with \
+             `wenle protect manifest`, which is what makes the next change visible.",
+            report.installed.len()
         );
         return Ok(Exit::Clean);
     }
     println!();
-    println!("{replaced} file(s) installed, {} failed:", failures.len());
-    for failure in &failures {
+    println!("{} file(s) installed, and this went wrong:", report.installed.len());
+    for failure in &report.failures {
         println!("  {failure}");
     }
     Ok(Exit::Failure)
+}
+
+/// The manifest's entries, read back after verification.
+///
+/// Verification reports names; the sandbox needs the digests too, and re-reading
+/// the manifest is cheaper than threading a second structure through the report.
+fn verified_entries(dir: &Path) -> Result<Vec<Entry>> {
+    let manifest_path = dir.join(MANIFEST_FILE);
+    let text = std::fs::read_to_string(&manifest_path)
+        .with_context(|| format!("reading {}", manifest_path.display()))?;
+    parse_manifest(&text).map_err(|error| anyhow!("{}: {error}", manifest_path.display()))
 }
 
 

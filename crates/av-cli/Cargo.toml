@@ -13,6 +13,12 @@ name = "wenle"
 path = "src/main.rs"
 
 [dependencies]
+# The update flow is a Lua script; the privileged operations stay in Rust. See
+# `commands/update/lua.rs` for the sandbox and the four things a script may do.
+# `vendored` compiles Lua 5.4 into this binary, so the interpreter is the one
+# this build was tested against rather than whichever Lua the machine happens to
+# have -- an updater that runs under an unknown interpreter is not a boundary.
+mlua = { version = "0.9", features = ["lua54", "vendored"] }
 av-core.workspace = true
 av-rules.workspace = true
 av-pe.workspace = true

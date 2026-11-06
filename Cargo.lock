@@ -495,7 +495,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "av-amsi"
-version = "0.1.0"
+version = "2.1.0"
 dependencies = [
  "av-core",
  "av-ipc",
@@ -508,7 +508,7 @@ dependencies = [
 
 [[package]]
 name = "av-archive"
-version = "0.1.0"
+version = "2.1.0"
 dependencies = [
  "av-core",
  "crc32fast",
@@ -520,7 +520,7 @@ dependencies = [
 
 [[package]]
 name = "av-authenticode"
-version = "0.1.0"
+version = "2.1.0"
 dependencies = [
  "av-pe",
  "av-signatures",
@@ -532,7 +532,7 @@ dependencies = [
 
 [[package]]
 name = "av-behaviour"
-version = "0.1.0"
+version = "2.1.0"
 dependencies = [
  "av-core",
  "av-driver-proto",
@@ -545,7 +545,7 @@ dependencies = [
 
 [[package]]
 name = "av-cli"
-version = "0.1.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "av-core",
@@ -567,6 +567,7 @@ dependencies = [
  "env_logger",
  "hex",
  "log",
+ "mlua",
  "num_cpus",
  "parking_lot",
  "rayon",
@@ -579,7 +580,7 @@ dependencies = [
 
 [[package]]
 name = "av-core"
-version = "0.1.0"
+version = "2.1.0"
 dependencies = [
  "chrono",
  "dirs",
@@ -599,11 +600,11 @@ dependencies = [
 
 [[package]]
 name = "av-driver-proto"
-version = "0.1.0"
+version = "2.1.0"
 
 [[package]]
 name = "av-fs"
-version = "0.1.0"
+version = "2.1.0"
 dependencies = [
  "av-core",
  "log",
@@ -615,7 +616,7 @@ dependencies = [
 
 [[package]]
 name = "av-guard"
-version = "0.1.0"
+version = "2.1.0"
 dependencies = [
  "av-authenticode",
  "av-core",
@@ -631,7 +632,7 @@ dependencies = [
 
 [[package]]
 name = "av-gui"
-version = "0.1.0"
+version = "2.1.0"
 dependencies = [
  "av-archive",
  "av-core",
@@ -660,7 +661,7 @@ dependencies = [
 
 [[package]]
 name = "av-integration"
-version = "0.1.0"
+version = "2.1.0"
 dependencies = [
  "av-amsi",
  "av-core",
@@ -674,7 +675,7 @@ dependencies = [
 
 [[package]]
 name = "av-ipc"
-version = "0.1.0"
+version = "2.1.0"
 dependencies = [
  "av-core",
  "av-quarantine",
@@ -688,7 +689,7 @@ dependencies = [
 
 [[package]]
 name = "av-memory"
-version = "0.1.0"
+version = "2.1.0"
 dependencies = [
  "av-core",
  "av-driver-proto",
@@ -703,14 +704,14 @@ dependencies = [
 
 [[package]]
 name = "av-patterns"
-version = "0.1.0"
+version = "2.1.0"
 dependencies = [
  "memchr",
 ]
 
 [[package]]
 name = "av-pe"
-version = "0.1.0"
+version = "2.1.0"
 dependencies = [
  "md-5",
  "thiserror 2.0.20",
@@ -718,7 +719,7 @@ dependencies = [
 
 [[package]]
 name = "av-quarantine"
-version = "0.1.0"
+version = "2.1.0"
 dependencies = [
  "aes-gcm",
  "av-core",
@@ -734,7 +735,7 @@ dependencies = [
 
 [[package]]
 name = "av-realtime"
-version = "0.1.0"
+version = "2.1.0"
 dependencies = [
  "av-core",
  "av-integration",
@@ -754,7 +755,7 @@ dependencies = [
 
 [[package]]
 name = "av-rules"
-version = "0.1.0"
+version = "2.1.0"
 dependencies = [
  "aho-corasick",
  "av-core",
@@ -779,7 +780,7 @@ dependencies = [
 
 [[package]]
 name = "av-sandbox"
-version = "0.1.0"
+version = "2.1.0"
 dependencies = [
  "av-core",
  "av-pe",
@@ -790,7 +791,7 @@ dependencies = [
 
 [[package]]
 name = "av-scan"
-version = "0.1.0"
+version = "2.1.0"
 dependencies = [
  "av-archive",
  "av-authenticode",
@@ -806,7 +807,7 @@ dependencies = [
 
 [[package]]
 name = "av-service"
-version = "0.1.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "av-amsi",
@@ -836,7 +837,7 @@ dependencies = [
 
 [[package]]
 name = "av-signatures"
-version = "0.1.0"
+version = "2.1.0"
 dependencies = [
  "av-pe",
  "log",
@@ -905,6 +906,16 @@ dependencies = [
  "futures-io",
  "futures-lite",
  "piper",
+]
+
+[[package]]
+name = "bstr"
+version = "1.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6bb31b46c14244e20ee9984b11bf5c992b91fb6939fea616e3512c8baecdbe5f"
+dependencies = [
+ "memchr",
+ "serde_core",
 ]
 
 [[package]]
@@ -1535,6 +1546,12 @@ dependencies = [
  "log",
  "regex",
 ]
+
+[[package]]
+name = "env_home"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7f84e12ccf0a7ddc17a6c41c93326024c42920d7ee630d04950e6926645c0fe"
 
 [[package]]
 name = "env_logger"
@@ -2303,6 +2320,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
+name = "lua-src"
+version = "547.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1edaf29e3517b49b8b746701e5648ccb5785cde1c119062cbabbc5d5cd115e42"
+dependencies = [
+ "cc",
+]
+
+[[package]]
+name = "luajit-src"
+version = "210.5.12+a4f56a4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b3a8e7962a5368d5f264d045a5a255e90f9aa3fc1941ae15a8d2940d42cac671"
+dependencies = [
+ "cc",
+ "which",
+]
+
+[[package]]
 name = "md-5"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2354,6 +2390,32 @@ checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
 dependencies = [
  "adler2",
  "simd-adler32",
+]
+
+[[package]]
+name = "mlua"
+version = "0.9.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d111deb18a9c9bd33e1541309f4742523bfab01d276bfa9a27519f6de9c11dc7"
+dependencies = [
+ "bstr",
+ "mlua-sys",
+ "num-traits",
+ "once_cell",
+ "rustc-hash",
+]
+
+[[package]]
+name = "mlua-sys"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "380c1f7e2099cafcf40e51d3a9f20a346977587aa4d012eae1f043149a728a93"
+dependencies = [
+ "cc",
+ "cfg-if",
+ "lua-src",
+ "luajit-src",
+ "pkg-config",
 ]
 
 [[package]]
@@ -3155,6 +3217,12 @@ dependencies = [
  "web-sys",
  "windows-sys 0.59.0",
 ]
+
+[[package]]
+name = "rustc-hash"
+version = "2.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
 
 [[package]]
 name = "rustc_version"
@@ -3979,6 +4047,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 
 [[package]]
+name = "which"
+version = "7.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24d643ce3fd3e5b54854602a080f34fb10ab75e0b813ee32d00ca2b44fa74762"
+dependencies = [
+ "either",
+ "env_home",
+ "rustix 1.1.5",
+ "winsafe",
+]
+
+[[package]]
 name = "winapi"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4331,6 +4411,12 @@ checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 dependencies = [
  "memchr",
 ]
+
+[[package]]
+name = "winsafe"
+version = "0.0.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d135d17ab770252ad95e9a872d365cf3090e3be864a34ab46f48555993efc904"
 
 [[package]]
 name = "writeable"

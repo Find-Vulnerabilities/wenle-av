@@ -179,10 +179,25 @@ pub enum UpdateCommand {
     /// installs nothing when one file does not match its manifest. The service
     /// is started again even when a copy failed: a product left stopped turns a
     /// failed update into an unprotected machine.
+    ///
+    /// The order the steps happen in is a Lua script -- `--script` names one,
+    /// and with none the built-in flow is used. The script can only ask for
+    /// four things (install a file its manifest names, stop the service, start
+    /// it, and stop with a message); the file operations themselves are Rust, so
+    /// a script cannot name a path of its own choosing. See
+    /// `commands/update/sandbox.rs`.
     Apply {
         /// The package directory, holding `manifest.txt` and the files.
         #[arg(value_name = "DIR")]
         dir: std::path::PathBuf,
+        /// Run this Lua script instead of the built-in flow.
+        ///
+        /// The script is executed with no standard libraries; `update.names()`,
+        /// `update.install(name)`, `update.stop_service()`,
+        /// `update.start_service()`, `update.log(message)` and
+        /// `update.fail(message)` are the whole vocabulary.
+        #[arg(long, value_name = "PATH")]
+        script: Option<std::path::PathBuf>,
     },
 }
 
