@@ -1833,7 +1833,17 @@ impl Host {
         };
         for finding in findings {
             let verdict = thresholds.classify(finding.score);
-            if verdict != Verdict::Suspicious {
+            // The aggregate is the one finding this service builds rather than
+            // the rule file, and reaching a conviction is what it is for: each
+            // contributing rule is deliberately below the threshold, and their
+            // total is deliberately above it. Measured on 2026-11-06 -- a real
+            // WannaCry produced BEH-0001, BEH-0004 and BEH-0054 inside a
+            // second, the aggregate scored 150, and this guard dropped it as a
+            // rule-file mistake while the virus went on encrypting.
+            //
+            // Everything else outside the band is still exactly the mistake the
+            // guard was written to catch.
+            if verdict != Verdict::Suspicious && finding.rule_id != av_behaviour::AGREEMENT_RULE_ID {
                 log::error!(
                     "behaviour rule {} (pid {}) scored {}, which is {} and not the warning \
                      band; not published. The embedded rule file is supposed to contain no \

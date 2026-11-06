@@ -60,6 +60,14 @@ const MAX_TRACKED_SERIES: usize = 4096;
 /// enough that a busy exclusion costs one line instead of hundreds.
 const EXCLUSION_QUIET_SECONDS: u64 = 60;
 
+/// The identifier of the finding several rules' evidence adds up to.
+///
+/// Not a rule in the file: the engine builds this one, which is why the service
+/// may treat it differently from a shipped rule -- see `observe_behaviour` in
+/// `av-service`, where every other finding outside the warning band is a rule
+/// file mistake and this one is the point.
+pub const AGREEMENT_RULE_ID: &str = "BEH-AGG";
+
 /// How long several rules' evidence stays able to add up, in seconds.
 ///
 /// The same order as the rules' own windows: a ransomware sweep concentrates its
@@ -415,7 +423,7 @@ impl Engine {
         rules.sort_unstable();
         let image = findings.iter().find_map(|finding| finding.process_image.clone());
         Some(Finding {
-            rule_id: "BEH-AGG".to_string(),
+            rule_id: AGREEMENT_RULE_ID.to_string(),
             name: "several independent signals agree".to_string(),
             description: format!(
                 "{} behaviour rules named this process within {} seconds: {}",
