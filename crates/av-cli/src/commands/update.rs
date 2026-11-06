@@ -242,6 +242,15 @@ fn apply_command(dir: &Path, script: Option<&Path>, context: &Context) -> Result
 
     let text = sandbox::script_from(script)?;
     let entries = verified_entries(dir)?;
+    // Images a previous update moved aside. The one this process is running
+    // from cannot be removed while it is mapped -- measured in the test VM on
+    // 2026-11-06, where the update left `wenle.old` behind for exactly that
+    // reason -- but everything else can, and `protect verify` should not keep
+    // reporting them as files nobody explained.
+    let swept = sweep_old_files(&install_dir);
+    if swept > 0 {
+        println!("  {swept} leftover image(s) from an earlier update removed");
+    }
     let report = sandbox::run(dir, &install_dir, &entries, &text)?;
 
     if report.stopped && !report.started {
@@ -278,6 +287,30 @@ fn verified_entries(dir: &Path) -> Result<Vec<Entry>> {
     let text = std::fs::read_to_string(&manifest_path)
         .with_context(|| format!("reading {}", manifest_path.display()))?;
     parse_manifest(&text).map_err(|error| anyhow!("{}: {error}", manifest_path.display()))
+}
+
+/// Remove the images an earlier update moved aside, and say how many went.
+///
+/// Only names this product ships are swept: a `.old` file beside the product
+/// could be anything, and an updater that deletes by extension is an updater
+/// that deletes somebody's backup. The image this process is running from is
+/// locked and stays until the machine reboots or the next update runs from the
+/// new one; that is expected, not a failure.
+fn sweep_old_files(install_dir: &Path) -> usize {
+    const SHIPPED: [&str; 4] = [
+        "wenle-av-service.exe.old",
+        "wenle.exe.old",
+        "wenle-gui.exe.old",
+        "av_amsi.dll.old",
+    ];
+    let mut removed = 0;
+    for name in SHIPPED {
+        let path = install_dir.join(name);
+        if path.exists() && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 
