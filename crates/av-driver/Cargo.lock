@@ -80,7 +80,7 @@ dependencies = [
 
 [[package]]
 name = "av-driver-proto"
-version = "0.1.0"
+version = "2.1.0"
 
 [[package]]
 name = "bindgen"
