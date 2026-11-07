@@ -1078,6 +1078,10 @@ pub struct Dispatcher {
     /// which pressing "allow" stops the next launch from being taken. See
     /// [`crate::allow`].
     allow: AllowList,
+    /// Paths already found clean, and what they looked like then. See
+    /// [`crate::verdict_cache`] for what it is worth and what it does not
+    /// claim.
+    cache: std::sync::Mutex<crate::verdict_cache::VerdictCache>,
     /// Where this product keeps its own files.
     ///
     /// Held so that [`Self::decide`] can answer a question about a path inside
@@ -1120,6 +1124,9 @@ impl Dispatcher {
             options: ScanOptions::realtime(),
             status: None,
             allow,
+            cache: std::sync::Mutex::new(crate::verdict_cache::VerdictCache::new(
+                crate::verdict_cache::DEFAULT_CAPACITY,
+            )),
             own_tree,
         }
     }
@@ -1260,6 +1267,18 @@ impl Dispatcher {
             );
             return (Decision::Allow, None);
         }
+        // A file this service has already scanned and found clean, unchanged
+        // since. See [`crate::verdict_cache`] for why only a clean result is
+        // remembered.
+        if let Ok(mut cache) = self.cache.lock() {
+            if cache.is_known_clean(&path) {
+                log::trace!(
+                    "{} was found clean and has not changed; not scanned again",
+                    path.display()
+                );
+                return (Decision::Allow, None);
+            }
+        }
         // The one way out of this function that neither looks at the file nor
         // says anything about it later: the scan did not finish inside the
         // deadline the driver's own wait leaves room for. Everything below is
@@ -1272,6 +1291,13 @@ impl Dispatcher {
         // [`refusing_gate`] for which and why -- so a conviction arriving from
         // the other is reported and not acted on.
         let convicted = verdict_to_decision(report.verdict()) == Decision::Block;
+        // Only a clean result is remembered: a conviction is re-earned on the
+        // next question, so a file that was fixed stops being refused.
+        if !convicted {
+            if let Ok(mut cache) = self.cache.lock() {
+                cache.remember_clean(&path);
+            }
+        }
         // Which of the driver's two gates asked. Appended to both lines rather
         // than logged as a line of its own, because the two are read together
         // and a separate line would double the volume of a path every program
