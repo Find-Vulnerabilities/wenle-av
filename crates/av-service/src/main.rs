@@ -329,6 +329,15 @@ fn run_console() -> Result<u8, ServiceError> {
 /// This is the one moment they are not the running image: this process was
 /// started from the new binary, so `<name>.old` is just a file. See
 /// [`av_service::install::sweep_old_images`].
+///
+/// # Why it runs twice
+///
+/// The update that installed this binary is still alive at the moment it starts
+/// the service: it renamed its own image to `wenle.old` and has not finished
+/// exiting, so that one file is still mapped and the sweep cannot remove it.
+/// Measured in the test VM on 2026-11-07 -- the log said `removed 1 image(s)`
+/// and `wenle.old` stayed. A second pass a few seconds later, on a thread that
+/// ends, catches exactly that file and nothing else.
 fn sweep_set_aside(paths: &av_core::paths::AvPaths) {
     let removed = av_service::install::sweep_old_images(&paths.install_dir);
     if removed > 0 {
@@ -336,6 +345,28 @@ fn sweep_set_aside(paths: &av_core::paths::AvPaths) {
             "removed {removed} image(s) an earlier update had moved aside, now that nothing is \
              running from them"
         );
+    }
+
+    let install_dir = paths.install_dir.clone();
+    let spawned = std::thread::Builder::new()
+        .name("sweep-set-aside".to_string())
+        .spawn(move || {
+            // Long enough for the process that ran the update to have exited --
+            // it starts this service itself, so the exit is seconds away at
+            // most -- and short enough that a person watching the directory
+            // sees it settle.
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let removed = av_service::install::sweep_old_images(&install_dir);
+            if removed > 0 {
+                log::info!(
+                    "removed {removed} image(s) once the process that ran the update had exited"
+                );
+            }
+        });
+    if let Err(error) = spawned {
+        // A thread that cannot be created is not a reason to fail a start; the
+        // first sweep has already run and the next start tries again.
+        log::warn!("the second sweep of set-aside images could not be started: {error}");
     }
 }
 
