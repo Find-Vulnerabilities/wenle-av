@@ -246,12 +246,20 @@ pub fn installed_binary(install_dir: &Path) -> std::path::PathBuf {
 /// extension is an updater that deletes somebody's backup, and this runs as
 /// SYSTEM where it would not be refused.
 pub fn sweep_old_images(install_dir: &Path) -> usize {
-    const SET_ASIDE: [&str; 5] = [
+    // Both spellings: this build appends `.old` to the whole name, and builds
+    // before 2026-11-07 replaced the extension, so `wenle.exe` left `wenle.old`.
+    // See `commands/update/sandbox.rs` for the measurement.
+    const SET_ASIDE: [&str; 10] = [
         "wenle-av-service.exe.old",
         "wenle.exe.old",
         "wenle-gui.exe.old",
         "av_amsi.dll.old",
         "WenleAvFilter.sys.old",
+        "wenle-av-service.old",
+        "wenle.old",
+        "wenle-gui.old",
+        "av_amsi.old",
+        "WenleAvFilter.old",
     ];
     let mut removed = 0;
     for name in SET_ASIDE {

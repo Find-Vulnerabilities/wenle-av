@@ -98,7 +98,15 @@ pub(super) fn install_file(from: &Path, to: &Path) -> std::io::Result<()> {
     match copy_here(from, to) {
         Ok(()) => Ok(()),
         Err(first) => {
-            let aside = to.with_extension("old");
+            // Appended, not `with_extension`: that *replaces* the extension, so
+            // `wenle.exe` became `wenle.old` and every sweep looking for
+            // `wenle.exe.old` found nothing. Measured in the test VM on
+            // 2026-11-07: two images survived a service restart that was
+            // supposed to remove them.
+            let aside = match to.file_name() {
+                Some(name) => to.with_file_name(format!("{}.old", name.to_string_lossy())),
+                None => to.with_extension("old"),
+            };
             let _ = std::fs::remove_file(&aside);
             match std::fs::rename(to, &aside) {
                 Ok(()) => match copy_here(from, to) {
@@ -244,6 +252,17 @@ pub fn run(
         "stop_service",
         lua.create_function(move |_, ()| {
             let mut session = s.borrow_mut();
+            // Nothing to stop is not a failure. The product can be installed as
+            // a portable directory with no service at all, and an update run
+            // there has to work; it is also what makes the whole flow testable
+            // on a machine that has never had the service installed.
+            if matches!(
+                av_service::install::state(),
+                Ok(av_service::install::ScmState::NotInstalled)
+            ) {
+                println!("  no service is installed here, so there is nothing to stop");
+                return Ok(false);
+            }
             // Wait for it: a copy that starts while the service process is
             // still alive fails with a sharing violation, which is exactly the
             // file an update exists to replace. See `install::stop_and_wait`.
@@ -267,6 +286,15 @@ pub fn run(
         "start_service",
         lua.create_function(move |_, ()| {
             let mut session = s.borrow_mut();
+            // The same rule as stopping: a portable installation has no service,
+            // and an update of one must not report a failure it did not have.
+            if matches!(
+                av_service::install::state(),
+                Ok(av_service::install::ScmState::NotInstalled)
+            ) {
+                println!("  no service is installed here, so there is nothing to start");
+                return Ok(false);
+            }
             match av_service::install::start() {
                 Ok(_) => {
                     println!("  the service was started");

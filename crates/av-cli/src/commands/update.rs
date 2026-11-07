@@ -257,7 +257,7 @@ pub fn run(command: &UpdateCommand, _globals: &Globals, context: &Context) -> Re
         UpdateCommand::Verify { dir } => verify_command(dir),
         UpdateCommand::Fetch { url, to } => fetch_command(url, to),
         UpdateCommand::Apply { dir, script } => apply_command(dir, script.as_deref(), context),
-        UpdateCommand::Rollback => rollback_command(context),
+        UpdateCommand::Rollback { install_dir } => rollback_command(install_dir.as_deref(), context),
     }
 }
 
@@ -437,11 +437,18 @@ fn apply_command(dir: &Path, script: Option<&Path>, context: &Context) -> Result
 
     let text = sandbox::script_from(script)?;
     let entries = verified_entries(dir)?;
+    // Leftovers first: the sweep removes every `.old` it may, and a backup of
+    // the *present* installation taken before the sweep would be a backup the
+    // sweep then deletes. See [`backup_path`] for the measurement.
+    let swept = sweep_old_files(&install_dir);
+    if swept > 0 {
+        println!("  {swept} leftover image(s) from an earlier update removed");
+    }
     // The state being replaced, kept where `rollback` can find it. Taken before
     // anything is touched, because a backup taken afterwards is a backup of the
     // new files.
     match backup_current(&install_dir, &entries) {
-        Ok(count) => println!("  {count} file(s) of the present installation kept as .old"),
+        Ok(count) => println!("  {count} file(s) of the present installation kept as .bak"),
         Err(error) => {
             output::error(&format!(
                 "the present installation could not be recorded, so nothing was changed: {error}"
@@ -449,15 +456,7 @@ fn apply_command(dir: &Path, script: Option<&Path>, context: &Context) -> Result
             return Ok(Exit::Failure);
         }
     }
-    // Images a previous update moved aside. The one this process is running
-    // from cannot be removed while it is mapped -- measured in the test VM on
-    // 2026-11-06, where the update left `wenle.old` behind for exactly that
-    // reason -- but everything else can, and `protect verify` should not keep
-    // reporting them as files nobody explained.
-    let swept = sweep_old_files(&install_dir);
-    if swept > 0 {
-        println!("  {swept} leftover image(s) from an earlier update removed");
-    }
+
     let report = sandbox::run(dir, &install_dir, &entries, &text)?;
 
     if report.stopped && !report.started {
@@ -504,11 +503,18 @@ fn verified_entries(dir: &Path) -> Result<Vec<Entry>> {
 /// locked and stays until the machine reboots or the next update runs from the
 /// new one; that is expected, not a failure.
 fn sweep_old_files(install_dir: &Path) -> usize {
-    const SHIPPED: [&str; 4] = [
+    // The first four are what this build produces; the last four are what
+    // `with_extension` produced before 2026-11-07, kept so an installation that
+    // already has them is cleaned rather than left with both spellings.
+    const SHIPPED: [&str; 8] = [
         "wenle-av-service.exe.old",
         "wenle.exe.old",
         "wenle-gui.exe.old",
         "av_amsi.dll.old",
+        "wenle-av-service.old",
+        "wenle.old",
+        "wenle-gui.old",
+        "av_amsi.old",
     ];
     let mut removed = 0;
     for name in SHIPPED {
@@ -555,8 +561,14 @@ fn backup_current(install_dir: &Path, entries: &[Entry]) -> Result<usize> {
 }
 
 /// The name a backup of `name` takes beside it.
+///
+/// `.bak`, not `.old`: `.old` is what a file is renamed to when Windows will not
+/// let it be replaced, and the sweeps -- the CLI's and the service's -- remove
+/// every `.old` they are allowed to. Measured in the test VM on 2026-11-07: with
+/// both on `.old`, the sweep deleted the backup the same update had just taken,
+/// and `rollback` had nothing to put back.
 fn backup_path(install_dir: &Path, name: &str) -> std::path::PathBuf {
-    install_dir.join(format!("{name}.old"))
+    install_dir.join(format!("{name}.bak"))
 }
 
 /// Put back the installation an earlier `apply` replaced.
@@ -566,8 +578,8 @@ fn backup_path(install_dir: &Path, name: &str) -> std::path::PathBuf {
 /// again. Refuses the whole rollback when one backup is missing or does not
 /// match: a half-restored installation is a mixture of two versions, which is
 /// worse than either.
-fn rollback_command(context: &Context) -> Result<Exit> {
-    let install_dir = context.paths.install_dir.clone();
+fn rollback_command(install_dir: Option<&Path>, context: &Context) -> Result<Exit> {
+    let install_dir = install_dir.map_or_else(|| context.paths.install_dir.clone(), Path::to_path_buf);
     output::heading("Rollback");
     println!("  installation: {}", install_dir.display());
 

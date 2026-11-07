@@ -226,7 +226,17 @@ pub enum UpdateCommand {
     /// the digest recorded at the time, and refuses the whole rollback when one
     /// of them is missing or different -- a half-restored installation is a
     /// mixture of two versions, which is worse than either.
-    Rollback,
+    Rollback {
+        /// The installation to restore, when it is not the one this program
+        /// sits beside.
+        ///
+        /// The case this exists for: an update that installed an older
+        /// command-line tool cannot be rolled back with it, because the older
+        /// one has no `rollback` verb. Running this command from a copy beside
+        /// the installation, naming the installation here, is the way back.
+        #[arg(long, value_name = "DIR")]
+        install_dir: Option<std::path::PathBuf>,
+    },
 }
 
 /// The `protect` command's arguments.
